@@ -1,6 +1,9 @@
 #include "application.h"
 #include "board.h"
 #include "display.h"
+#include "camera_display.h"
+#include "esp_camera.h"
+#include "esp_lvgl_port.h"
 #include "system_info.h"
 #include "audio_codec.h"
 #include "mqtt_protocol.h"
@@ -166,7 +169,7 @@ void Application::Run() {
     // Set the priority of the main task to 10
     vTaskPrioritySet(nullptr, 10);
 
-    const EventBits_t ALL_EVENTS = 
+    const EventBits_t ALL_EVENTS =
         MAIN_EVENT_SCHEDULE |
         MAIN_EVENT_SEND_AUDIO |
         MAIN_EVENT_WAKE_WORD_DETECTED |
@@ -178,6 +181,7 @@ void Application::Run() {
         MAIN_EVENT_TOGGLE_CHAT |
         MAIN_EVENT_START_LISTENING |
         MAIN_EVENT_STOP_LISTENING |
+        MAIN_EVENT_TOGGLE_CAMERA |
         MAIN_EVENT_ACTIVATION_DONE |
         MAIN_EVENT_STATE_CHANGED;
 
@@ -215,6 +219,10 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_STOP_LISTENING) {
             HandleStopListeningEvent();
+        }
+
+        if (bits & MAIN_EVENT_TOGGLE_CAMERA) {
+            HandleToggleCameraEvent();
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
@@ -1117,3 +1125,75 @@ void Application::ResetProtocol() {
     });
 }
 
+void Application::ToggleCameraMode() {
+    xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CAMERA);
+}
+
+void Application::HandleToggleCameraEvent() {
+    auto& board = Board::GetInstance();
+    auto display = board.GetDisplay();
+
+    // 检查 esp_camera 是否已初始化
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor == nullptr) {
+        ESP_LOGW(TAG, "Camera not initialized");
+        display->ShowNotification("相机未初始化");
+        return;
+    }
+
+    if (!camera_mode_enabled_) {
+        // 启动相机模式
+        ESP_LOGI(TAG, "Starting camera mode");
+
+        if (camera_display_ == nullptr) {
+            camera_display_ = new CameraDisplay();
+
+            // 获取当前的 LVGL 屏幕
+            if (lvgl_port_lock(0)) {
+                lv_obj_t* scr = lv_screen_active();
+
+                // 创建相机图像控件
+                lv_obj_t* camera_img = lv_image_create(scr);
+
+                // 设置为全屏，占据整个屏幕
+                //
+                //
+                lv_obj_set_size(camera_img, 320, 480);
+                ESP_LOGI(TAG, "Camera image created: 320x480");
+                lv_obj_align(camera_img, LV_ALIGN_CENTER, 0, 0);  // 从(0,0)开始
+                lv_obj_set_style_bg_color(camera_img, lv_color_black(), 0);
+                lv_obj_set_style_bg_opa(camera_img, LV_OPA_COVER, 0);
+                lv_obj_set_style_pad_all(camera_img, 0, 0);  // 移除所有内边距
+                lv_obj_set_style_border_width(camera_img, 0, 0);  // 移除边框
+
+                // 设置到相机显示
+                camera_display_->SetCameraImage(camera_img);
+
+                lvgl_port_unlock();
+            }
+        }
+
+        if (camera_display_->Start()) {
+            camera_mode_enabled_ = true;
+            display->ShowNotification("相机已启动");
+        } else {
+            ESP_LOGE(TAG, "Failed to start camera mode");
+            delete camera_display_;
+            camera_display_ = nullptr;
+            camera_mode_enabled_ = false;
+            display->ShowNotification("相机启动失败");
+        }
+    } else {
+        // 停止相机模式
+        ESP_LOGI(TAG, "Stopping camera mode");
+
+        if (camera_display_ != nullptr) {
+            camera_display_->Stop();
+            delete camera_display_;
+            camera_display_ = nullptr;
+        }
+
+        camera_mode_enabled_ = false;
+        display->ShowNotification("相机已关闭");
+    }
+}

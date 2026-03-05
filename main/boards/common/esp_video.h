@@ -50,4 +50,10 @@ public:
     virtual bool SetHMirror(bool enabled) override;
     virtual bool SetVFlip(bool enabled) override;
     virtual std::string Explain(const std::string& question);
+
+    // 获取当前帧数据（用于实时显示）
+    const FrameBuffer& GetFrame() const { return frame_; }
+    bool IsStreaming() const { return streaming_on_; }
+    uint16_t GetFrameWidth() const { return frame_.width; }
+    uint16_t GetFrameHeight() const { return frame_.height; }
 };

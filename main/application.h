@@ -31,6 +31,7 @@
 #define MAIN_EVENT_START_LISTENING      (1 << 10)
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
+#define MAIN_EVENT_TOGGLE_CAMERA        (1 << 13)
 
 
 enum AecMode {
@@ -103,6 +104,12 @@ public:
      */
     void StopListening();
 
+    /**
+     * Toggle camera mode (event-based, thread-safe)
+     * Sends MAIN_EVENT_TOGGLE_CAMERA to be handled in Run()
+     */
+    void ToggleCameraMode();
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
@@ -143,12 +150,17 @@ private:
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
+    // 相机显示
+    class CameraDisplay* camera_display_ = nullptr;
+    bool camera_mode_enabled_ = false;
+
 
     // Event handlers
     void HandleStateChangedEvent();
     void HandleToggleChatEvent();
     void HandleStartListeningEvent();
     void HandleStopListeningEvent();
+    void HandleToggleCameraEvent();
     void HandleNetworkConnectedEvent();
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();

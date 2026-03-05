@@ -28,7 +28,7 @@
 
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
-#include "esp_video.h"
+#include "esp_camera.h"
 
 #define TAG "waveshare_lcd_3_5b"
 
@@ -108,7 +108,6 @@ private:
     esp_io_expander_handle_t io_expander = NULL;
     LcdDisplay* display_;
     PowerSaveTimer* power_save_timer_;
-    EspVideo* camera_;
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
@@ -176,44 +175,64 @@ private:
     }
 
     void InitializeCamera() {
-        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
-            .data_width = CAM_CTLR_DATA_WIDTH_8,
-            .data_io = {
-                [0] = CAM_PIN_D0,
-                [1] = CAM_PIN_D1,
-                [2] = CAM_PIN_D2,
-                [3] = CAM_PIN_D3,
-                [4] = CAM_PIN_D4,
-                [5] = CAM_PIN_D5,
-                [6] = CAM_PIN_D6,
-                [7] = CAM_PIN_D7,
-            },
-            .vsync_io = CAM_PIN_VSYNC,
-            .de_io = CAM_PIN_HREF,
-            .pclk_io = CAM_PIN_PCLK,
-            .xclk_io = CAM_PIN_XCLK,
-        };
+        ESP_LOGI(TAG, "Initializing esp_camera...");
 
-        esp_video_init_sccb_config_t sccb_config = {
-            .init_sccb = false,  // 不初始化新的 SCCB，使用现有的 I2C 总线
-            .i2c_handle = i2c_bus_,  // 使用现有的 I2C 总线句柄
-            .freq = 100000,  // 100kHz
-        };
+        // 参考 factory demo 的配置
+        camera_config_t config;
+        config.ledc_channel = LEDC_CHANNEL_0;
+        config.ledc_timer = LEDC_TIMER_1;
+        config.pin_d0 = CAM_PIN_D0;
+        config.pin_d1 = CAM_PIN_D1;
+        config.pin_d2 = CAM_PIN_D2;
+        config.pin_d3 = CAM_PIN_D3;
+        config.pin_d4 = CAM_PIN_D4;
+        config.pin_d5 = CAM_PIN_D5;
+        config.pin_d6 = CAM_PIN_D6;
+        config.pin_d7 = CAM_PIN_D7;
+        config.pin_xclk = CAM_PIN_XCLK;
+        config.pin_pclk = CAM_PIN_PCLK;
+        config.pin_vsync = CAM_PIN_VSYNC;
+        config.pin_href = CAM_PIN_HREF;
+        config.pin_sccb_sda = GPIO_NUM_NC;  // 使用现有的 I2C 总线
+        config.pin_sccb_scl = GPIO_NUM_NC;
+        config.sccb_i2c_port = I2C_NUM_0;  // I2C0
+        config.pin_pwdn = CAM_PIN_PWDN;
+        config.pin_reset = CAM_PIN_RESET;
+        config.xclk_freq_hz = 20000000;  // 20MHz XCLK
+        config.frame_size = FRAMESIZE_320X480;  // 320x480，匹配显示屏旋转后的尺寸（参考 01_factory）
+        config.pixel_format = PIXFORMAT_RGB565;  // RGB565 for streaming
+        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+        config.fb_location = CAMERA_FB_IN_PSRAM;
+        config.jpeg_quality = 12;
+        config.fb_count = 1;
 
-        esp_video_init_dvp_config_t dvp_config = {
-            .sccb_config = sccb_config,
-            .reset_pin = CAM_PIN_RESET,
-            .pwdn_pin = CAM_PIN_PWDN,
-            .dvp_pin = dvp_pin_config,
-            .xclk_freq = 12000000,
-        };
+        esp_err_t err = esp_camera_init(&config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
+            return;
+        }
 
-        esp_video_init_config_t video_config = {
-            .dvp = &dvp_config,
-        };
+        // 设置传感器参数
+        sensor_t *s = esp_camera_sensor_get();
+        if (s != NULL) {
+            ESP_LOGI(TAG, "Camera sensor PID=0x%04X", s->id.PID);
+            
+            // 修复：颜色偏绿 -> 改用 BGR565
+            // 修复：左右反了 -> 关闭水平镜像
+            s->set_vflip(s, 1);  // 保持垂直翻转
+            s->set_hmirror(s, 0);  // 关闭水平镜像
 
-        camera_ = new EspVideo(video_config);
-        
+            // 手动设置像素格式为 RGB565
+            s->set_pixformat(s, PIXFORMAT_RGB565);
+
+            // OV5640 颜色修正：改用 BGR565
+            s->set_reg(s, 0x4300, 0xFF, 0x61);  // BGR565
+            s->set_reg(s, 0x501F, 0xFF, 0x00);
+
+            ESP_LOGI(TAG, "Camera initialized (vflip=1, hmirror=0, BGR565)");
+        } else {
+            ESP_LOGE(TAG, "Failed to get camera sensor");
+        }
     }
 
     void InitializeLcdDisplay() {
@@ -257,6 +276,7 @@ private:
     }
 
     void InitializeButtons() {
+        // 短按：切换对话状态 / WiFi配置
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -264,6 +284,13 @@ private:
                 return;
             }
             app.ToggleChatState();
+        });
+
+        // 长按（2秒）：启动/关闭相机
+        boot_button_.OnLongPress([this]() {
+            ESP_LOGI(TAG, "Long press detected, toggling camera");
+            auto& app = Application::GetInstance();
+            app.ToggleCameraMode();
         });
     }
 
@@ -335,8 +362,10 @@ public:
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
     }
+
+    // 相机使用全局 esp_camera 驱动，不返回 Camera 对象
     virtual Camera* GetCamera() override {
-        return camera_;
+        return nullptr;
     }
 
 #if PMIC_ENABLE      
