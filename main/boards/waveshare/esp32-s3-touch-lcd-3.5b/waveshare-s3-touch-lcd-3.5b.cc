@@ -217,15 +217,14 @@ private:
         if (s != NULL) {
             ESP_LOGI(TAG, "Camera sensor PID=0x%04X", s->id.PID);
             
-            // 修复：颜色偏绿 -> 改用 BGR565
-            // 修复：左右反了 -> 关闭水平镜像
-            s->set_vflip(s, 1);  // 保持垂直翻转
-            s->set_hmirror(s, 0);  // 关闭水平镜像
+            // 测试 vflip=1, hmirror=0 组合
+            s->set_vflip(s, 1);
+            s->set_hmirror(s, 0);
 
             // 手动设置像素格式为 RGB565
             s->set_pixformat(s, PIXFORMAT_RGB565);
 
-            // OV5640 颜色修正：改用 BGR565
+            // OV5640 颜色修正：BGR565
             s->set_reg(s, 0x4300, 0xFF, 0x61);  // BGR565
             s->set_reg(s, 0x501F, 0xFF, 0x00);
 
