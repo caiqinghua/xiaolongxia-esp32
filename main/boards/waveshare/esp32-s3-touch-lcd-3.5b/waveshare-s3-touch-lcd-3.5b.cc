@@ -223,11 +223,11 @@ private:
             // 手动设置像素格式为 RGB565
             s->set_pixformat(s, PIXFORMAT_RGB565);
 
-            // OV5640 颜色修正：BGR565
-            s->set_reg(s, 0x4300, 0xFF, 0x61);  // BGR565
+            // OV5640 颜色修正：RGB565
+            s->set_reg(s, 0x4300, 0xFF, 0x60);  // RGB565
             s->set_reg(s, 0x501F, 0xFF, 0x00);
 
-            ESP_LOGI(TAG, "Camera initialized (vflip=1, hmirror=0, BGR565)");
+            ESP_LOGI(TAG, "Camera initialized (vflip=1, hmirror=0, RGB565)");
         } else {
             ESP_LOGE(TAG, "Failed to get camera sensor");
         }
