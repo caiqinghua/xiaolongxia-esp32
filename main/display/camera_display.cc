@@ -140,6 +140,8 @@ void CameraDisplay::CameraTask(void* arg) {
                     }
                     lv_image_set_src(display->camera_image_, &img_dsc);
                     lv_obj_set_size(display->camera_image_, fb->width, fb->height);
+                    // 设置相机图像旋转 270 度（逆时针 90 度）来抵消 LVGL 的 90 度旋转
+                    lv_image_set_rotation(display->camera_image_, 2700);  // 2700 = 270.0 度 (LVGL 使用 10 倍精度)
                     lv_obj_invalidate(display->camera_image_);
                 } else {
                     ESP_LOGE(TAG, "camera_image_ is NULL!");

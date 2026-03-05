@@ -217,7 +217,6 @@ private:
         if (s != NULL) {
             ESP_LOGI(TAG, "Camera sensor PID=0x%04X", s->id.PID);
             
-            // 测试 vflip=1, hmirror=0 组合
             s->set_vflip(s, 1);
             s->set_hmirror(s, 0);
 
