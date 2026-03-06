@@ -177,7 +177,6 @@ void CameraDisplay::CameraTask(void* arg) {
                         lv_obj_align(display->camera_image_, LV_ALIGN_CENTER, 0, 0);
                         ESP_LOGI(TAG, "Updated camera image size to %dx%d", width, height);
                     }
-
                     lv_image_dsc_t img_dsc;
                     img_dsc.header.w = width;
                     img_dsc.header.h = height;
@@ -188,6 +187,14 @@ void CameraDisplay::CameraTask(void* arg) {
                     lv_image_set_src(display->camera_image_, &img_dsc);
                     // 设置相机图像旋转 270 度（逆时针 90 度）来抵消 LVGL 的 90 度旋转
                     lv_image_set_rotation(display->camera_image_, 2700);
+
+                    // 设置图像居中对齐
+                    // lv_image_set_align(display->camera_image_, LV_IMAGE_ALIGN_CENTER);
+
+                    if (frame_count == 0) {
+                        ESP_LOGI(TAG, "Image displayed: %dx%d, centered in 320x480 widget", width, height);
+                    }
+
                     lv_obj_invalidate(display->camera_image_);
                 } else {
                     ESP_LOGE(TAG, "camera_image_ is NULL!");

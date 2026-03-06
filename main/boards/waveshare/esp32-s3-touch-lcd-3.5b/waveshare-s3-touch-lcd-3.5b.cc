@@ -206,11 +206,11 @@ private:
         config.pin_pwdn = CAM_PIN_PWDN;
         config.pin_reset = CAM_PIN_RESET;
         config.xclk_freq_hz = 10000000;
-        config.frame_size = FRAMESIZE_QVGA;  // QVGA (320x240)
+        config.frame_size = FRAMESIZE_HVGA;  // HVGA (480x320) - 旋转后正好填满320x480屏幕
         config.pixel_format = PIXFORMAT_JPEG;  // JPEG 格式
         config.grab_mode = CAMERA_GRAB_LATEST;
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.jpeg_quality = 10;
+        config.jpeg_quality = 12;  // 提高质量，因为HVGA数据量更大
         config.fb_count = 2;
 
         // 创建 Esp32Camera 对象
@@ -224,10 +224,14 @@ private:
             // OV5640 传感器配置
             if (s->id.PID == OV5640_PID) {
                 s->set_vflip(s, 1);  // 垂直翻转
+                ESP_LOGI(TAG, "OV5640: Set frame size to HVGA (480x320)");
+                s->set_framesize(s, FRAMESIZE_HVGA);
             }
 
-            ESP_LOGI(TAG, "Camera initialized");
-            
+            // 验证帧大小设置
+            framesize_t actual_size = s->status.framesize;
+            ESP_LOGI(TAG, "Camera initialized, actual frame size: %d", actual_size);
+
             // 测试拍照并保存到 SD 卡
             // TestCameraCapture();
         } else {
