@@ -29,8 +29,13 @@
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
 #include "esp_camera.h"
+#include "esp_http_server.h"
+#include "esp_wifi.h"
 
 #define TAG "waveshare_lcd_3_5b"
+
+// Forward declaration for camera web server
+void start_camera_web_server();
 
 static const axs15231b_lcd_init_cmd_t lcd_init_cmds[] = {
     {0xBB, (uint8_t[]){0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5A, 0xA5}, 8, 0},
@@ -175,9 +180,9 @@ private:
     }
 
     void InitializeCamera() {
-        ESP_LOGI(TAG, "Initializing esp_camera...");
+        ESP_LOGI(TAG, "Initializing esp_camera for web server...");
 
-        // 参考 factory demo 的配置
+        // 参考 Waveshare demo 的配置，使用 JPEG 格式用于 Web 流媒体
         camera_config_t config;
         config.ledc_channel = LEDC_CHANNEL_0;
         config.ledc_timer = LEDC_TIMER_1;
@@ -193,18 +198,18 @@ private:
         config.pin_pclk = CAM_PIN_PCLK;
         config.pin_vsync = CAM_PIN_VSYNC;
         config.pin_href = CAM_PIN_HREF;
-        config.pin_sccb_sda = GPIO_NUM_NC;  // 使用现有的 I2C 总线
+        config.pin_sccb_sda = GPIO_NUM_NC;
         config.pin_sccb_scl = GPIO_NUM_NC;
-        config.sccb_i2c_port = I2C_NUM_0;  // I2C0
+        config.sccb_i2c_port = I2C_NUM_0;
         config.pin_pwdn = CAM_PIN_PWDN;
         config.pin_reset = CAM_PIN_RESET;
-        config.xclk_freq_hz = 20000000;  // 20MHz XCLK
-        config.frame_size = FRAMESIZE_320X480;  // 320x480，匹配显示屏旋转后的尺寸（参考 01_factory）
-        config.pixel_format = PIXFORMAT_RGB565;  // RGB565 for streaming
-        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+        config.xclk_freq_hz = 10000000;
+        config.frame_size = FRAMESIZE_QVGA;  // QVGA (320x240) for web streaming
+        config.pixel_format = PIXFORMAT_JPEG;  // JPEG for streaming
+        config.grab_mode = CAMERA_GRAB_LATEST;
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.jpeg_quality = 12;
-        config.fb_count = 1;
+        config.jpeg_quality = 10;
+        config.fb_count = 2;
 
         esp_err_t err = esp_camera_init(&config);
         if (err != ESP_OK) {
@@ -216,21 +221,19 @@ private:
         sensor_t *s = esp_camera_sensor_get();
         if (s != NULL) {
             ESP_LOGI(TAG, "Camera sensor PID=0x%04X", s->id.PID);
-            
-            s->set_vflip(s, 1);
-            s->set_hmirror(s, 0);
 
-            // 手动设置像素格式为 RGB565
-            s->set_pixformat(s, PIXFORMAT_RGB565);
+            // OV5640 传感器配置
+            if (s->id.PID == OV5640_PID) {
+                s->set_vflip(s, 1);  // 垂直翻转
+            }
 
-            // OV5640 颜色修正：RGB565
-            s->set_reg(s, 0x4300, 0xFF, 0x60);  // RGB565
-            s->set_reg(s, 0x501F, 0xFF, 0x00);
-
-            ESP_LOGI(TAG, "Camera initialized (vflip=1, hmirror=0, RGB565)");
+            ESP_LOGI(TAG, "Camera initialized with JPEG for web streaming");
         } else {
             ESP_LOGE(TAG, "Failed to get camera sensor");
         }
+
+        // 启动相机 Web 服务器
+        start_camera_web_server();
     }
 
     void InitializeLcdDisplay() {
