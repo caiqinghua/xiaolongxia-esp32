@@ -5,6 +5,7 @@
 #include "application.h"
 #include "button.h"
 #include "config.h"
+#include "esp32_camera.h"
 
 #include <esp_log.h>
 #include "i2c_device.h"
@@ -113,6 +114,7 @@ private:
     esp_io_expander_handle_t io_expander = NULL;
     LcdDisplay* display_;
     PowerSaveTimer* power_save_timer_;
+    Esp32Camera* camera_;  // ← 添加 Camera 对象
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
@@ -180,10 +182,10 @@ private:
     }
 
     void InitializeCamera() {
-        ESP_LOGI(TAG, "Initializing esp_camera for web server...");
+        ESP_LOGI(TAG, "Initializing esp_camera...");
 
-        // 参考 Waveshare demo 的配置，使用 JPEG 格式用于 Web 流媒体
-        camera_config_t config;
+        // 配置相机参数
+        camera_config_t config = {};
         config.ledc_channel = LEDC_CHANNEL_0;
         config.ledc_timer = LEDC_TIMER_1;
         config.pin_d0 = CAM_PIN_D0;
@@ -198,24 +200,21 @@ private:
         config.pin_pclk = CAM_PIN_PCLK;
         config.pin_vsync = CAM_PIN_VSYNC;
         config.pin_href = CAM_PIN_HREF;
-        config.pin_sccb_sda = GPIO_NUM_NC;
+        config.pin_sccb_sda = GPIO_NUM_NC;  // 使用现有的 I2C 总线
         config.pin_sccb_scl = GPIO_NUM_NC;
         config.sccb_i2c_port = I2C_NUM_0;
         config.pin_pwdn = CAM_PIN_PWDN;
         config.pin_reset = CAM_PIN_RESET;
         config.xclk_freq_hz = 10000000;
-        config.frame_size = FRAMESIZE_QVGA;  // QVGA (320x240) for web streaming
-        config.pixel_format = PIXFORMAT_JPEG;  // JPEG for streaming
+        config.frame_size = FRAMESIZE_QVGA;  // QVGA (320x240)
+        config.pixel_format = PIXFORMAT_JPEG;  // JPEG 格式
         config.grab_mode = CAMERA_GRAB_LATEST;
         config.fb_location = CAMERA_FB_IN_PSRAM;
         config.jpeg_quality = 10;
         config.fb_count = 2;
 
-        esp_err_t err = esp_camera_init(&config);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
-            return;
-        }
+        // 创建 Esp32Camera 对象
+        camera_ = new Esp32Camera(config);
 
         // 设置传感器参数
         sensor_t *s = esp_camera_sensor_get();
@@ -227,13 +226,55 @@ private:
                 s->set_vflip(s, 1);  // 垂直翻转
             }
 
-            ESP_LOGI(TAG, "Camera initialized with JPEG for web streaming");
+            ESP_LOGI(TAG, "Camera initialized");
+            
+            // 测试拍照并保存到 SD 卡
+            // TestCameraCapture();
         } else {
             ESP_LOGE(TAG, "Failed to get camera sensor");
         }
 
         // 启动相机 Web 服务器
         start_camera_web_server();
+    }
+
+    // 测试拍照并保存到 SD 卡
+    void TestCameraCapture() {
+        ESP_LOGI(TAG, "Testing camera capture...");
+        
+        // 获取相机帧
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb == nullptr) {
+            ESP_LOGE(TAG, "Failed to get camera frame");
+            return;
+        }
+
+        ESP_LOGI(TAG, "Photo captured: %dx%d, size=%d bytes, format=%d",
+                 fb->width, fb->height, fb->len, fb->format);
+
+        // 保存到 SD 卡
+        SavePhotoToSD(fb);
+
+        // 释放帧缓冲区
+        esp_camera_fb_return(fb);
+    }
+
+    void SavePhotoToSD(camera_fb_t *fb) {
+        // 检查 SD 卡是否挂载
+        char path[64];
+        sprintf(path, "/sdcard/photo_%ld.jpg", (long)esp_timer_get_time() / 1000000);
+        
+        FILE* f = fopen(path, "wb");
+        if (f == nullptr) {
+            ESP_LOGE(TAG, "Failed to open file for writing: %s", path);
+            return;
+        }
+
+        // 写入 JPEG 数据
+        fwrite(fb->buf, 1, fb->len, f);
+        fclose(f);
+
+        ESP_LOGI(TAG, "Photo saved to: %s", path);
     }
 
     void InitializeLcdDisplay() {
@@ -364,9 +405,9 @@ public:
         return &backlight;
     }
 
-    // 相机使用全局 esp_camera 驱动，不返回 Camera 对象
+    // 返回 Camera 对象，支持 MCP 拍照和 Explain 功能
     virtual Camera* GetCamera() override {
-        return nullptr;
+        return camera_;
     }
 
 #if PMIC_ENABLE      
