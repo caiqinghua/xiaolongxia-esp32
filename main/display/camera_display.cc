@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
+#include "jpeg_to_image.h"
 
 #define TAG "CameraDisplay"
 
@@ -25,7 +26,7 @@ bool CameraDisplay::Start() {
         return true;
     }
 
-    ESP_LOGI(TAG, "Starting camera display (using esp_camera)");
+    ESP_LOGI(TAG, "Starting camera display (using esp_camera + JPEG decode)");
 
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor == NULL) {
@@ -34,12 +35,13 @@ bool CameraDisplay::Start() {
     }
 
     ESP_LOGI(TAG, "Camera sensor found, starting display task");
+    ESP_LOGI(TAG, "Using JPEG format with decode pipeline for preview");
 
     is_running_ = true;
     BaseType_t ret = xTaskCreatePinnedToCore(
         CameraTask,
         "camera_task",
-        8 * 1024,
+        16 * 1024,  // 增加栈空间用于JPEG解码
         this,
         5,
         &camera_task_handle_,
@@ -85,63 +87,107 @@ void CameraDisplay::Stop() {
 void CameraDisplay::CameraTask(void* arg) {
     CameraDisplay* display = static_cast<CameraDisplay*>(arg);
 
-    ESP_LOGI(TAG, "Camera task started");
+    ESP_LOGI(TAG, "Camera task started (JPEG decode pipeline)");
 
     vTaskDelay(pdMS_TO_TICKS(500));
 
     int frame_count = 0;
     int error_count = 0;
+    int decode_error_count = 0;
 
-    // 分配 RGB565 缓冲区（用于字节交换）
-    uint16_t *rgb_buffer = (uint16_t*)malloc(640 * 480 * 2);
-    if (rgb_buffer == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate RGB buffer");
-        display->camera_task_handle_ = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
+    uint8_t *decoded_rgb = nullptr;  // 解码后的RGB缓冲区
+    size_t decoded_size = 0;
 
     while (display->is_running_) {
         camera_fb_t *fb = esp_camera_fb_get();
 
         if (fb != NULL) {
+            // 每30帧打印一次信息
             if (frame_count % 30 == 0) {
-                ESP_LOGI(TAG, "[Frame %d] %dx%d, len=%d, format=%d",
-                         frame_count, fb->width, fb->height, fb->len, fb->format);
+                ESP_LOGI(TAG, "[Frame %d] JPEG: %dx%d, len=%d bytes",
+                         frame_count, fb->width, fb->height, fb->len);
             }
 
-            // 相机输出的 RGB565 是大端格式，需要交换字节为小端
-            const uint8_t *src = fb->buf;
-            size_t pixel_count = fb->width * fb->height;
-            
-            for (size_t i = 0; i < pixel_count; i++) {
-                // 交换字节：大端 -> 小端
-                rgb_buffer[i] = ((uint16_t)src[i * 2] << 8) | (uint16_t)src[i * 2 + 1];
+            // 检查是否是JPEG格式
+            if (fb->format != PIXFORMAT_JPEG) {
+                ESP_LOGW(TAG, "Unexpected format: %d, expected JPEG (4)", fb->format);
+                esp_camera_fb_return(fb);
+                error_count++;
+                vTaskDelay(pdMS_TO_TICKS(33));
+                continue;
             }
+
+            // 验证JPEG魔数
+            if (fb->len < 2 || fb->buf[0] != 0xFF || fb->buf[1] != 0xD8) {
+                ESP_LOGE(TAG, "Invalid JPEG data: %02X %02X", fb->buf[0], fb->buf[1]);
+                esp_camera_fb_return(fb);
+                error_count++;
+                vTaskDelay(pdMS_TO_TICKS(33));
+                continue;
+            }
+
+            // 解码JPEG为RGB565
+            size_t width = 0, height = 0, stride = 0;
+            uint8_t *rgb_data = nullptr;
+            size_t rgb_len = 0;
+
+            esp_err_t ret = jpeg_to_image(fb->buf, fb->len, &rgb_data, &rgb_len, &width, &height, &stride);
+
+            if (ret != ESP_OK || rgb_data == nullptr) {
+                ESP_LOGE(TAG, "JPEG decode failed: %d", ret);
+                esp_camera_fb_return(fb);
+                decode_error_count++;
+                error_count++;
+
+                // 如果连续解码失败多次，等待一下
+                if (decode_error_count > 5) {
+                    ESP_LOGW(TAG, "Multiple decode errors, waiting 500ms");
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    decode_error_count = 0;
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(33));
+                }
+                continue;
+            }
+
+            decode_error_count = 0;  // 重置解码错误计数
+
+            // 释放旧的解码缓冲区
+            if (decoded_rgb != nullptr) {
+                heap_caps_free(decoded_rgb);
+                decoded_rgb = nullptr;
+            }
+
+            decoded_rgb = rgb_data;
+            decoded_size = rgb_len;
 
             if (frame_count == 0) {
-                ESP_LOGI(TAG, "First frame: buf=%p, len=%d, w=%d, h=%d", fb->buf, fb->len, fb->width, fb->height);
-                ESP_LOGI(TAG, "First 4 bytes: %02X %02X %02X %02X", fb->buf[0], fb->buf[1], fb->buf[2], fb->buf[3]);
-                ESP_LOGI(TAG, "Swapped pixels[0-2]: 0x%04X 0x%04X 0x%04X", rgb_buffer[0], rgb_buffer[1], rgb_buffer[2]);
+                ESP_LOGI(TAG, "First decode: %dx%d, len=%d, stride=%d", width, height, rgb_len, stride);
+                ESP_LOGI(TAG, "First 4 pixels: 0x%04X 0x%04X 0x%04X 0x%04X",
+                         ((uint16_t*)rgb_data)[0], ((uint16_t*)rgb_data)[1],
+                         ((uint16_t*)rgb_data)[2], ((uint16_t*)rgb_data)[3]);
             }
-            
+
+            // 显示到LVGL
             if (lvgl_port_lock(0)) {
-                // 检查图像控件是否存在
                 if (display->camera_image_ != nullptr) {
+                    // 第一次设置时，更新图像控件大小
+                    if (frame_count == 0) {
+                        lv_obj_set_size(display->camera_image_, width, height);
+                        lv_obj_align(display->camera_image_, LV_ALIGN_CENTER, 0, 0);
+                        ESP_LOGI(TAG, "Updated camera image size to %dx%d", width, height);
+                    }
+
                     lv_image_dsc_t img_dsc;
-                    img_dsc.header.w = fb->width;
-                    img_dsc.header.h = fb->height;
-                    img_dsc.data_size = fb->width * fb->height * 2;
-                    img_dsc.data = (const uint8_t*)rgb_buffer;
+                    img_dsc.header.w = width;
+                    img_dsc.header.h = height;
+                    img_dsc.data_size = rgb_len;
+                    img_dsc.data = rgb_data;
                     img_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
 
-                    if (frame_count == 0) {
-                        ESP_LOGI(TAG, "Setting image: %dx%d, cf=%d", fb->width, fb->height, img_dsc.header.cf);
-                    }
                     lv_image_set_src(display->camera_image_, &img_dsc);
-                    lv_obj_set_size(display->camera_image_, fb->width, fb->height);
                     // 设置相机图像旋转 270 度（逆时针 90 度）来抵消 LVGL 的 90 度旋转
-                    lv_image_set_rotation(display->camera_image_, 2700);  // 2700 = 270.0 度 (LVGL 使用 10 倍精度)
+                    lv_image_set_rotation(display->camera_image_, 2700);
                     lv_obj_invalidate(display->camera_image_);
                 } else {
                     ESP_LOGE(TAG, "camera_image_ is NULL!");
@@ -162,11 +208,16 @@ void CameraDisplay::CameraTask(void* arg) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             error_count = 0;
         } else {
-            vTaskDelay(pdMS_TO_TICKS(33));
+            vTaskDelay(pdMS_TO_TICKS(33));  // ~30fps
         }
     }
 
     ESP_LOGI(TAG, "Camera task stopped, captured %d frames", frame_count);
-    free(rgb_buffer);
+
+    // 清理解码缓冲区
+    if (decoded_rgb != nullptr) {
+        heap_caps_free(decoded_rgb);
+    }
+
     vTaskDelete(nullptr);
 }
