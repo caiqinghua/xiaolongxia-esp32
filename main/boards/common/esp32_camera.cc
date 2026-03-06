@@ -14,6 +14,7 @@
 #include "mcp_server.h"
 #include "system_info.h"
 #include "jpg/image_to_jpeg.h"
+#include "jpg/jpeg_to_image.h"
 #include "esp_timer.h"
 
 #define TAG "Esp32Camera"
@@ -120,8 +121,37 @@ bool Esp32Camera::Capture() {
             }
         }
     } else if (current_fb_->format == PIXFORMAT_JPEG) {
-        // JPEG format preview usually requires decoding, skip preview display for now, just log
-        ESP_LOGW(TAG, "JPEG capture success, len=%zu, but not supported for preview", current_fb_->len);
+        // JPEG格式：解码为RGB565用于预览
+        ESP_LOGI(TAG, "JPEG capture, decoding for preview...");
+
+        uint8_t *decoded_rgb = nullptr;
+        size_t decoded_len = 0;
+        size_t width = 0, height = 0, stride = 0;
+        esp_err_t ret = jpeg_to_image(current_fb_->buf, current_fb_->len, &decoded_rgb, &decoded_len, &width, &height, &stride);
+
+        if (ret == ESP_OK && decoded_rgb != nullptr) {
+            size_t data_size = width * height * 2;
+
+            // 显示预览
+            uint8_t *preview_data = (uint8_t *)heap_caps_malloc(data_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (preview_data != nullptr) {
+                memcpy(preview_data, decoded_rgb, data_size);
+                auto display = dynamic_cast<LvglDisplay *>(Board::GetInstance().GetDisplay());
+                if (display != nullptr) {
+                    ESP_LOGI(TAG, "Showing preview: %dx%d", width, height);
+                    display->SetPreviewImage(std::make_unique<LvglAllocatedImage>(preview_data, data_size, width, height, stride, LV_COLOR_FORMAT_RGB565));
+                } else {
+                    heap_caps_free(preview_data);
+                }
+            }
+
+            // 释放解码缓冲区（JPEG数据已保存到current_fb_）
+            heap_caps_free(decoded_rgb);
+
+            ESP_LOGI(TAG, "JPEG decoded for preview: %dx%d", width, height);
+        } else {
+            ESP_LOGE(TAG, "Failed to decode JPEG for preview: %d", ret);
+        }
     }
 
     ESP_LOGI(TAG, "Captured frame: %dx%d, len=%zu, format=%d",
