@@ -1155,16 +1155,14 @@ void Application::HandleToggleCameraEvent() {
                 // 创建相机图像控件
                 lv_obj_t* camera_img = lv_image_create(scr);
 
-                // 设置为全屏，占据整个屏幕
-                //
-                //
+                // 设置为全屏（竖向320x480）
                 lv_obj_set_size(camera_img, 320, 480);
-                ESP_LOGI(TAG, "Camera image created: 320x480");
-                lv_obj_align(camera_img, LV_ALIGN_CENTER, 0, 0);  // 从(0,0)开始
+                ESP_LOGI(TAG, "Camera image created: 320x480 (portrait)");
+                lv_obj_align(camera_img, LV_ALIGN_CENTER, 0, 0);
                 lv_obj_set_style_bg_color(camera_img, lv_color_black(), 0);
                 lv_obj_set_style_bg_opa(camera_img, LV_OPA_COVER, 0);
-                lv_obj_set_style_pad_all(camera_img, 0, 0);  // 移除所有内边距
-                lv_obj_set_style_border_width(camera_img, 0, 0);  // 移除边框
+                lv_obj_set_style_pad_all(camera_img, 0, 0);
+                lv_obj_set_style_border_width(camera_img, 0, 0);
 
                 // 设置到相机显示
                 camera_display_->SetCameraImage(camera_img);

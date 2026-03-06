@@ -36,8 +36,8 @@
 
 
 
-#define DISPLAY_WIDTH           480
-#define DISPLAY_HEIGHT          320
+#define DISPLAY_WIDTH           320
+#define DISPLAY_HEIGHT          480
 #define DISPLAY_TRANS_SIZE      (DISPLAY_WIDTH * 10)
 
 #define DISPLAY_MIRROR_X        false
@@ -49,7 +49,7 @@
 #define DISPLAY_OFFSET_X        0
 #define DISPLAY_OFFSET_Y        0
 
-#define LV_DISPLAY_ROTATION LV_DISPLAY_ROTATION_90
+#define LV_DISPLAY_ROTATION LV_DISPLAY_ROTATION_0
 
 #define DISPLAY_BACKLIGHT_PIN   GPIO_NUM_6
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT false

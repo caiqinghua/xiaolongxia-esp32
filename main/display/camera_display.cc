@@ -185,14 +185,12 @@ void CameraDisplay::CameraTask(void* arg) {
                     img_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
 
                     lv_image_set_src(display->camera_image_, &img_dsc);
-                    // 设置相机图像旋转 270 度（逆时针 90 度）来抵消 LVGL 的 90 度旋转
-                    lv_image_set_rotation(display->camera_image_, 2700);
 
-                    // 设置图像居中对齐
-                    // lv_image_set_align(display->camera_image_, LV_IMAGE_ALIGN_CENTER);
+                    // 相机图像旋转90度以适应竖屏
+                    lv_image_set_rotation(display->camera_image_, 2700);  // 2700 = 90度 × 30
 
                     if (frame_count == 0) {
-                        ESP_LOGI(TAG, "Image displayed: %dx%d, centered in 320x480 widget", width, height);
+                        ESP_LOGI(TAG, "Image displayed: %dx%d (no rotation)", width, height);
                     }
 
                     lv_obj_invalidate(display->camera_image_);
