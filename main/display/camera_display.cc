@@ -186,8 +186,8 @@ void CameraDisplay::CameraTask(void* arg) {
 
                     lv_image_set_src(display->camera_image_, &img_dsc);
 
-                    // 相机图像旋转90度以适应竖屏
-                    lv_image_set_rotation(display->camera_image_, 2700);  // 2700 = 90度 × 30
+                    // 相机已经是320x480竖屏，不需要旋转
+                    lv_image_set_rotation(display->camera_image_, 0);
 
                     if (frame_count == 0) {
                         ESP_LOGI(TAG, "Image displayed: %dx%d (no rotation)", width, height);

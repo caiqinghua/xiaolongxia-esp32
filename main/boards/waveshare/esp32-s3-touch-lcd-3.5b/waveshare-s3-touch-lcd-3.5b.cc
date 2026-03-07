@@ -206,7 +206,7 @@ private:
         config.pin_pwdn = CAM_PIN_PWDN;
         config.pin_reset = CAM_PIN_RESET;
         config.xclk_freq_hz = 10000000;
-        config.frame_size = FRAMESIZE_HVGA;  // HVGA (480x320) - 旋转后正好填满320x480屏幕
+        config.frame_size = FRAMESIZE_320X480;  // 320x480 竖屏，直接匹配屏幕
         config.pixel_format = PIXFORMAT_JPEG;  // JPEG 格式
         config.grab_mode = CAMERA_GRAB_LATEST;
         config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -224,8 +224,8 @@ private:
             // OV5640 传感器配置
             if (s->id.PID == OV5640_PID) {
                 s->set_vflip(s, 1);  // 垂直翻转
-                ESP_LOGI(TAG, "OV5640: Set frame size to HVGA (480x320)");
-                s->set_framesize(s, FRAMESIZE_HVGA);
+                ESP_LOGI(TAG, "OV5640: Set frame size to 320x480");
+                s->set_framesize(s, FRAMESIZE_320X480);
             }
 
             // 验证帧大小设置
