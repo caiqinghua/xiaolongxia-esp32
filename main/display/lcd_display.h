@@ -67,8 +67,8 @@ public:
     // 显示文字结果在preview_image_位置（替代相机预览）
     void ShowTextResult(const char* text);
 
-    // 清除文字结果并恢复相机预览
-    void ClearTextResult();
+    // 关闭文本结果显示控件，恢复相机预览
+    void CloseTextResult();
 };
 
 // SPI LCD display

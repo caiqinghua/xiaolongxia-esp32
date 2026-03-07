@@ -737,7 +737,11 @@ void Application::HandleToggleChatEvent() {
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
+        ESP_LOGI(TAG, "ToggleChat: stopping listening and closing text result");
         protocol_->CloseAudioChannel();
+
+        // 关闭文本结果并恢复相机预览
+        CloseTextResultAndRestorePreview();
     }
 }
 
@@ -792,18 +796,24 @@ void Application::HandleStartListeningEvent() {
 void Application::HandleStopListeningEvent() {
     auto state = GetDeviceState();
 
+    ESP_LOGI(TAG, "HandleStopListeningEvent: state=%d", state);
+
     if (state == kDeviceStateAudioTesting) {
         audio_service_.EnableAudioTesting(false);
         SetDeviceState(kDeviceStateWifiConfiguring);
         return;
     } else if (state == kDeviceStateListening) {
+        ESP_LOGI(TAG, "Stopping listening, will close text result");
         if (protocol_) {
             protocol_->SendStopListening();
         }
         SetDeviceState(kDeviceStateIdle);
 
-        // 清除文字结果并恢复相机预览
-        ClearTextResultAndRestorePreview();
+        // 关闭文本结果并恢复相机预览
+        ESP_LOGI(TAG, "Calling CloseTextResultAndRestorePreview");
+        CloseTextResultAndRestorePreview();
+    } else {
+        ESP_LOGI(TAG, "Not in listening state (state=%d), ignoring stop event", state);
     }
 }
 
@@ -1177,23 +1187,35 @@ void Application::ResumeCameraPreview() {
     }
 }
 
-void Application::ClearTextResultAndRestorePreview() {
+void Application::CloseTextResultAndRestorePreview() {
     auto display = Board::GetInstance().GetDisplay();
     auto lcd_display = dynamic_cast<LcdDisplay*>(display);
 
-    // 清除文字结果
+    ESP_LOGI(TAG, "CloseTextResultAndRestorePreview called");
+    ESP_LOGI(TAG, "camera_display_: %p, IsRunning: %d", camera_display_,
+             camera_display_ != nullptr ? camera_display_->IsRunning() : -1);
+
+    // 关闭文本结果控件
     if (lcd_display != nullptr) {
-        lcd_display->ClearTextResult();
+        lcd_display->CloseTextResult();
+        ESP_LOGI(TAG, "Text result closed");
     }
 
     // 恢复相机预览
-    if (camera_display_ != nullptr && !camera_display_->IsRunning()) {
-        ESP_LOGI(TAG, "Restoring camera preview");
-        if (camera_display_->Start()) {
-            ESP_LOGI(TAG, "Camera preview restored successfully");
+    if (camera_display_ != nullptr) {
+        if (!camera_display_->IsRunning()) {
+            ESP_LOGI(TAG, "Starting camera preview...");
+            if (camera_display_->Start()) {
+                ESP_LOGI(TAG, "Camera preview restored successfully");
+                camera_preview_paused_ = false;
+            } else {
+                ESP_LOGE(TAG, "Failed to restore camera preview");
+            }
         } else {
-            ESP_LOGE(TAG, "Failed to restore camera preview");
+            ESP_LOGI(TAG, "Camera preview already running");
         }
+    } else {
+        ESP_LOGE(TAG, "camera_display_ is nullptr, cannot restore preview");
     }
 }
 

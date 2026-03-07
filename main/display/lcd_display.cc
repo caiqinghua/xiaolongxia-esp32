@@ -6,12 +6,14 @@
 
 #include <vector>
 #include <algorithm>
+#include <string>
 #include <font_awesome.h>
 #include <esp_log.h>
 #include <esp_err.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
 #include <cstring>
+#include <cJSON.h>
 #include <src/misc/cache/lv_cache.h>
 
 #include "board.h"
@@ -1054,30 +1056,103 @@ void LcdDisplay::ShowTextResult(const char* text) {
         }
     }
 
+    // 解析JSON，提取text字段并清理
+    std::string clean_text;
+    cJSON* json = cJSON_Parse(text);
+    if (json && cJSON_IsObject(json)) {
+        cJSON* text_item = cJSON_GetObjectItem(json, "text");
+        if (text_item && cJSON_IsString(text_item)) {
+            const char* text_content = text_item->valuestring;
+
+            // 查找所有引号对，提取英文内容
+            std::vector<std::string> quoted_texts;
+            const char* p = text_content;
+            while (*p) {
+                // 查找开始引号
+                const char* quote_start = strchr(p, '"');
+                if (quote_start == nullptr) break;
+
+                // 查找结束引号
+                const char* quote_end = strchr(quote_start + 1, '"');
+                if (quote_end == nullptr) break;
+
+                // 提取引号之间的内容
+                std::string content(quote_start + 1, quote_end - quote_start - 1);
+
+                // 检查是否包含英文字母（过滤掉中文引号）
+                bool has_english = false;
+                for (char c : content) {
+                    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+                        has_english = true;
+                        break;
+                    }
+                }
+
+                if (has_english && content.length() > 10) {  // 至少10个字符
+                    quoted_texts.push_back(content);
+                }
+
+                p = quote_end + 1;
+            }
+
+            // 如果找到了引号内容，合并它们
+            if (!quoted_texts.empty()) {
+                for (size_t i = 0; i < quoted_texts.size(); i++) {
+                    if (i > 0) {
+                        clean_text += " ";  // 段落之间加空格
+                    }
+                    clean_text += quoted_texts[i];
+                }
+            }
+
+            // 如果没有找到引号内容，使用备用方案：跳过中文前缀
+            if (clean_text.empty()) {
+                const char* start = text_content;
+                while (*start && (*start < 'A' || (*start > 'Z' && *start < 'a') || *start > 'z')) {
+                    if (*start == '\n') {
+                        start++;
+                        break;
+                    }
+                    start++;
+                }
+
+                for (const char* p = start; *p; p++) {
+                    if (*p != '\n' && *p != '\r' && *p != '"') {  // 同时移除引号
+                        clean_text += *p;
+                    } else if (*p == '\n' || *p == '\r') {
+                        clean_text += ' ';
+                    }
+                }
+            }
+        }
+        cJSON_Delete(json);
+    }
+
+    // 如果解析失败，使用原始文本
+    if (clean_text.empty()) {
+        clean_text = "Failed to parse result";
+    }
+
     // 创建新的label显示文字结果
     auto screen = lv_screen_active();
-    ESP_LOGI(TAG, "Creating text result label, screen: %p", screen);
-
     if (screen != nullptr && lvgl_port_lock(0)) {
         text_result_label_ = lv_label_create(screen);
-        ESP_LOGI(TAG, "Label created: %p", text_result_label_);
 
         // 设置大小（不完全覆盖屏幕，留出边距）
         lv_obj_set_size(text_result_label_, 300, 400);
         lv_obj_align(text_result_label_, LV_ALIGN_CENTER, 0, 0);
 
         // 设置文字内容
-        lv_label_set_text(text_result_label_, text);
-        ESP_LOGI(TAG, "Text set to label: %s", text);
+        lv_label_set_text(text_result_label_, clean_text.c_str());
 
         // 设置文字样式：强制使用白色文字，确保可见
         lv_obj_set_style_text_align(text_result_label_, LV_TEXT_ALIGN_LEFT, 0);
         lv_obj_set_style_text_font(text_result_label_, lvgl_theme->text_font()->font(), 0);
         lv_obj_set_style_text_color(text_result_label_, lv_color_white(), 0);
 
-        // 启用滚动模式（长文字可以滚动查看）
-        lv_label_set_long_mode(text_result_label_, LV_LABEL_LONG_SCROLL);
-        lv_obj_set_style_pad_all(text_result_label_, 12, 0);
+        // 启用自动换行模式，让文字充满整个区域
+        lv_label_set_long_mode(text_result_label_, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_pad_all(text_result_label_, 16, 0);
 
         // 设置背景：深灰色背景，高对比度
         lv_obj_set_style_bg_color(text_result_label_, lv_color_hex(0x333333), 0);
@@ -1093,33 +1168,47 @@ void LcdDisplay::ShowTextResult(const char* text) {
         lv_obj_invalidate(text_result_label_);
 
         lvgl_port_unlock();
-        ESP_LOGI(TAG, "Text result label setup complete");
-    } else {
-        ESP_LOGE(TAG, "Failed to create text result label: screen=%p, lock=%d",
-                 screen, screen != nullptr);
     }
 
-    ESP_LOGI(TAG, "Text result displayed on screen");
+    ESP_LOGI(TAG, "Text result displayed: %s", clean_text.c_str());
 }
 
-void LcdDisplay::ClearTextResult() {
+void LcdDisplay::CloseTextResult() {
     DisplayLockGuard lock(this);
+
+    ESP_LOGI(TAG, "CloseTextResult called, text_result_label_: %p, preview_image_: %p",
+             text_result_label_, preview_image_);
 
     // 删除文字结果label
     if (text_result_label_ != nullptr) {
+        ESP_LOGI(TAG, "Deleting text_result_label_");
+
+        // 尝试获取LVGL锁
         if (lvgl_port_lock(0)) {
+            ESP_LOGI(TAG, "LVGL lock acquired, deleting label");
             lv_obj_del(text_result_label_);
             text_result_label_ = nullptr;
+            // 强制刷新整个屏幕
+            lv_obj_invalidate(lv_screen_active());
             lvgl_port_unlock();
+            ESP_LOGI(TAG, "text_result_label_ deleted and screen invalidated");
+        } else {
+            ESP_LOGE(TAG, "Failed to acquire LVGL lock!");
         }
+    } else {
+        ESP_LOGI(TAG, "text_result_label_ is nullptr, nothing to delete");
     }
 
     // 恢复preview_image_显示（恢复相机预览）
     if (preview_image_ != nullptr) {
+        ESP_LOGI(TAG, "Removing HIDDEN flag from preview_image_");
         lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(preview_image_);
+    } else {
+        ESP_LOGE(TAG, "preview_image_ is nullptr!");
     }
 
-    ESP_LOGI(TAG, "Text result cleared, camera preview restored");
+    ESP_LOGI(TAG, "Text result closed, camera preview restored");
 }
 
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {

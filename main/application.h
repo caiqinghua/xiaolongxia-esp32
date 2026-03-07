@@ -123,10 +123,10 @@ public:
     void ResumeCameraPreview();
 
     /**
-     * Clear text result and restore camera preview
+     * Close text result and restore camera preview
      * Called when user presses BOOT button to exit listening
      */
-    void ClearTextResultAndRestorePreview();
+    void CloseTextResultAndRestorePreview();
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
