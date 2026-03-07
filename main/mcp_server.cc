@@ -14,6 +14,7 @@
 
 #include "application.h"
 #include "display.h"
+#include "lcd_display.h"
 #include "oled_display.h"
 #include "board.h"
 #include "settings.h"
@@ -130,14 +131,16 @@ void McpServer::AddCommonTools() {
                     auto question = properties["question"].value<std::string>();
                     std::string result = camera->Explain(question);
 
-                    // explain完成后恢复相机预览
-                    if (was_running) {
-                        app.ResumeCameraPreview();
+                    // 成功获取结果后，将结果显示在预览位置，不恢复预览
+                    auto display = Board::GetInstance().GetDisplay();
+                    auto lcd_display = dynamic_cast<LcdDisplay*>(display);
+                    if (lcd_display != nullptr) {
+                        lcd_display->ShowTextResult(result.c_str());
                     }
 
                     return result;
                 } catch (...) {
-                    // 出错时也要恢复相机预览
+                    // 出错时恢复相机预览
                     if (was_running) {
                         app.ResumeCameraPreview();
                     }

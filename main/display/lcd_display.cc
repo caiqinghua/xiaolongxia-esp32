@@ -1036,6 +1036,92 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
 }
 
+void LcdDisplay::ShowTextResult(const char* text) {
+    DisplayLockGuard lock(this);
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+
+    // 隐藏preview_image_（停止显示相机预览）
+    if (preview_image_ != nullptr) {
+        lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // 如果text_result_label_已经存在，删除它
+    if (text_result_label_ != nullptr) {
+        if (lvgl_port_lock(0)) {
+            lv_obj_del(text_result_label_);
+            text_result_label_ = nullptr;
+            lvgl_port_unlock();
+        }
+    }
+
+    // 创建新的label显示文字结果
+    auto screen = lv_screen_active();
+    ESP_LOGI(TAG, "Creating text result label, screen: %p", screen);
+
+    if (screen != nullptr && lvgl_port_lock(0)) {
+        text_result_label_ = lv_label_create(screen);
+        ESP_LOGI(TAG, "Label created: %p", text_result_label_);
+
+        // 设置大小（不完全覆盖屏幕，留出边距）
+        lv_obj_set_size(text_result_label_, 300, 400);
+        lv_obj_align(text_result_label_, LV_ALIGN_CENTER, 0, 0);
+
+        // 设置文字内容
+        lv_label_set_text(text_result_label_, text);
+        ESP_LOGI(TAG, "Text set to label: %s", text);
+
+        // 设置文字样式：强制使用白色文字，确保可见
+        lv_obj_set_style_text_align(text_result_label_, LV_TEXT_ALIGN_LEFT, 0);
+        lv_obj_set_style_text_font(text_result_label_, lvgl_theme->text_font()->font(), 0);
+        lv_obj_set_style_text_color(text_result_label_, lv_color_white(), 0);
+
+        // 启用滚动模式（长文字可以滚动查看）
+        lv_label_set_long_mode(text_result_label_, LV_LABEL_LONG_SCROLL);
+        lv_obj_set_style_pad_all(text_result_label_, 12, 0);
+
+        // 设置背景：深灰色背景，高对比度
+        lv_obj_set_style_bg_color(text_result_label_, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_bg_opa(text_result_label_, LV_OPA_90, 0);
+        lv_obj_set_style_radius(text_result_label_, 12, 0);
+        lv_obj_set_style_border_width(text_result_label_, 2, 0);
+        lv_obj_set_style_border_color(text_result_label_, lv_color_white(), 0);
+
+        // 显示在最上层
+        lv_obj_move_foreground(text_result_label_);
+
+        // 强制刷新
+        lv_obj_invalidate(text_result_label_);
+
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "Text result label setup complete");
+    } else {
+        ESP_LOGE(TAG, "Failed to create text result label: screen=%p, lock=%d",
+                 screen, screen != nullptr);
+    }
+
+    ESP_LOGI(TAG, "Text result displayed on screen");
+}
+
+void LcdDisplay::ClearTextResult() {
+    DisplayLockGuard lock(this);
+
+    // 删除文字结果label
+    if (text_result_label_ != nullptr) {
+        if (lvgl_port_lock(0)) {
+            lv_obj_del(text_result_label_);
+            text_result_label_ = nullptr;
+            lvgl_port_unlock();
+        }
+    }
+
+    // 恢复preview_image_显示（恢复相机预览）
+    if (preview_image_ != nullptr) {
+        lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    ESP_LOGI(TAG, "Text result cleared, camera preview restored");
+}
+
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!", role, content);

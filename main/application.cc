@@ -791,7 +791,7 @@ void Application::HandleStartListeningEvent() {
 
 void Application::HandleStopListeningEvent() {
     auto state = GetDeviceState();
-    
+
     if (state == kDeviceStateAudioTesting) {
         audio_service_.EnableAudioTesting(false);
         SetDeviceState(kDeviceStateWifiConfiguring);
@@ -801,6 +801,9 @@ void Application::HandleStopListeningEvent() {
             protocol_->SendStopListening();
         }
         SetDeviceState(kDeviceStateIdle);
+
+        // 清除文字结果并恢复相机预览
+        ClearTextResultAndRestorePreview();
     }
 }
 
@@ -1171,6 +1174,26 @@ void Application::ResumeCameraPreview() {
             ESP_LOGE(TAG, "Failed to resume camera preview");
         }
         camera_preview_paused_ = false;
+    }
+}
+
+void Application::ClearTextResultAndRestorePreview() {
+    auto display = Board::GetInstance().GetDisplay();
+    auto lcd_display = dynamic_cast<LcdDisplay*>(display);
+
+    // 清除文字结果
+    if (lcd_display != nullptr) {
+        lcd_display->ClearTextResult();
+    }
+
+    // 恢复相机预览
+    if (camera_display_ != nullptr && !camera_display_->IsRunning()) {
+        ESP_LOGI(TAG, "Restoring camera preview");
+        if (camera_display_->Start()) {
+            ESP_LOGI(TAG, "Camera preview restored successfully");
+        } else {
+            ESP_LOGE(TAG, "Failed to restore camera preview");
+        }
     }
 }
 

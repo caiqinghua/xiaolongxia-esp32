@@ -27,6 +27,7 @@ protected:
     lv_obj_t* side_bar_ = nullptr;
     lv_obj_t* bottom_bar_ = nullptr;
     lv_obj_t* preview_image_ = nullptr;
+    lv_obj_t* text_result_label_ = nullptr;  // 用于显示拍照识别的文字结果
     lv_obj_t* emoji_label_ = nullptr;
     lv_obj_t* emoji_image_ = nullptr;
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
@@ -62,6 +63,12 @@ public:
 
     // Get emoji box object for hiding during camera mode
     lv_obj_t* GetEmojiBox() { return emoji_box_; }
+
+    // 显示文字结果在preview_image_位置（替代相机预览）
+    void ShowTextResult(const char* text);
+
+    // 清除文字结果并恢复相机预览
+    void ClearTextResult();
 };
 
 // SPI LCD display

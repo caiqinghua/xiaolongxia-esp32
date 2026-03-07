@@ -122,6 +122,12 @@ public:
      */
     void ResumeCameraPreview();
 
+    /**
+     * Clear text result and restore camera preview
+     * Called when user presses BOOT button to exit listening
+     */
+    void ClearTextResultAndRestorePreview();
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
