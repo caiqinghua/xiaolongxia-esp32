@@ -18,6 +18,8 @@
 
 #include "board.h"
 #include "application.h"
+#include "settings.h"
+#include "system_info.h"
 
 #define TAG "LcdDisplay"
 
@@ -1060,13 +1062,130 @@ static void WordClickCallback(lv_event_t* e) {
     if (context != nullptr) {
         ESP_LOGI(TAG, "Word CLICKED: %s", context->word.c_str());
 
-        // 构造翻译消息：使用SendText发送"翻译 word"格式
-        std::string message = "翻译 " + context->word;
-        ESP_LOGI(TAG, "Sending translate request: %s", message.c_str());
+        // 显示正在查询的提示
+        auto display = Board::GetInstance().GetDisplay();
+        if (display != nullptr) {
+            std::string prompt = "正在查询单词: " + context->word;
+            display->SetChatMessage("system", prompt.c_str());
+        }
 
-        // 通过Application::SendText发送
-        Application::GetInstance().SendText(message);
-        ESP_LOGI(TAG, "Translate message sent via SendText");
+        // 播放提示音
+        auto& app = Application::GetInstance();
+        app.PlaySound(Lang::Sounds::OGG_POPUP);
+
+        // 使用 camera->Explain 发送图片+问题到vision API
+        auto camera = Board::GetInstance().GetCamera();
+        if (camera != nullptr) {
+            try {
+                // 暂停相机预览，避免冲突
+                bool was_running = app.PauseCameraPreview();
+
+                // 等待预览完全停止
+                if (was_running) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+
+                try {
+                    // 先拍照
+                    if (!camera->Capture()) {
+                        throw std::runtime_error("Failed to capture photo");
+                    }
+
+                    // 构造问题：这是一个翻译任务，解释图片中某个单词的意思
+                    std::string question = "This is a translation task. Please explain what the word \"" +
+                                          context->word + "\" means in Chinese. The word is from the text in the image.";
+                    ESP_LOGI(TAG, "Translation question: %s", question.c_str());
+
+                    // 发送图片+问题到vision API（复用take photo的流程）
+                    std::string result = camera->Explain(question);
+                    ESP_LOGI(TAG, "Translation result: %s", result.c_str());
+
+                    // 显示查询结果
+                    if (display != nullptr) {
+                        // 解析JSON并显示text字段
+                        cJSON* json = cJSON_Parse(result.c_str());
+                        if (json != nullptr) {
+                            cJSON* text_item = cJSON_GetObjectItem(json, "text");
+                            if (text_item != nullptr && cJSON_IsString(text_item)) {
+                                const char* translation = text_item->valuestring;
+
+                                // 提取中文翻译部分
+                                // 格式: "The word "mechanic" in the text means "机械师" in Chinese."
+                                std::string chinese_text;
+                                std::string translation_str = translation;
+
+                                // 查找 "means \"" 后的第一个引号内容（中文翻译）
+                                size_t means_pos = translation_str.find("means \"");
+                                if (means_pos != std::string::npos) {
+                                    size_t start_pos = translation_str.find("\"", means_pos + 7);
+                                    if (start_pos != std::string::npos) {
+                                        size_t end_pos = translation_str.find("\"", start_pos + 1);
+                                        if (end_pos != std::string::npos) {
+                                            chinese_text = translation_str.substr(start_pos + 1, end_pos - start_pos - 1);
+                                        }
+                                    }
+                                }
+
+                                // 如果没有找到标准格式，尝试查找所有中文内容
+                                if (chinese_text.empty()) {
+                                    for (size_t i = 0; i < translation_str.length(); ) {
+                                        if ((translation_str[i] & 0x80) != 0) {  // 中文字符
+                                            size_t start = i;
+                                            while (i < translation_str.length() && (translation_str[i] & 0x80) != 0) {
+                                                i++;
+                                            }
+                                            std::string segment = translation_str.substr(start, i - start);
+                                            if (!chinese_text.empty()) {
+                                                chinese_text += " ";
+                                            }
+                                            chinese_text += segment;
+                                        } else {
+                                            i++;
+                                        }
+                                    }
+                                }
+
+                                // 显示中文翻译结果
+                                if (!chinese_text.empty()) {
+                                    display->SetChatMessage("system", chinese_text.c_str());
+                                    ESP_LOGI(TAG, "Extracted Chinese translation: %s", chinese_text.c_str());
+                                } else {
+                                    display->SetChatMessage("system", translation);
+                                }
+                            } else {
+                                display->SetChatMessage("system", result.c_str());
+                            }
+                            cJSON_Delete(json);
+                        } else {
+                            display->SetChatMessage("system", result.c_str());
+                        }
+                    }
+                } catch (...) {
+                    // 出错时恢复相机预览
+                    if (was_running) {
+                        app.ResumeCameraPreview();
+                    }
+                    throw;
+                }
+
+                // 成功获取结果后，恢复相机预览
+                if (was_running) {
+                    app.ResumeCameraPreview();
+                }
+
+            } catch (const std::exception& e) {
+                ESP_LOGE(TAG, "Failed to translate word: %s", e.what());
+                if (display != nullptr) {
+                    std::string error = "翻译失败: " + std::string(e.what());
+                    display->SetChatMessage("system", error.c_str());
+                }
+            }
+        } else {
+            ESP_LOGE(TAG, "Camera is not available");
+            if (display != nullptr) {
+                display->SetChatMessage("system", "相机不可用");
+            }
+        }
     } else {
         ESP_LOGE(TAG, "WordClickCallback: context is nullptr!");
     }
