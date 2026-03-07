@@ -1119,6 +1119,15 @@ void Application::SendMcpMessage(const std::string& payload) {
     });
 }
 
+void Application::SendText(const std::string& text) {
+    // Always schedule to run in main task for thread safety
+    Schedule([this, text = std::move(text)]() {
+        if (protocol_) {
+            protocol_->SendUserText(text);
+        }
+    });
+}
+
 void Application::SetAecMode(AecMode mode) {
     aec_mode_ = mode;
     Schedule([this]() {

@@ -69,6 +69,10 @@ public:
 
     // 关闭文本结果显示控件，恢复相机预览
     void CloseTextResult();
+
+private:
+    // 创建可点击的单词按钮
+    void CreateWordButton(lv_obj_t* parent, const std::string& word, const std::string& full_text, class LvglTheme* theme);
 };
 
 // SPI LCD display

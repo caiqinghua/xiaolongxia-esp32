@@ -17,6 +17,7 @@
 #include <src/misc/cache/lv_cache.h>
 
 #include "board.h"
+#include "application.h"
 
 #define TAG "LcdDisplay"
 
@@ -1038,6 +1039,39 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
 }
 
+// 存储单词点击上下文的结构
+struct WordClickContext {
+    std::string word;
+    std::string full_text;
+};
+
+// 单词点击回调函数
+static void WordClickCallback(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+
+    // 只处理CLICKED事件，避免滑动时误触发
+    if (code != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+    WordClickContext* context = (WordClickContext*)lv_obj_get_user_data(btn);
+
+    if (context != nullptr) {
+        ESP_LOGI(TAG, "Word CLICKED: %s", context->word.c_str());
+
+        // 构造翻译消息：使用SendText发送"翻译 word"格式
+        std::string message = "翻译 " + context->word;
+        ESP_LOGI(TAG, "Sending translate request: %s", message.c_str());
+
+        // 通过Application::SendText发送
+        Application::GetInstance().SendText(message);
+        ESP_LOGI(TAG, "Translate message sent via SendText");
+    } else {
+        ESP_LOGE(TAG, "WordClickCallback: context is nullptr!");
+    }
+}
+
 void LcdDisplay::ShowTextResult(const char* text) {
     DisplayLockGuard lock(this);
     auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
@@ -1055,6 +1089,8 @@ void LcdDisplay::ShowTextResult(const char* text) {
             lvgl_port_unlock();
         }
     }
+
+    ESP_LOGI(TAG, "=== ShowTextResult: Starting to create clickable words ===");
 
     // 解析JSON，提取text字段并清理
     std::string clean_text;
@@ -1124,6 +1160,39 @@ void LcdDisplay::ShowTextResult(const char* text) {
                     }
                 }
             }
+
+            // 移除中文翻译后缀：查找"中文翻译："或类似的中文文本
+            size_t translation_pos = clean_text.find("中文翻译");
+            if (translation_pos != std::string::npos) {
+                // 向前查找冒号位置
+                size_t colon_pos = clean_text.find(':', translation_pos);
+                if (colon_pos != std::string::npos) {
+                    clean_text = clean_text.substr(0, colon_pos);
+                }
+                // 移除末尾的空格
+                while (!clean_text.empty() && (clean_text.back() == ' ' || clean_text.back() == '\t')) {
+                    clean_text.pop_back();
+                }
+            }
+
+            // 移除句末的中文标点和中文文本
+            while (!clean_text.empty()) {
+                char last_char = clean_text.back();
+                // 检查是否为中文字符（UTF-8编码中文字符的高位为1）
+                if ((unsigned char)last_char >= 0x80) {
+                    // 找到中文字符的开始位置（UTF-8中文字符通常占3个字节）
+                    size_t chinese_start = clean_text.length() - 3;
+                    if (chinese_start < clean_text.length()) {
+                        clean_text = clean_text.substr(0, chinese_start);
+                    } else {
+                        clean_text.clear();
+                    }
+                } else if (last_char == ' ' || last_char == '\t') {
+                    clean_text.pop_back();
+                } else {
+                    break;  // 遇到英文内容，停止
+                }
+            }
         }
         cJSON_Delete(json);
     }
@@ -1133,44 +1202,127 @@ void LcdDisplay::ShowTextResult(const char* text) {
         clean_text = "Failed to parse result";
     }
 
-    // 创建新的label显示文字结果
+    // 创建容器用于放置可点击的单词
     auto screen = lv_screen_active();
     if (screen != nullptr && lvgl_port_lock(0)) {
-        text_result_label_ = lv_label_create(screen);
-
-        // 设置大小（不完全覆盖屏幕，留出边距）
+        // 主容器：滚动区域
+        text_result_label_ = lv_obj_create(screen);
         lv_obj_set_size(text_result_label_, 300, 400);
         lv_obj_align(text_result_label_, LV_ALIGN_CENTER, 0, 0);
-
-        // 设置文字内容
-        lv_label_set_text(text_result_label_, clean_text.c_str());
-
-        // 设置文字样式：强制使用白色文字，确保可见
-        lv_obj_set_style_text_align(text_result_label_, LV_TEXT_ALIGN_LEFT, 0);
-        lv_obj_set_style_text_font(text_result_label_, lvgl_theme->text_font()->font(), 0);
-        lv_obj_set_style_text_color(text_result_label_, lv_color_white(), 0);
-
-        // 启用自动换行模式，让文字充满整个区域
-        lv_label_set_long_mode(text_result_label_, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_pad_all(text_result_label_, 16, 0);
-
-        // 设置背景：深灰色背景，高对比度
         lv_obj_set_style_bg_color(text_result_label_, lv_color_hex(0x333333), 0);
         lv_obj_set_style_bg_opa(text_result_label_, LV_OPA_90, 0);
         lv_obj_set_style_radius(text_result_label_, 12, 0);
         lv_obj_set_style_border_width(text_result_label_, 2, 0);
         lv_obj_set_style_border_color(text_result_label_, lv_color_white(), 0);
+        lv_obj_set_style_pad_all(text_result_label_, 16, 0);
+        lv_obj_set_scroll_snap_y(text_result_label_, LV_SCROLL_SNAP_NONE);
+
+        // 禁用滚动，避免拦截点击事件
+        lv_obj_set_scroll_dir(text_result_label_, LV_DIR_NONE);
+
+        // 确保容器不拦截点击事件
+        lv_obj_clear_flag(text_result_label_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(text_result_label_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(text_result_label_, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+
+        // 设置flex布局
+        lv_obj_set_layout(text_result_label_, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(text_result_label_, LV_FLEX_FLOW_ROW_WRAP);
+        lv_obj_set_flex_align(text_result_label_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+
+        ESP_LOGI(TAG, "=== Container created: %p ===", text_result_label_);
+
+        // 分割文本为单词并创建按钮
+        std::string word;
+        for (char c : clean_text) {
+            // 检查是否为标点符号
+            if (c == ' ' || c == '\t' || c == '\n' || c == ',' || c == '.' || c == '!' || c == '?' ||
+                c == ';' || c == ':' || c == '(' || c == ')' || c == '"' || c == '\'') {
+                // 先保存当前单词
+                if (!word.empty()) {
+                    CreateWordButton(text_result_label_, word, clean_text, lvgl_theme);
+                    word.clear();
+                }
+
+                // 标点符号作为单独的元素显示（但不可点击）
+                if (c == ' ') {
+                    lv_obj_t* space = lv_label_create(text_result_label_);
+                    lv_label_set_text(space, " ");
+                    lv_obj_set_style_text_color(space, lv_color_white(), 0);
+                    lv_obj_set_style_text_font(space, lvgl_theme->text_font()->font(), 0);
+                } else if (c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':') {
+                    // 标点符号后加空格
+                    std::string punct(1, c);
+                    lv_obj_t* punct_label = lv_label_create(text_result_label_);
+                    lv_label_set_text(punct_label, punct.c_str());
+                    lv_obj_set_style_text_color(punct_label, lv_color_white(), 0);
+                    lv_obj_set_style_text_font(punct_label, lvgl_theme->text_font()->font(), 0);
+                }
+            } else {
+                word += c;
+            }
+        }
+
+        // 处理最后一个单词
+        if (!word.empty()) {
+            CreateWordButton(text_result_label_, word, clean_text, lvgl_theme);
+        }
 
         // 显示在最上层
         lv_obj_move_foreground(text_result_label_);
-
-        // 强制刷新
         lv_obj_invalidate(text_result_label_);
 
         lvgl_port_unlock();
     }
 
-    ESP_LOGI(TAG, "Text result displayed: %s", clean_text.c_str());
+    ESP_LOGI(TAG, "Text result displayed with clickable words: %s", clean_text.c_str());
+}
+
+void LcdDisplay::CreateWordButton(lv_obj_t* parent, const std::string& word, const std::string& full_text, LvglTheme* theme) {
+    // 创建按钮对象
+    lv_obj_t* btn = lv_button_create(parent);
+
+    // 确保按钮可点击
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+
+    // 创建上下文数据（需要在堆上分配，因为需要持久存在）
+    WordClickContext* context = new WordClickContext{word, full_text};
+    lv_obj_set_user_data(btn, context);
+
+    // 只添加CLICKED事件，避免滑动时误触发
+    lv_obj_add_event_cb(btn, WordClickCallback, LV_EVENT_CLICKED, nullptr);
+
+    // 创建标签显示单词
+    lv_obj_t* label = lv_label_create(btn);
+    lv_label_set_text(label, word.c_str());
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(label, theme->text_font()->font(), 0);
+
+    // 确保标签不会拦截点击事件
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
+
+    // 设置按钮内边距
+    lv_obj_set_style_pad_all(btn, 2, 0);
+    lv_obj_set_style_pad_hor(btn, 4, 0);
+    lv_obj_set_height(btn, LV_SIZE_CONTENT);
+    lv_obj_set_width(btn, LV_SIZE_CONTENT);
+
+    // 设置按钮样式：默认透明，点击时高亮
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_50, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x4CAF50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(btn, 0, 0);
+
+    ESP_LOGI(TAG, "Button created: word='%s'", word.c_str());
+}
+
+// 清理单词上下文的回调函数
+static void CleanupWordContext(lv_obj_t* obj) {
+    WordClickContext* context = (WordClickContext*)lv_obj_get_user_data(obj);
+    if (context != nullptr) {
+        delete context;
+        lv_obj_set_user_data(obj, nullptr);
+    }
 }
 
 void LcdDisplay::CloseTextResult() {
@@ -1179,13 +1331,23 @@ void LcdDisplay::CloseTextResult() {
     ESP_LOGI(TAG, "CloseTextResult called, text_result_label_: %p, preview_image_: %p",
              text_result_label_, preview_image_);
 
-    // 删除文字结果label
+    // 删除文字结果容器
     if (text_result_label_ != nullptr) {
         ESP_LOGI(TAG, "Deleting text_result_label_");
 
         // 尝试获取LVGL锁
         if (lvgl_port_lock(0)) {
-            ESP_LOGI(TAG, "LVGL lock acquired, deleting label");
+            ESP_LOGI(TAG, "LVGL lock acquired, deleting container");
+
+            // 清理所有子按钮的WordClickContext
+            uint32_t child_count = lv_obj_get_child_count(text_result_label_);
+            for (uint32_t i = 0; i < child_count; i++) {
+                lv_obj_t* child = lv_obj_get_child(text_result_label_, i);
+                if (child != nullptr) {
+                    CleanupWordContext(child);
+                }
+            }
+
             lv_obj_del(text_result_label_);
             text_result_label_ = nullptr;
             // 强制刷新整个屏幕
