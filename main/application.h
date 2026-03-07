@@ -110,6 +110,18 @@ public:
      */
     void ToggleCameraMode();
 
+    /**
+     * Pause camera preview (for taking photos)
+     * Returns true if preview was paused, false if no preview was running
+     */
+    bool PauseCameraPreview();
+
+    /**
+     * Resume camera preview (after taking photos)
+     * Only resumes if preview was previously paused
+     */
+    void ResumeCameraPreview();
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
@@ -153,6 +165,7 @@ private:
     // 相机显示
     class CameraDisplay* camera_display_ = nullptr;
     bool camera_mode_enabled_ = false;
+    bool camera_preview_paused_ = false;  // 记录预览是否被暂停
 
 
     // Event handlers

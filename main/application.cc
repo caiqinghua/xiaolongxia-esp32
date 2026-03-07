@@ -1152,6 +1152,28 @@ void Application::ToggleCameraMode() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CAMERA);
 }
 
+bool Application::PauseCameraPreview() {
+    if (camera_display_ != nullptr && camera_display_->IsRunning()) {
+        ESP_LOGI(TAG, "Pausing camera preview for photo capture");
+        camera_display_->Stop();
+        camera_preview_paused_ = true;
+        return true;
+    }
+    return false;
+}
+
+void Application::ResumeCameraPreview() {
+    if (camera_preview_paused_ && camera_display_ != nullptr) {
+        ESP_LOGI(TAG, "Resuming camera preview after photo capture");
+        if (camera_display_->Start()) {
+            ESP_LOGI(TAG, "Camera preview resumed successfully");
+        } else {
+            ESP_LOGE(TAG, "Failed to resume camera preview");
+        }
+        camera_preview_paused_ = false;
+    }
+}
+
 void Application::HandleToggleCameraEvent() {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();

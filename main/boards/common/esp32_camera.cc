@@ -108,50 +108,10 @@ bool Esp32Camera::Capture() {
         } else {
             memcpy(encode_buf_, current_fb_->buf, data_size);
         }
-
-        // Allocate separate buffer for preview display
-        uint8_t *preview_data = (uint8_t *)heap_caps_malloc(data_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (preview_data != nullptr) {
-            memcpy(preview_data, encode_buf_, data_size);
-            auto display = dynamic_cast<LvglDisplay *>(Board::GetInstance().GetDisplay());
-            if (display != nullptr) {
-                display->SetPreviewImage(std::make_unique<LvglAllocatedImage>(preview_data, data_size, current_fb_->width, current_fb_->height, current_fb_->width * 2, LV_COLOR_FORMAT_RGB565));
-            } else {
-                heap_caps_free(preview_data);
-            }
-        }
+        ESP_LOGI(TAG, "RGB565 captured: %dx%d, %d bytes", current_fb_->width, current_fb_->height, data_size);
     } else if (current_fb_->format == PIXFORMAT_JPEG) {
-        // JPEG格式：解码为RGB565用于预览
-        ESP_LOGI(TAG, "JPEG capture, decoding for preview...");
-
-        uint8_t *decoded_rgb = nullptr;
-        size_t decoded_len = 0;
-        size_t width = 0, height = 0, stride = 0;
-        esp_err_t ret = jpeg_to_image(current_fb_->buf, current_fb_->len, &decoded_rgb, &decoded_len, &width, &height, &stride);
-
-        if (ret == ESP_OK && decoded_rgb != nullptr) {
-            size_t data_size = width * height * 2;
-
-            // 显示预览
-            uint8_t *preview_data = (uint8_t *)heap_caps_malloc(data_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (preview_data != nullptr) {
-                memcpy(preview_data, decoded_rgb, data_size);
-                auto display = dynamic_cast<LvglDisplay *>(Board::GetInstance().GetDisplay());
-                if (display != nullptr) {
-                    ESP_LOGI(TAG, "Showing preview: %dx%d", width, height);
-                    display->SetPreviewImage(std::make_unique<LvglAllocatedImage>(preview_data, data_size, width, height, stride, LV_COLOR_FORMAT_RGB565));
-                } else {
-                    heap_caps_free(preview_data);
-                }
-            }
-
-            // 释放解码缓冲区（JPEG数据已保存到current_fb_）
-            heap_caps_free(decoded_rgb);
-
-            ESP_LOGI(TAG, "JPEG decoded for preview: %dx%d", width, height);
-        } else {
-            ESP_LOGE(TAG, "Failed to decode JPEG for preview: %d", ret);
-        }
+        // JPEG格式：直接使用JPEG数据上传，不需要解码预览
+        ESP_LOGI(TAG, "JPEG captured: %dx%d, %d bytes", current_fb_->width, current_fb_->height, current_fb_->len);
     }
 
     ESP_LOGI(TAG, "Captured frame: %dx%d, len=%zu, format=%d",

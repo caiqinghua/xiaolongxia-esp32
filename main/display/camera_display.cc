@@ -65,23 +65,17 @@ void CameraDisplay::Stop() {
     ESP_LOGI(TAG, "Stopping camera display");
     is_running_ = false;
 
+    // 等待任务自己退出，不要强制删除
     if (camera_task_handle_) {
         for (int i = 0; i < 20 && camera_task_handle_ != nullptr; ++i) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        if (camera_task_handle_ != nullptr) {
-            vTaskDelete(camera_task_handle_);
-            camera_task_handle_ = nullptr;
-        }
+        // 任务会自己调用 vTaskDelete(nullptr) 退出
+        camera_task_handle_ = nullptr;
     }
 
-    if (camera_image_ != nullptr) {
-        if (lvgl_port_lock(0)) {
-            lv_obj_del(camera_image_);
-            camera_image_ = nullptr;
-            lvgl_port_unlock();
-        }
-    }
+    // 不删除 camera_image_，因为它是主界面的 preview_image_
+    // camera_image_ 由主界面管理，不应该在这里删除
 }
 
 void CameraDisplay::CameraTask(void* arg) {

@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cstring>
 #include <esp_pthread.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include "application.h"
 #include "display.h"
@@ -112,11 +114,35 @@ void McpServer::AddCommonTools() {
                 // Lower the priority to do the camera capture
                 TaskPriorityReset priority_reset(1);
 
-                if (!camera->Capture()) {
-                    throw std::runtime_error("Failed to capture photo");
+                // 暂停相机预览，避免冲突
+                auto& app = Application::GetInstance();
+                bool was_running = app.PauseCameraPreview();
+
+                // 等待预览完全停止
+                if (was_running) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
                 }
-                auto question = properties["question"].value<std::string>();
-                return camera->Explain(question);
+
+                try {
+                    if (!camera->Capture()) {
+                        throw std::runtime_error("Failed to capture photo");
+                    }
+                    auto question = properties["question"].value<std::string>();
+                    std::string result = camera->Explain(question);
+
+                    // explain完成后恢复相机预览
+                    if (was_running) {
+                        app.ResumeCameraPreview();
+                    }
+
+                    return result;
+                } catch (...) {
+                    // 出错时也要恢复相机预览
+                    if (was_running) {
+                        app.ResumeCameraPreview();
+                    }
+                    throw;
+                }
             });
     }
 #endif
