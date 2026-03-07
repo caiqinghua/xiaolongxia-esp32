@@ -353,9 +353,9 @@ private:
                 .interrupt = 0,
             },
             .flags = {
-                .swap_xy = 1,
-                .mirror_x = 1,
-                .mirror_y = 1,
+                .swap_xy = 0,  // 匹配显示配置
+                .mirror_x = 0, // 匹配显示配置
+                .mirror_y = 0, // 匹配显示配置
             },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
