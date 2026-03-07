@@ -41,7 +41,6 @@ public:
     virtual bool SetVFlip(bool enabled) override;
     virtual bool SetSwapBytes(bool enabled) override;
     virtual std::string Explain(const std::string &question) override;
-    virtual std::string AskQuestion(const std::string &question) override;
 
 private:
     std::string SendJpegToExplain(const uint8_t* jpeg_data, size_t jpeg_size, const std::string& question);
