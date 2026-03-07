@@ -56,6 +56,12 @@ public:
     
     // Set whether to hide chat messages/subtitles
     void SetHideSubtitle(bool hide);
+
+    // Get preview image object for camera display (background layer)
+    lv_obj_t* GetPreviewImage() { return preview_image_; }
+
+    // Get emoji box object for hiding during camera mode
+    lv_obj_t* GetEmojiBox() { return emoji_box_; }
 };
 
 // SPI LCD display

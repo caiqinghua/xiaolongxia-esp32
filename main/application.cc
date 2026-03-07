@@ -1,6 +1,7 @@
 #include "application.h"
 #include "board.h"
 #include "display.h"
+#include "lcd_display.h"
 #include "camera_display.h"
 #include "esp_camera.h"
 #include "esp_lvgl_port.h"
@@ -163,6 +164,28 @@ void Application::Initialize() {
 
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
+
+    // 启动相机预览（默认在主界面显示）
+    ESP_LOGI(TAG, "Starting camera preview on main screen");
+    auto lcd_display = dynamic_cast<LcdDisplay*>(display);
+    if (lcd_display != nullptr && lvgl_port_lock(0)) {
+        lv_obj_t* preview_img = lcd_display->GetPreviewImage();
+
+        if (preview_img != nullptr) {
+            camera_display_ = new CameraDisplay();
+            camera_display_->SetCameraImage(preview_img);
+
+            if (camera_display_->Start()) {
+                ESP_LOGI(TAG, "Camera preview started successfully");
+            } else {
+                ESP_LOGE(TAG, "Failed to start camera preview");
+                delete camera_display_;
+                camera_display_ = nullptr;
+            }
+        }
+
+        lvgl_port_unlock();
+    }
 }
 
 void Application::Run() {
@@ -1148,24 +1171,16 @@ void Application::HandleToggleCameraEvent() {
         if (camera_display_ == nullptr) {
             camera_display_ = new CameraDisplay();
 
-            // 获取当前的 LVGL 屏幕
-            if (lvgl_port_lock(0)) {
-                lv_obj_t* scr = lv_screen_active();
+            // 获取preview_image_来显示相机预览
+            auto lcd_display = dynamic_cast<LcdDisplay*>(display);
+            if (lcd_display != nullptr && lvgl_port_lock(0)) {
+                lv_obj_t* preview_img = lcd_display->GetPreviewImage();
 
-                // 创建相机图像控件
-                lv_obj_t* camera_img = lv_image_create(scr);
-
-                // 设置为全屏（竖向320x480）
-                lv_obj_set_size(camera_img, 320, 480);
-                ESP_LOGI(TAG, "Camera image created: 320x480 (portrait)");
-                lv_obj_align(camera_img, LV_ALIGN_CENTER, 0, 0);
-                lv_obj_set_style_bg_color(camera_img, lv_color_black(), 0);
-                lv_obj_set_style_bg_opa(camera_img, LV_OPA_COVER, 0);
-                lv_obj_set_style_pad_all(camera_img, 0, 0);
-                lv_obj_set_style_border_width(camera_img, 0, 0);
-
-                // 设置到相机显示
-                camera_display_->SetCameraImage(camera_img);
+                if (preview_img != nullptr) {
+                    // preview_image_已经默认全屏显示，直接设置给相机显示
+                    camera_display_->SetCameraImage(preview_img);
+                    ESP_LOGI(TAG, "Using preview_image for camera display: 320x480");
+                }
 
                 lvgl_port_unlock();
             }
