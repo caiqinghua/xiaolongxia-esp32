@@ -1,6 +1,7 @@
 #include "ota.h"
 #include "system_info.h"
 #include "settings.h"
+#include "server_config.h"
 #include "assets/lang_config.h"
 
 #include <freertos/FreeRTOS.h>
@@ -44,8 +45,15 @@ Ota::~Ota() {
 }
 
 std::string Ota::GetCheckVersionUrl() {
+    // Check NVS server config first
+    std::string url = ServerConfig::GetOtaUrl();
+    if (!url.empty()) {
+        return url;
+    }
+
+    // Fallback to old wifi settings
     Settings settings("wifi", false);
-    std::string url = settings.GetString("ota_url");
+    url = settings.GetString("ota_url");
     if (url.empty()) {
         url = CONFIG_OTA_URL;
     }

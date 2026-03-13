@@ -4,6 +4,7 @@
  */
 
 #include "mcp_server.h"
+#include "server_config.h"
 #include <esp_log.h>
 #include <esp_app_desc.h>
 #include <algorithm>
@@ -361,20 +362,31 @@ void McpServer::ParseMessage(const std::string& message) {
 }
 
 void McpServer::ParseCapabilities(const cJSON* capabilities) {
+    auto camera = Board::GetInstance().GetCamera();
+    if (!camera) {
+        return;
+    }
+
+    // Check if vision URL is configured in NVS
+    std::string nvs_vision_url = ServerConfig::GetVisionUrl();
+    if (!nvs_vision_url.empty()) {
+        ESP_LOGI(TAG, "Using NVS configured vision URL: %s", nvs_vision_url.c_str());
+        camera->SetExplainUrl(nvs_vision_url, "");
+        return;
+    }
+
+    // Fallback to OTA-provided vision URL
     auto vision = cJSON_GetObjectItem(capabilities, "vision");
     if (cJSON_IsObject(vision)) {
         auto url = cJSON_GetObjectItem(vision, "url");
         auto token = cJSON_GetObjectItem(vision, "token");
         if (cJSON_IsString(url)) {
-            auto camera = Board::GetInstance().GetCamera();
-            if (camera) {
-                std::string url_str = std::string(url->valuestring);
-                std::string token_str;
-                if (cJSON_IsString(token)) {
-                    token_str = std::string(token->valuestring);
-                }
-                camera->SetExplainUrl(url_str, token_str);
+            std::string url_str = std::string(url->valuestring);
+            std::string token_str;
+            if (cJSON_IsString(token)) {
+                token_str = std::string(token->valuestring);
             }
+            camera->SetExplainUrl(url_str, token_str);
         }
     }
 }

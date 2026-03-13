@@ -3,6 +3,7 @@
 #include "system_info.h"
 #include "application.h"
 #include "settings.h"
+#include "server_config.h"
 
 #include <cstring>
 #include <cJSON.h>
@@ -83,6 +84,16 @@ void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
 bool WebsocketProtocol::OpenAudioChannel() {
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
+
+    // Check if WebSocket URL is configured in NVS server config
+    if (url.empty()) {
+        std::string nvs_ws_url = ServerConfig::GetWebSocketUrl();
+        if (!nvs_ws_url.empty()) {
+            ESP_LOGI(TAG, "Using NVS configured WebSocket URL: %s", nvs_ws_url.c_str());
+            url = nvs_ws_url;
+        }
+    }
+
     std::string token = settings.GetString("token");
     int version = settings.GetInt("version");
     if (version != 0) {
