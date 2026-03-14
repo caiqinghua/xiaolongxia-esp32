@@ -64,14 +64,17 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     afe_config->vad_init = true;
 #endif
 
+    afe_config->afe_perferred_priority = 1;  // Higher priority for AFE processing
+
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
-    
+
+    // Increase task priority to ensure timely fetch() calls
     xTaskCreate([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
         vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+    }, "audio_communication", 4096, this, 5, NULL);  // Increased priority from 3 to 5
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
