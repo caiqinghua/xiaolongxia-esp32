@@ -166,25 +166,30 @@ void Application::Initialize() {
     display->UpdateStatusBar(true);
 
     // 启动相机预览（默认在主界面显示）
-    ESP_LOGI(TAG, "Starting camera preview on main screen");
-    auto lcd_display = dynamic_cast<LcdDisplay*>(display);
-    if (lcd_display != nullptr && lvgl_port_lock(0)) {
-        lv_obj_t* preview_img = lcd_display->GetPreviewImage();
+    // 只有带摄像头的板子才启动摄像头预览
+    if (board.GetCamera() != nullptr) {
+        ESP_LOGI(TAG, "Starting camera preview on main screen");
+        auto lcd_display = dynamic_cast<LcdDisplay*>(display);
+        if (lcd_display != nullptr && lvgl_port_lock(0)) {
+            lv_obj_t* preview_img = lcd_display->GetPreviewImage();
 
-        if (preview_img != nullptr) {
-            camera_display_ = new CameraDisplay();
-            camera_display_->SetCameraImage(preview_img);
+            if (preview_img != nullptr) {
+                camera_display_ = new CameraDisplay();
+                camera_display_->SetCameraImage(preview_img);
 
-            if (camera_display_->Start()) {
-                ESP_LOGI(TAG, "Camera preview started successfully");
-            } else {
-                ESP_LOGE(TAG, "Failed to start camera preview");
-                delete camera_display_;
-                camera_display_ = nullptr;
+                if (camera_display_->Start()) {
+                    ESP_LOGI(TAG, "Camera preview started successfully");
+                } else {
+                    ESP_LOGE(TAG, "Failed to start camera preview");
+                    delete camera_display_;
+                    camera_display_ = nullptr;
+                }
             }
-        }
 
-        lvgl_port_unlock();
+            lvgl_port_unlock();
+        }
+    } else {
+        ESP_LOGI(TAG, "Board does not have camera, skipping camera preview");
     }
 }
 
@@ -1231,6 +1236,13 @@ void Application::CloseTextResultAndRestorePreview() {
 void Application::HandleToggleCameraEvent() {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
+
+    // 检查板子是否有摄像头
+    if (board.GetCamera() == nullptr) {
+        ESP_LOGW(TAG, "Board does not have camera");
+        display->ShowNotification("该板子不支持相机");
+        return;
+    }
 
     // 检查 esp_camera 是否已初始化
     sensor_t *sensor = esp_camera_sensor_get();
