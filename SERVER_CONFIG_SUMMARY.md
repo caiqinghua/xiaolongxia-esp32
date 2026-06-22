@@ -16,7 +16,7 @@
 
 | 文件 | 修改内容 |
 |------|----------|
-| `main/Kconfig.projbuild` | 更新默认 OTA URL 为 api.tulingbc.com |
+| `main/Kconfig.projbuild` | 更新默认 OTA URL 为 audream.tulingbc.com |
 | `main/sdkconfig` | 更新当前配置的 OTA URL |
 | `main/ota.cc` | 集成 ServerConfig，支持 NVS 配置 |
 | `main/protocols/websocket_protocol.cc` | 集成 ServerConfig |
@@ -26,9 +26,9 @@
 ### 3. 默认服务器地址
 
 ```ini
-OTA URL        = https://api.tulingbc.com/xiaozhi/ota/
-WebSocket URL = wss://api.tulingbc.com/xiaozhi/v1/
-Vision URL    = https://api.tulingbc.com/mcp/vision/explain
+OTA URL        = https://audream.tulingbc.com/xiaozhi/ota/
+WebSocket URL = wss://audream.tulingbc.com/xiaozhi/v1/
+Vision URL    = https://audream.tulingbc.com/mcp/vision/explain
 ```
 
 ## 🚀 使用方法
@@ -41,9 +41,9 @@ Vision URL    = https://api.tulingbc.com/mcp/vision/explain
 
 # 或使用 Python 工具手动配置
 python3 scripts/set_server_config.py --port /dev/ttyUSB0 \
-    --ota https://api.tulingbc.com/xiaozhi/ota/ \
-    --websocket wss://api.tulingbc.com/xiaozhi/v1/ \
-    --vision https://api.tulingbc.com/mcp/vision/explain
+    --ota https://audream.tulingbc.com/xiaozhi/ota/ \
+    --websocket wss://audream.tulingbc.com/xiaozhi/v1/ \
+    --vision https://audream.tulingbc.com/mcp/vision/explain
 
 # 查看当前配置
 python3 scripts/set_server_config.py --port /dev/ttyUSB0 --show
@@ -96,14 +96,14 @@ idf.py monitor
 
 **使用 NVS 配置时：**
 ```
-I (1234) ServerConfig: Using NVS OTA URL: https://api.tulingbc.com/xiaozhi/ota/
-I (1235) WS: Using NVS WebSocket URL: wss://api.tulingbc.com/xiaozhi/v1/
-I (1236) ServerConfig: Using NVS Vision URL: https://api.tulingbc.com/mcp/vision/explain
+I (1234) ServerConfig: Using NVS OTA URL: https://audream.tulingbc.com/xiaozhi/ota/
+I (1235) WS: Using NVS WebSocket URL: wss://audream.tulingbc.com/xiaozhi/v1/
+I (1236) ServerConfig: Using NVS Vision URL: https://audream.tulingbc.com/mcp/vision/explain
 ```
 
 **使用默认配置时：**
 ```
-I (1234) ServerConfig: Using default OTA URL: https://api.tulingbc.com/xiaozhi/ota/
+I (1234) ServerConfig: Using default OTA URL: https://audream.tulingbc.com/xiaozhi/ota/
 ```
 
 ## 🛠️ NVS 结构
@@ -112,9 +112,9 @@ I (1234) ServerConfig: Using default OTA URL: https://api.tulingbc.com/xiaozhi/o
 
 | 键 | 类型 | 值 |
 |---|------|-----|
-| `ota_url` | string | https://api.tulingbc.com/xiaozhi/ota/ |
-| `websocket_url` | string | wss://api.tulingbc.com/xiaozhi/v1/ |
-| `vision_url` | string | https://api.tulingbc.com/mcp/vision/explain |
+| `ota_url` | string | https://audream.tulingbc.com/xiaozhi/ota/ |
+| `websocket_url` | string | wss://audream.tulingbc.com/xiaozhi/v1/ |
+| `vision_url` | string | https://audream.tulingbc.com/mcp/vision/explain |
 
 ## 📖 详细文档
 
@@ -140,19 +140,19 @@ I (1234) ServerConfig: Using default OTA URL: https://api.tulingbc.com/xiaozhi/o
 
 ### OTA 接口
 ```
-GET https://api.tulingbc.com/xiaozhi/ota/
+GET https://audream.tulingbc.com/xiaozhi/ota/
 ```
 
 响应格式：
 ```json
 {
   "websocket": {
-    "url": "wss://api.tulingbc.com/xiaozhi/v1/",
+    "url": "wss://audream.tulingbc.com/xiaozhi/v1/",
     "token": "Bearer your-token",
     "version": 1
   },
   "vision": {
-    "url": "https://api.tulingbc.com/mcp/vision/explain",
+    "url": "https://audream.tulingbc.com/mcp/vision/explain",
     "token": "Bearer your-vision-token"
   },
   "server_time": {
@@ -161,18 +161,18 @@ GET https://api.tulingbc.com/xiaozhi/ota/
   },
   "firmware": {
     "version": "2.2.4",
-    "url": "https://api.tulingbc.com/firmware/xiaozhi.bin"
+    "url": "https://audream.tulingbc.com/firmware/xiaozhi.bin"
   }
 }
 ```
 
 ### WebSocket 服务
 ```
-wss://api.tulingbc.com/xiaozhi/v1/
+wss://audream.tulingbc.com/xiaozhi/v1/
 ```
 
 ### 视觉分析接口
 ```
-POST https://api.tulingbc.com/mcp/vision/explain
+POST https://audream.tulingbc.com/mcp/vision/explain
 Content-Type: multipart/form-data
 ```

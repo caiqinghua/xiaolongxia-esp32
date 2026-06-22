@@ -7,15 +7,15 @@ URLs are stored in NVS (Non-Volatile Storage) and persist across reboots.
 
 Usage:
     python set_server_config.py --port <serial_port> --ota <url> --websocket <url> --vision <url>
-    python set_server_config.py --port /dev/ttyUSB0 --ota https://api.tulingbc.com/xiaozhi/ota/
+    python set_server_config.py --port /dev/ttyUSB0 --ota https://audream.tulingbc.com/xiaozhi/ota/
     python set_server_config.py --clear
 
 Examples:
-    # Set all URLs to api.tulingbc.com
+    # Set all URLs to audream.tulingbc.com
     python set_server_config.py --port /dev/ttyUSB0 \\
-        --ota https://api.tulingbc.com/xiaozhi/ota/ \\
-        --websocket wss://api.tulingbc.com/xiaozhi/v1/ \\
-        --vision https://api.tulingbc.com/mcp/vision/explain
+        --ota https://audream.tulingbc.com/xiaozhi/ota/ \\
+        --websocket wss://audream.tulingbc.com/xiaozhi/v1/ \\
+        --vision https://audream.tulingbc.com/mcp/vision/explain
 
     # Clear all NVS server URLs (use defaults from firmware)
     python set_server_config.py --port /dev/ttyUSB0 --clear

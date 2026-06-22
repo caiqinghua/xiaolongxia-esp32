@@ -3,9 +3,9 @@
 # Usage: ./scripts/config_tulingbc.sh [serial_port]
 
 SERIAL_PORT=${1:-"/dev/ttyUSB0"}
-OTA_URL="https://api.tulingbc.com/xiaozhi/ota/"
-WEBSOCKET_URL="wss://api.tulingbc.com/xiaozhi/v1/"
-VISION_URL="https://api.tulingbc.com/mcp/vision/explain"
+OTA_URL="https://audream.tulingbc.com/xiaozhi/ota/"
+WEBSOCKET_URL="wss://audream.tulingbc.com/xiaozhi/v1/"
+VISION_URL="https://audream.tulingbc.com/mcp/vision/explain"
 
 echo "🚀 配置图灵必驰服务器..."
 echo "串口: $SERIAL_PORT"

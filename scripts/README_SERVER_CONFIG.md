@@ -16,13 +16,13 @@ pip install pyserial
 
 # 设置所有服务器地址
 python scripts/set_server_config.py --port /dev/ttyUSB0 \
-    --ota https://api.tulingbc.com/xiaozhi/ota/ \
-    --websocket wss://api.tulingbc.com/xiaozhi/v1/ \
-    --vision https://api.tulingbc.com/mcp/vision/explain
+    --ota https://audream.tulingbc.com/xiaozhi/ota/ \
+    --websocket wss://audream.tulingbc.com/xiaozhi/v1/ \
+    --vision https://audream.tulingbc.com/mcp/vision/explain
 
 # 仅设置 OTA URL
 python scripts/set_server_config.py --port /dev/ttyUSB0 \
-    --ota https://api.tulingbc.com/xiaozhi/ota/
+    --ota https://audream.tulingbc.com/xiaozhi/ota/
 
 # 查看当前配置
 python scripts/set_server_config.py --port /dev/ttyUSB0 --show
@@ -40,17 +40,17 @@ python scripts/set_server_config.py --list
 
 **设置 OTA URL：**
 ```json
-{"action":"set_server_config","ota_url":"https://api.tulingbc.com/xiaozhi/ota/"}
+{"action":"set_server_config","ota_url":"https://audream.tulingbc.com/xiaozhi/ota/"}
 ```
 
 **设置 WebSocket URL：**
 ```json
-{"action":"set_server_config","websocket_url":"wss://api.tulingbc.com/xiaozhi/v1/"}
+{"action":"set_server_config","websocket_url":"wss://audream.tulingbc.com/xiaozhi/v1/"}
 ```
 
 **设置 Vision URL：**
 ```json
-{"action":"set_server_config","vision_url":"https://api.tulingbc.com/mcp/vision/explain"}
+{"action":"set_server_config","vision_url":"https://audream.tulingbc.com/mcp/vision/explain"}
 ```
 
 **清除所有配置：**
@@ -96,7 +96,7 @@ python scripts/set_server_config.py --list
 固件默认配置为：
 
 ```ini
-OTA URL        = https://api.tulingbc.com/xiaozhi/ota/
+OTA URL        = https://audream.tulingbc.com/xiaozhi/ota/
 WebSocket URL = (从 OTA 服务器获取)
 Vision URL    = (从 OTA 服务器获取)
 ```
@@ -108,12 +108,12 @@ Vision URL    = (从 OTA 服务器获取)
 ```json
 {
   "websocket": {
-    "url": "wss://api.tulingbc.com/xiaozhi/v1/",
+    "url": "wss://audream.tulingbc.com/xiaozhi/v1/",
     "token": "Bearer your-token-here",
     "version": 1
   },
   "vision": {
-    "url": "https://api.tulingbc.com/mcp/vision/explain",
+    "url": "https://audream.tulingbc.com/mcp/vision/explain",
     "token": "Bearer your-vision-token-here"
   },
   "server_time": {
@@ -122,7 +122,7 @@ Vision URL    = (从 OTA 服务器获取)
   },
   "firmware": {
     "version": "2.2.4",
-    "url": "https://api.tulingbc.com/firmware/xiaozhi.bin"
+    "url": "https://audream.tulingbc.com/firmware/xiaozhi.bin"
   }
 }
 ```
@@ -150,15 +150,15 @@ idf.py reset
 设备启动时会显示当前使用的配置：
 
 ```
-I (1234) ServerConfig: Using NVS OTA URL: https://api.tulingbc.com/xiaozhi/ota/
-I (1235) ServerConfig: Using NVS WebSocket URL: wss://api.tulingbc.com/xiaozhi/v1/
-I (1236) ServerConfig: Using NVS Vision URL: https://api.tulingbc.com/mcp/vision/explain
+I (1234) ServerConfig: Using NVS OTA URL: https://audream.tulingbc.com/xiaozhi/ota/
+I (1235) ServerConfig: Using NVS WebSocket URL: wss://audream.tulingbc.com/xiaozhi/v1/
+I (1236) ServerConfig: Using NVS Vision URL: https://audream.tulingbc.com/mcp/vision/explain
 ```
 
 如果使用默认值，会显示：
 
 ```
-I (1234) ServerConfig: Using default OTA URL: https://api.tulingbc.com/xiaozhi/ota/
+I (1234) ServerConfig: Using default OTA URL: https://audream.tulingbc.com/xiaozhi/ota/
 ```
 
 ## 技术细节
