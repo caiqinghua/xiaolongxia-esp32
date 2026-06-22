@@ -1,18 +1,22 @@
 #include "blufi.h"
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 #include "esp_bt.h"
 #include "esp_event.h"
+#include "esp_efuse.h"
+#include "esp_efuse_table.h"
+#include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/task.h"
 #include "wifi_manager.h"
 
-#define BLUFI_DEVICE_NAME "Xiaozhi-Blufi"
+#define BLUFI_DEVICE_NAME "Audream Watch"
 
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
 #include "esp_bt_device.h"
@@ -35,6 +39,8 @@ extern void esp_blufi_btc_deinit(void);
 
 extern "C" {
 void esp_blufi_adv_start(void);
+
+void esp_blufi_adv_start_with_name(const char* name);
 
 void esp_blufi_adv_stop(void);
 
@@ -62,6 +68,84 @@ void esp_blufi_btc_deinit(void);
 #include "ssid_manager.h"
 
 static const char* BLUFI_TAG = "BLUFI_CLASS";
+
+namespace {
+
+constexpr uint16_t kAudreamCompanyIdentifier = 0xFFFF;
+constexpr char kAudreamManufacturerMarker[] = "ADRM";
+constexpr size_t kMaxManufacturerDataLength = 29;
+constexpr size_t kManufacturerHeaderLength = 2 + sizeof(kAudreamManufacturerMarker) - 1;
+
+#ifdef CONFIG_BT_BLUEDROID_ENABLED
+uint8_t g_audream_manufacturer_data[kMaxManufacturerDataLength] = {};
+esp_ble_adv_data_t g_audream_scan_response_data = {
+    .set_scan_rsp = true,
+    .include_name = false,
+    .include_txpower = false,
+    .min_interval = 0x0006,
+    .max_interval = 0x0010,
+    .appearance = 0x00,
+    .manufacturer_len = 0,
+    .p_manufacturer_data = g_audream_manufacturer_data,
+    .service_data_len = 0,
+    .p_service_data = nullptr,
+    .service_uuid_len = 0,
+    .p_service_uuid = nullptr,
+    .flag = 0x0,
+};
+#endif
+
+std::string ReadDeviceSerialNumber() {
+#ifdef ESP_EFUSE_BLOCK_USR_DATA
+    uint8_t serial_number[33] = {};
+    if (esp_efuse_read_field_blob(ESP_EFUSE_USER_DATA, serial_number, 32 * 8) == ESP_OK && serial_number[0] != 0) {
+        serial_number[32] = 0;
+        return std::string(reinterpret_cast<char*>(serial_number));
+    }
+#endif
+
+    uint8_t mac[6] = {};
+    if (esp_read_mac(mac, ESP_MAC_BT) == ESP_OK) {
+        char fallback[13] = {};
+        snprintf(fallback, sizeof(fallback), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        return std::string(fallback);
+    }
+    return "UNKNOWN";
+}
+
+#ifdef CONFIG_BT_BLUEDROID_ENABLED
+void ConfigureAudreamScanResponse(const std::string& serial_number) {
+    const size_t max_serial_length = kMaxManufacturerDataLength - kManufacturerHeaderLength;
+    const size_t serial_length = std::min(serial_number.size(), max_serial_length);
+    if (serial_number.size() > max_serial_length) {
+        ESP_LOGW(BLUFI_TAG, "Serial number is too long for BLE scan response and will be truncated");
+    }
+
+    memset(g_audream_manufacturer_data, 0, sizeof(g_audream_manufacturer_data));
+    g_audream_manufacturer_data[0] = static_cast<uint8_t>(kAudreamCompanyIdentifier & 0xFF);
+    g_audream_manufacturer_data[1] = static_cast<uint8_t>((kAudreamCompanyIdentifier >> 8) & 0xFF);
+    memcpy(&g_audream_manufacturer_data[2], kAudreamManufacturerMarker, sizeof(kAudreamManufacturerMarker) - 1);
+    memcpy(&g_audream_manufacturer_data[kManufacturerHeaderLength], serial_number.data(), serial_length);
+
+    g_audream_scan_response_data.manufacturer_len = kManufacturerHeaderLength + serial_length;
+    esp_err_t ret = esp_ble_gap_config_adv_data(&g_audream_scan_response_data);
+    if (ret != ESP_OK) {
+        ESP_LOGW(BLUFI_TAG, "Failed to configure Audream scan response: %s", esp_err_to_name(ret));
+    }
+}
+#endif
+
+void StartAudreamBluFiAdvertising() {
+    std::string serial_number = ReadDeviceSerialNumber();
+    ESP_LOGI(BLUFI_TAG, "BLUFI device name: %s, serial number: %s", BLUFI_DEVICE_NAME, serial_number.c_str());
+
+#ifdef CONFIG_BT_BLUEDROID_ENABLED
+    ConfigureAudreamScanResponse(serial_number);
+#endif
+    esp_blufi_adv_start_with_name(BLUFI_DEVICE_NAME);
+}
+
+} // namespace
 
 static wifi_mode_t GetWifiModeWithFallback(const WifiManager& wifi) {
     if (wifi.IsConfigMode()) {
@@ -650,8 +734,7 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
     switch (event) {
         case ESP_BLUFI_EVENT_INIT_FINISH:
             ESP_LOGI(BLUFI_TAG, "BLUFI init finish");
-            esp_ble_gap_set_device_name(BLUFI_DEVICE_NAME);
-            esp_blufi_adv_start();
+            StartAudreamBluFiAdvertising();
             break;
         case ESP_BLUFI_EVENT_DEINIT_FINISH:
             ESP_LOGI(BLUFI_TAG, "BLUFI deinit finish");
@@ -667,7 +750,7 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
             m_ble_is_connected = false;
             _security_deinit();
             if (!m_provisioned) {
-                esp_blufi_adv_start();
+                StartAudreamBluFiAdvertising();
             } else {
                 esp_blufi_adv_stop();
                 if (!m_deinited) {
