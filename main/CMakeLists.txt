@@ -93,6 +93,8 @@ set(AUDREAM_SD_CS_GPIO GPIO_NUM_NC)
 set(AUDREAM_SD_MOSI_GPIO GPIO_NUM_NC)
 set(AUDREAM_SD_MISO_GPIO GPIO_NUM_NC)
 set(AUDREAM_SD_CLK_GPIO GPIO_NUM_NC)
+set(AUDREAM_SD_SPI_HOST SPI2_HOST)
+set(AUDREAM_SD_USE_SDMMC 0)
 
 # Add board files according to BOARD_TYPE
 # Set default assets if the board uses partition table V2
@@ -308,10 +310,12 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_06)
     set(BUILTIN_TEXT_FONT font_puhui_basic_30_4)
     set(BUILTIN_ICON_FONT font_awesome_30_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
-    set(AUDREAM_SD_CS_GPIO GPIO_NUM_17)
+    set(AUDREAM_SD_CS_GPIO GPIO_NUM_NC)
     set(AUDREAM_SD_MOSI_GPIO GPIO_NUM_1)
     set(AUDREAM_SD_MISO_GPIO GPIO_NUM_3)
     set(AUDREAM_SD_CLK_GPIO GPIO_NUM_2)
+    set(AUDREAM_SD_SPI_HOST SPI3_HOST)
+    set(AUDREAM_SD_USE_SDMMC 1)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_C6_TOUCH_AMOLED_2_06)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-c6-touch-amoled-2.06")
@@ -937,6 +941,8 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE AUDREAM_SD_MOSI_GPIO=${AUDREAM_SD_MOSI_GPIO}
                     PRIVATE AUDREAM_SD_MISO_GPIO=${AUDREAM_SD_MISO_GPIO}
                     PRIVATE AUDREAM_SD_CLK_GPIO=${AUDREAM_SD_CLK_GPIO}
+                    PRIVATE AUDREAM_SD_SPI_HOST=${AUDREAM_SD_SPI_HOST}
+                    PRIVATE AUDREAM_SD_USE_SDMMC=${AUDREAM_SD_USE_SDMMC}
                     )
 
 # Add generation rules

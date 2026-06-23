@@ -5,6 +5,8 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <string>
 #include <vector>
 #include "esp_bt.h"
@@ -77,6 +79,8 @@ constexpr uint16_t kAudreamCompanyIdentifier = 0xFFFF;
 constexpr char kAudreamManufacturerMarker[] = "ADRM";
 constexpr size_t kMaxManufacturerDataLength = 29;
 constexpr size_t kManufacturerHeaderLength = 2 + sizeof(kAudreamManufacturerMarker) - 1;
+constexpr uint32_t kAudreamControlWorkerStackSize = 8192;
+constexpr UBaseType_t kAudreamControlWorkerPriority = 5;
 
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
 uint8_t g_audream_manufacturer_data[kMaxManufacturerDataLength] = {};
@@ -145,6 +149,65 @@ void StartAudreamBluFiAdvertising() {
     ConfigureAudreamScanResponse(serial_number);
 #endif
     esp_blufi_adv_start_with_name(BLUFI_DEVICE_NAME);
+}
+
+struct AudreamCustomRequest {
+    std::vector<uint8_t> data;
+};
+
+void AudreamCustomDataTask(void* arg) {
+    std::unique_ptr<AudreamCustomRequest> request(static_cast<AudreamCustomRequest*>(arg));
+    if (!request) {
+        ESP_LOGE(BLUFI_TAG, "Audream custom data task received a null request");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ESP_LOGI(BLUFI_TAG, "Handling Audream custom data off the BLUFI task: %u bytes", static_cast<unsigned>(request->data.size()));
+    std::vector<uint8_t> response =
+        AudreamDeviceControl::GetInstance().HandleRequest(
+            request->data.data(),
+            request->data.size()
+        );
+    esp_err_t result = esp_blufi_send_custom_data(
+        response.data(),
+        response.size()
+    );
+    if (result != ESP_OK) {
+        ESP_LOGE(
+            BLUFI_TAG,
+            "Failed to send Audream custom data response: %s",
+            esp_err_to_name(result)
+        );
+    }
+    vTaskDelete(nullptr);
+}
+
+void QueueAudreamCustomData(const uint8_t* data, uint32_t length) {
+    if (data == nullptr || length == 0) {
+        ESP_LOGW(BLUFI_TAG, "Ignored empty Audream custom data request");
+        return;
+    }
+
+    auto* request = new (std::nothrow) AudreamCustomRequest();
+    if (request == nullptr) {
+        ESP_LOGE(BLUFI_TAG, "Failed to allocate Audream custom data request");
+        return;
+    }
+    request->data.assign(data, data + length);
+
+    BaseType_t created = xTaskCreate(
+        AudreamCustomDataTask,
+        "audream_ctrl",
+        kAudreamControlWorkerStackSize,
+        request,
+        kAudreamControlWorkerPriority,
+        nullptr
+    );
+    if (created != pdPASS) {
+        ESP_LOGE(BLUFI_TAG, "Failed to create Audream custom data worker task");
+        delete request;
+    }
 }
 
 } // namespace
@@ -904,22 +967,7 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
                 "Received Audream custom data: %" PRIu32 " bytes",
                 param->custom_data.data_len
             );
-            std::vector<uint8_t> response =
-                AudreamDeviceControl::GetInstance().HandleRequest(
-                    param->custom_data.data,
-                    param->custom_data.data_len
-                );
-            esp_err_t result = esp_blufi_send_custom_data(
-                response.data(),
-                response.size()
-            );
-            if (result != ESP_OK) {
-                ESP_LOGE(
-                    BLUFI_TAG,
-                    "Failed to send Audream custom data response: %s",
-                    esp_err_to_name(result)
-                );
-            }
+            QueueAudreamCustomData(param->custom_data.data, param->custom_data.data_len);
             break;
         }
         case ESP_BLUFI_EVENT_GET_WIFI_STATUS: {

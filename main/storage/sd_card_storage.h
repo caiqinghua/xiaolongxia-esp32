@@ -1,8 +1,18 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
+
+enum class StorageStatusErrorCode : uint32_t {
+    kNone = 0,
+    kPinsNotConfigured = 1,
+    kSpiBusInitFailed = 2,
+    kMountFailed = 3,
+    kDirectoryCreateFailed = 4,
+    kFreeSpaceReadFailed = 5,
+};
 
 struct StorageStatus {
     bool mounted = false;
@@ -10,6 +20,7 @@ struct StorageStatus {
     uint64_t free_bytes = 0;
     uint64_t recording_bytes = 0;
     uint32_t estimated_remaining_minutes = 0;
+    StorageStatusErrorCode error_code = StorageStatusErrorCode::kNone;
 };
 
 struct StoredRecordingInfo {
@@ -23,8 +34,10 @@ class SdCardStorage {
 public:
     static SdCardStorage& GetInstance();
 
+    void StartInitializationTask();
     bool Mount();
     bool IsMounted() const;
+    StorageStatus ProbeAndMountStatus();
     StorageStatus GetStatus();
     std::string RecordingsDirectory() const;
     bool EnsureRecordingsDirectory();
@@ -45,5 +58,10 @@ public:
 private:
     SdCardStorage() = default;
 
+    mutable std::recursive_mutex mutex_;
+    bool initialization_task_started_ = false;
     bool mounted_ = false;
+    bool ready_ = false;
+    StorageStatus cached_status_;
+    StorageStatusErrorCode last_error_code_ = StorageStatusErrorCode::kNone;
 };

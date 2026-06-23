@@ -11,6 +11,7 @@
 #include "power_save_timer.h"
 #include "axp2101.h"
 #include "i2c_device.h"
+#include "storage/sd_card_storage.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -43,7 +44,7 @@ public:
         WriteReg(0x92, (3300 - 500) / 100);
         WriteReg(0x93, (3300 - 500) / 100);
 
-        // Enable ALDO1(MIC)
+        // Enable ALDO1 and ALDO2.
         WriteReg(0x90, 0x03);
 
         WriteReg(0x64, 0x02); // CV charger voltage setting to 4.1V
@@ -302,6 +303,7 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeTools();
+        SdCardStorage::GetInstance().StartInitializationTask();
     }
 
     virtual AudioCodec* GetAudioCodec() override {

@@ -84,6 +84,7 @@ enum class Opcode : uint8_t {
     kReadLocalRecordingChunk = 0x24,
     kStartTemporaryAPTransfer = 0x25,
     kCompleteTemporaryAPTransfer = 0x26,
+    kRefreshStorageStatus = 0x27,
 };
 
 enum class Status : uint8_t {
@@ -143,6 +144,30 @@ void AppendString(std::vector<uint8_t>& output, const std::string& value) {
     const size_t clamped_size = std::min<size_t>(value.size(), 255);
     output.push_back(static_cast<uint8_t>(clamped_size));
     output.insert(output.end(), value.begin(), value.begin() + clamped_size);
+}
+
+std::vector<uint8_t> BuildStorageStatusPayload(const StorageStatus& status) {
+    std::vector<uint8_t> payload;
+    payload.reserve(33);
+    payload.push_back(status.mounted ? 1 : 0);
+    AppendUInt64(payload, status.total_bytes);
+    AppendUInt64(payload, status.free_bytes);
+    AppendUInt64(payload, status.recording_bytes);
+    AppendUInt32(payload, status.estimated_remaining_minutes);
+    AppendUInt32(payload, static_cast<uint32_t>(status.error_code));
+    return payload;
+}
+
+void LogStorageStatus(const char* operation, const StorageStatus& status) {
+    ESP_LOGI(
+        kTag,
+        "%s storage status mounted=%d error_code=%lu free_mb=%lu remaining_minutes=%lu",
+        operation,
+        status.mounted ? 1 : 0,
+        static_cast<unsigned long>(status.error_code),
+        static_cast<unsigned long>(status.free_bytes / (1024 * 1024)),
+        static_cast<unsigned long>(status.estimated_remaining_minutes)
+    );
 }
 
 bool ReadString(const uint8_t* data, size_t length, size_t& cursor, std::string& value) {
@@ -413,20 +438,23 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
 
         case Opcode::kGetStorageStatus: {
             auto status = SdCardStorage::GetInstance().GetStatus();
-            std::vector<uint8_t> payload;
-            payload.reserve(29);
-            payload.push_back(status.mounted ? 1 : 0);
-            AppendUInt64(payload, status.total_bytes);
-            AppendUInt64(payload, status.free_bytes);
-            AppendUInt64(payload, status.recording_bytes);
-            AppendUInt32(payload, status.estimated_remaining_minutes);
+            LogStorageStatus("Cached", status);
             return BuildPayloadResponse(
                 opcode_value,
                 request_id,
-                status.mounted
-                    ? static_cast<uint8_t>(Status::kSuccess)
-                    : static_cast<uint8_t>(Status::kStorageUnavailable),
-                payload
+                static_cast<uint8_t>(Status::kSuccess),
+                BuildStorageStatusPayload(status)
+            );
+        }
+
+        case Opcode::kRefreshStorageStatus: {
+            auto status = SdCardStorage::GetInstance().ProbeAndMountStatus();
+            LogStorageStatus("Refreshed", status);
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                BuildStorageStatusPayload(status)
             );
         }
 

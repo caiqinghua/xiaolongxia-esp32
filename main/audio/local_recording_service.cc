@@ -46,10 +46,17 @@ LocalRecordingService& LocalRecordingService::GetInstance() {
 bool LocalRecordingService::Start(AudioService& audio_service) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (recording_) {
+        ESP_LOGW(kTag, "Local recording start ignored because recording is already active");
         return false;
     }
     auto& storage = SdCardStorage::GetInstance();
-    if (!storage.Mount() || !storage.EnsureRecordingsDirectory()) {
+    auto storage_status = storage.GetStatus();
+    if (!storage_status.mounted) {
+        ESP_LOGE(
+            kTag,
+            "Local recording start failed because storage is unavailable, error_code=%lu",
+            static_cast<unsigned long>(storage_status.error_code)
+        );
         return false;
     }
 
@@ -58,6 +65,7 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
     current_.file_name = current_.recording_id + ".opus";
     current_.file_path = storage.RecordingsDirectory() + "/" + current_.file_name;
     if (!writer_.Open(current_.file_path.c_str(), kSampleRate, kChannels, kFrameSamples)) {
+        ESP_LOGE(kTag, "Failed to open local recording writer: %s", current_.file_path.c_str());
         current_ = {};
         return false;
     }
