@@ -1,8 +1,11 @@
 #include "storage/sd_card_storage.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <dirent.h>
+#include <fstream>
 #include <sys/stat.h>
 #include <sys/unistd.h>
 
@@ -36,6 +39,63 @@ constexpr char kTag[] = "AudreamStorage";
 constexpr char kMountPoint[] = "/sdcard";
 constexpr char kRecordingsDirectory[] = "/sdcard/audream/recordings";
 constexpr uint32_t kEstimatedOpusBytesPerMinute = 180000;
+
+struct RecordingScanEntry {
+    StoredRecordingInfo info;
+    time_t modified_at = 0;
+};
+
+bool EndsWith(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool IsSafeRecordingID(const std::string& recording_id) {
+    if (recording_id.empty() || recording_id.size() > 96) {
+        return false;
+    }
+    return std::all_of(recording_id.begin(), recording_id.end(), [](char ch) {
+        return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '-';
+    });
+}
+
+std::string BuildRecordingPath(const std::string& recording_id) {
+    return std::string(kRecordingsDirectory) + "/" + recording_id + ".opus";
+}
+
+uint32_t FileSizeBytes(const std::string& path) {
+    struct stat st = {};
+    if (stat(path.c_str(), &st) != 0) {
+        return 0;
+    }
+    return static_cast<uint32_t>(st.st_size);
+}
+
+uint32_t ReadMetadataUInt32(const std::string& metadata_path, const std::string& key) {
+    std::ifstream stream(metadata_path);
+    if (!stream.good()) {
+        return 0;
+    }
+    const std::string content(
+        (std::istreambuf_iterator<char>(stream)),
+        std::istreambuf_iterator<char>()
+    );
+    const std::string marker = "\"" + key + "\":";
+    const size_t start = content.find(marker);
+    if (start == std::string::npos) {
+        return 0;
+    }
+    size_t cursor = start + marker.size();
+    while (cursor < content.size() && std::isspace(static_cast<unsigned char>(content[cursor]))) {
+        cursor++;
+    }
+    uint32_t value = 0;
+    while (cursor < content.size() && std::isdigit(static_cast<unsigned char>(content[cursor]))) {
+        value = value * 10 + static_cast<uint32_t>(content[cursor] - '0');
+        cursor++;
+    }
+    return value;
+}
 
 uint64_t DirectorySizeBytes(const char* path) {
     DIR* dir = opendir(path);
@@ -173,4 +233,95 @@ bool SdCardStorage::EnsureRecordingsDirectory() {
         return false;
     }
     return EnsureDirectory(kRecordingsDirectory);
+}
+
+std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t max_count) {
+    std::vector<StoredRecordingInfo> result;
+    if (!Mount() || !EnsureRecordingsDirectory()) {
+        return result;
+    }
+
+    DIR* dir = opendir(kRecordingsDirectory);
+    if (dir == nullptr) {
+        ESP_LOGE(kTag, "Failed to open recordings directory: %s", std::strerror(errno));
+        return result;
+    }
+
+    std::vector<RecordingScanEntry> entries;
+    while (dirent* entry = readdir(dir)) {
+        const std::string file_name = entry->d_name;
+        if (!EndsWith(file_name, ".opus")) {
+            continue;
+        }
+        const std::string recording_id = file_name.substr(0, file_name.size() - 5);
+        if (!IsSafeRecordingID(recording_id)) {
+            continue;
+        }
+        const std::string path = std::string(kRecordingsDirectory) + "/" + file_name;
+        struct stat st = {};
+        if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        StoredRecordingInfo info;
+        info.recording_id = recording_id;
+        info.file_name = file_name;
+        info.size_bytes = static_cast<uint32_t>(st.st_size);
+        info.duration_ms = ReadMetadataUInt32(path + ".json", "duration_ms");
+        entries.push_back({
+            .info = info,
+            .modified_at = st.st_mtime,
+        });
+    }
+    closedir(dir);
+
+    std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+        return left.modified_at > right.modified_at;
+    });
+
+    result.reserve(std::min(max_count, entries.size()));
+    for (const auto& entry : entries) {
+        if (result.size() >= max_count) {
+            break;
+        }
+        result.push_back(entry.info);
+    }
+    return result;
+}
+
+bool SdCardStorage::ReadRecordingChunk(
+    const std::string& recording_id,
+    uint32_t offset,
+    size_t max_length,
+    std::vector<uint8_t>& output,
+    uint32_t& total_size
+) {
+    output.clear();
+    total_size = 0;
+    if (!IsSafeRecordingID(recording_id) || max_length == 0) {
+        return false;
+    }
+    if (!Mount() || !EnsureRecordingsDirectory()) {
+        return false;
+    }
+
+    const std::string path = BuildRecordingPath(recording_id);
+    total_size = FileSizeBytes(path);
+    if (total_size == 0 || offset > total_size) {
+        return false;
+    }
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        ESP_LOGE(kTag, "Failed to open recording file: %s", path.c_str());
+        return false;
+    }
+    if (fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
+        fclose(file);
+        return false;
+    }
+    const size_t length = std::min<size_t>(max_length, total_size - offset);
+    output.resize(length);
+    const size_t bytes_read = fread(output.data(), 1, length, file);
+    fclose(file);
+    output.resize(bytes_read);
+    return bytes_read == length;
 }

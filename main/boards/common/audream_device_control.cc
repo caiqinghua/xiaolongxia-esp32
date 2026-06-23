@@ -25,6 +25,7 @@ constexpr char kRecordingModeKey[] = "recording_mode";
 constexpr uint8_t kProtocolVersion = 1;
 constexpr size_t kRequestHeaderLength = 4;
 constexpr uint8_t kResponseOpcodeMask = 0x80;
+constexpr size_t kMaxReadChunkBytes = 180;
 
 constexpr int32_t kDefaultAutoPowerOffSeconds = -1;
 constexpr uint8_t kDefaultMicrophoneGainDb = 24;
@@ -43,6 +44,7 @@ constexpr uint16_t kCapabilityRecordingMode = 1 << 7;
 constexpr uint16_t kCapabilityFirmwareVersion = 1 << 8;
 constexpr uint16_t kCapabilityLocalRecording = 1 << 9;
 constexpr uint16_t kCapabilityRecordingStorage = 1 << 10;
+constexpr uint16_t kCapabilityRecordingFileTransfer = 1 << 11;
 constexpr uint16_t kCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityMicrophoneGain |
@@ -54,7 +56,8 @@ constexpr uint16_t kCapabilities =
     kCapabilityRecordingMode |
     kCapabilityFirmwareVersion |
     kCapabilityLocalRecording |
-    kCapabilityRecordingStorage;
+    kCapabilityRecordingStorage |
+    kCapabilityRecordingFileTransfer;
 constexpr uint16_t kSimulatedCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityCallGain |
@@ -74,6 +77,8 @@ enum class Opcode : uint8_t {
     kGetStorageStatus = 0x20,
     kStartLocalRecording = 0x21,
     kStopLocalRecording = 0x22,
+    kListLocalRecordings = 0x23,
+    kReadLocalRecordingChunk = 0x24,
 };
 
 enum class Status : uint8_t {
@@ -86,6 +91,7 @@ enum class Status : uint8_t {
     kBusy = 6,
     kNotRecording = 7,
     kIoError = 8,
+    kNotFound = 9,
 };
 
 uint16_t ReadUInt16(const uint8_t* data) {
@@ -132,6 +138,30 @@ void AppendString(std::vector<uint8_t>& output, const std::string& value) {
     const size_t clamped_size = std::min<size_t>(value.size(), 255);
     output.push_back(static_cast<uint8_t>(clamped_size));
     output.insert(output.end(), value.begin(), value.begin() + clamped_size);
+}
+
+bool ReadString(const uint8_t* data, size_t length, size_t& cursor, std::string& value) {
+    if (cursor >= length) {
+        return false;
+    }
+    const size_t string_length = data[cursor];
+    cursor++;
+    if (cursor + string_length > length) {
+        return false;
+    }
+    value.assign(
+        reinterpret_cast<const char*>(&data[cursor]),
+        string_length
+    );
+    cursor += string_length;
+    return true;
+}
+
+uint32_t ReadUInt32(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) |
+        (static_cast<uint32_t>(data[1]) << 8) |
+        (static_cast<uint32_t>(data[2]) << 16) |
+        (static_cast<uint32_t>(data[3]) << 24);
 }
 
 bool IsValidAutoPowerOff(int32_t seconds) {
@@ -448,6 +478,87 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 metadata.valid
                     ? static_cast<uint8_t>(Status::kSuccess)
                     : static_cast<uint8_t>(Status::kIoError),
+                payload
+            );
+        }
+
+        case Opcode::kListLocalRecordings: {
+            uint8_t max_count = 8;
+            if (length == kRequestHeaderLength + 1) {
+                max_count = std::clamp<uint8_t>(data[kRequestHeaderLength], 1, 16);
+            } else if (length != kRequestHeaderLength) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            auto recordings = SdCardStorage::GetInstance().ListRecordings(max_count);
+            std::vector<uint8_t> payload;
+            payload.push_back(0);
+            uint8_t appended_count = 0;
+            for (const auto& recording : recordings) {
+                if (payload.size() > 180) {
+                    break;
+                }
+                AppendString(payload, recording.recording_id);
+                AppendString(payload, recording.file_name);
+                AppendUInt32(payload, recording.duration_ms);
+                AppendUInt32(payload, recording.size_bytes);
+                appended_count++;
+            }
+            payload[0] = appended_count;
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                payload
+            );
+        }
+
+        case Opcode::kReadLocalRecordingChunk: {
+            size_t cursor = kRequestHeaderLength;
+            std::string recording_id;
+            if (!ReadString(data, length, cursor, recording_id) ||
+                cursor + sizeof(uint32_t) + sizeof(uint16_t) != length) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            const uint32_t offset = ReadUInt32(&data[cursor]);
+            cursor += sizeof(uint32_t);
+            const uint16_t requested_length = ReadUInt16(&data[cursor]);
+            const size_t chunk_length = std::min<size_t>(requested_length, kMaxReadChunkBytes);
+            std::vector<uint8_t> chunk;
+            uint32_t total_size = 0;
+            if (!SdCardStorage::GetInstance().ReadRecordingChunk(
+                    recording_id,
+                    offset,
+                    chunk_length,
+                    chunk,
+                    total_size
+                )) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kNotFound),
+                    {}
+                );
+            }
+            std::vector<uint8_t> payload;
+            AppendUInt32(payload, offset);
+            AppendUInt32(payload, total_size);
+            AppendUInt16(payload, static_cast<uint16_t>(chunk.size()));
+            payload.push_back(offset + chunk.size() >= total_size ? 1 : 0);
+            payload.insert(payload.end(), chunk.begin(), chunk.end());
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
                 payload
             );
         }
