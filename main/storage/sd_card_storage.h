@@ -29,6 +29,11 @@ public:
     std::string RecordingsDirectory() const;
     bool EnsureRecordingsDirectory();
     std::vector<StoredRecordingInfo> ListRecordings(size_t max_count);
+    bool GetRecordingFilePath(
+        const std::string& recording_id,
+        std::string& file_path,
+        uint32_t& total_size
+    );
     bool ReadRecordingChunk(
         const std::string& recording_id,
         uint32_t offset,

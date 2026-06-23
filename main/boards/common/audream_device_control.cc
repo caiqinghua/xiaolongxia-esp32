@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "settings.h"
 #include "storage/sd_card_storage.h"
+#include "storage/temporary_ap_transfer_service.h"
 
 namespace {
 
@@ -45,6 +46,7 @@ constexpr uint16_t kCapabilityFirmwareVersion = 1 << 8;
 constexpr uint16_t kCapabilityLocalRecording = 1 << 9;
 constexpr uint16_t kCapabilityRecordingStorage = 1 << 10;
 constexpr uint16_t kCapabilityRecordingFileTransfer = 1 << 11;
+constexpr uint16_t kCapabilityTemporaryAPTransfer = 1 << 12;
 constexpr uint16_t kCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityMicrophoneGain |
@@ -57,7 +59,8 @@ constexpr uint16_t kCapabilities =
     kCapabilityFirmwareVersion |
     kCapabilityLocalRecording |
     kCapabilityRecordingStorage |
-    kCapabilityRecordingFileTransfer;
+    kCapabilityRecordingFileTransfer |
+    kCapabilityTemporaryAPTransfer;
 constexpr uint16_t kSimulatedCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityCallGain |
@@ -79,6 +82,8 @@ enum class Opcode : uint8_t {
     kStopLocalRecording = 0x22,
     kListLocalRecordings = 0x23,
     kReadLocalRecordingChunk = 0x24,
+    kStartTemporaryAPTransfer = 0x25,
+    kCompleteTemporaryAPTransfer = 0x26,
 };
 
 enum class Status : uint8_t {
@@ -562,6 +567,59 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 payload
             );
         }
+
+        case Opcode::kStartTemporaryAPTransfer: {
+            size_t cursor = kRequestHeaderLength;
+            std::string recording_id;
+            if (!ReadString(data, length, cursor, recording_id) || cursor != length) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            auto session = TemporaryAPTransferService::GetInstance().Start(recording_id);
+            if (!session.valid) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kNotFound),
+                    {}
+                );
+            }
+            std::vector<uint8_t> payload;
+            AppendString(payload, session.recording_id);
+            AppendString(payload, session.ssid);
+            AppendString(payload, session.password);
+            AppendString(payload, session.url);
+            AppendString(payload, session.token);
+            AppendUInt32(payload, session.size_bytes);
+            AppendUInt32(payload, session.expires_in_seconds);
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                payload
+            );
+        }
+
+        case Opcode::kCompleteTemporaryAPTransfer:
+            if (length != kRequestHeaderLength) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            TemporaryAPTransferService::GetInstance().Stop();
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                {}
+            );
 
         case Opcode::kResetSettings:
             ResetSettings();

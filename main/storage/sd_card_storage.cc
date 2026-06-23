@@ -288,6 +288,28 @@ std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t max_count)
     return result;
 }
 
+bool SdCardStorage::GetRecordingFilePath(
+    const std::string& recording_id,
+    std::string& file_path,
+    uint32_t& total_size
+) {
+    file_path.clear();
+    total_size = 0;
+    if (!IsSafeRecordingID(recording_id)) {
+        return false;
+    }
+    if (!Mount() || !EnsureRecordingsDirectory()) {
+        return false;
+    }
+    const std::string path = BuildRecordingPath(recording_id);
+    total_size = FileSizeBytes(path);
+    if (total_size == 0) {
+        return false;
+    }
+    file_path = path;
+    return true;
+}
+
 bool SdCardStorage::ReadRecordingChunk(
     const std::string& recording_id,
     uint32_t offset,
@@ -304,9 +326,8 @@ bool SdCardStorage::ReadRecordingChunk(
         return false;
     }
 
-    const std::string path = BuildRecordingPath(recording_id);
-    total_size = FileSizeBytes(path);
-    if (total_size == 0 || offset > total_size) {
+    std::string path;
+    if (!GetRecordingFilePath(recording_id, path, total_size) || offset > total_size) {
         return false;
     }
     FILE* file = fopen(path.c_str(), "rb");
