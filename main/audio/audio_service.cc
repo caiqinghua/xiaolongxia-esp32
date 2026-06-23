@@ -660,6 +660,14 @@ void AudioService::EnableLocalRecording(bool enable) {
         xEventGroupSetBits(event_group_, AS_EVENT_LOCAL_RECORDING_RUNNING);
     } else {
         xEventGroupClearBits(event_group_, AS_EVENT_LOCAL_RECORDING_RUNNING);
+        EventBits_t bits = xEventGroupGetBits(event_group_);
+        if ((bits & (
+                AS_EVENT_AUDIO_TESTING_RUNNING |
+                AS_EVENT_WAKE_WORD_RUNNING |
+                AS_EVENT_AUDIO_PROCESSOR_RUNNING
+            )) == 0 && codec_->input_enabled()) {
+            codec_->EnableInput(false);
+        }
     }
 }
 

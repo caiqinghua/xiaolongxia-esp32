@@ -26,7 +26,7 @@ constexpr char kRecordingModeKey[] = "recording_mode";
 constexpr uint8_t kProtocolVersion = 1;
 constexpr size_t kRequestHeaderLength = 4;
 constexpr uint8_t kResponseOpcodeMask = 0x80;
-constexpr size_t kMaxReadChunkBytes = 180;
+constexpr size_t kMaxReadChunkBytes = 96;
 
 constexpr int32_t kDefaultAutoPowerOffSeconds = -1;
 constexpr uint8_t kDefaultMicrophoneGainDb = 24;
