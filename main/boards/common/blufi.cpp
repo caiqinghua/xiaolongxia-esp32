@@ -1,6 +1,8 @@
 #include "blufi.h"
+#include "audream_device_control.h"
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -896,6 +898,30 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
             m_sta_connected = false;
             m_sta_got_ip = false;
             break;
+        case ESP_BLUFI_EVENT_RECV_CUSTOM_DATA: {
+            ESP_LOGI(
+                BLUFI_TAG,
+                "Received Audream custom data: %" PRIu32 " bytes",
+                param->custom_data.data_len
+            );
+            std::vector<uint8_t> response =
+                AudreamDeviceControl::GetInstance().HandleRequest(
+                    param->custom_data.data,
+                    param->custom_data.data_len
+                );
+            esp_err_t result = esp_blufi_send_custom_data(
+                response.data(),
+                response.size()
+            );
+            if (result != ESP_OK) {
+                ESP_LOGE(
+                    BLUFI_TAG,
+                    "Failed to send Audream custom data response: %s",
+                    esp_err_to_name(result)
+                );
+            }
+            break;
+        }
         case ESP_BLUFI_EVENT_GET_WIFI_STATUS: {
             auto& wifi = WifiManager::GetInstance();
             wifi_mode_t mode = GetWifiModeWithFallback(wifi);

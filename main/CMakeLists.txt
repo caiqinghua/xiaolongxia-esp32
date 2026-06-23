@@ -52,6 +52,7 @@ list(APPEND SOURCES
     "boards/common/dual_network_board.cc"
     "boards/common/adc_battery_monitor.cc"
     "boards/common/afsk_demod.cc"
+    "boards/common/audream_device_control.cc"
     "boards/common/axp2101.cc"
     "boards/common/backlight.cc"
     "boards/common/button.cc"
