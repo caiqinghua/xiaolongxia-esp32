@@ -2,12 +2,16 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <string>
 
 #include "audio/audio_codec.h"
+#include "audio/local_recording_service.h"
+#include "application.h"
 #include "board.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
 #include "settings.h"
+#include "storage/sd_card_storage.h"
 
 namespace {
 
@@ -37,6 +41,8 @@ constexpr uint16_t kCapabilityEraseAndRemove = 1 << 5;
 constexpr uint16_t kCapabilityBatteryLevel = 1 << 6;
 constexpr uint16_t kCapabilityRecordingMode = 1 << 7;
 constexpr uint16_t kCapabilityFirmwareVersion = 1 << 8;
+constexpr uint16_t kCapabilityLocalRecording = 1 << 9;
+constexpr uint16_t kCapabilityRecordingStorage = 1 << 10;
 constexpr uint16_t kCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityMicrophoneGain |
@@ -46,7 +52,9 @@ constexpr uint16_t kCapabilities =
     kCapabilityEraseAndRemove |
     kCapabilityBatteryLevel |
     kCapabilityRecordingMode |
-    kCapabilityFirmwareVersion;
+    kCapabilityFirmwareVersion |
+    kCapabilityLocalRecording |
+    kCapabilityRecordingStorage;
 constexpr uint16_t kSimulatedCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityCallGain |
@@ -63,6 +71,9 @@ enum class Opcode : uint8_t {
     kResetSettings = 0x06,
     kEraseAndRemove = 0x07,
     kSetRecordingMode = 0x08,
+    kGetStorageStatus = 0x20,
+    kStartLocalRecording = 0x21,
+    kStopLocalRecording = 0x22,
 };
 
 enum class Status : uint8_t {
@@ -71,6 +82,10 @@ enum class Status : uint8_t {
     kUnsupportedVersion = 2,
     kUnsupportedOpcode = 3,
     kInvalidValue = 4,
+    kStorageUnavailable = 5,
+    kBusy = 6,
+    kNotRecording = 7,
+    kIoError = 8,
 };
 
 uint16_t ReadUInt16(const uint8_t* data) {
@@ -98,6 +113,25 @@ void AppendInt32(std::vector<uint8_t>& output, int32_t value) {
     output.push_back(static_cast<uint8_t>((raw_value >> 8) & 0xFF));
     output.push_back(static_cast<uint8_t>((raw_value >> 16) & 0xFF));
     output.push_back(static_cast<uint8_t>((raw_value >> 24) & 0xFF));
+}
+
+void AppendUInt32(std::vector<uint8_t>& output, uint32_t value) {
+    output.push_back(static_cast<uint8_t>(value & 0xFF));
+    output.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+}
+
+void AppendUInt64(std::vector<uint8_t>& output, uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) {
+        output.push_back(static_cast<uint8_t>((value >> shift) & 0xFF));
+    }
+}
+
+void AppendString(std::vector<uint8_t>& output, const std::string& value) {
+    const size_t clamped_size = std::min<size_t>(value.size(), 255);
+    output.push_back(static_cast<uint8_t>(clamped_size));
+    output.insert(output.end(), value.begin(), value.begin() + clamped_size);
 }
 
 bool IsValidAutoPowerOff(int32_t seconds) {
@@ -203,6 +237,22 @@ std::vector<uint8_t> AudreamDeviceControl::BuildResponse(
     response.push_back(state.firmware_major);
     response.push_back(state.firmware_minor);
     response.push_back(state.firmware_patch);
+    return response;
+}
+
+std::vector<uint8_t> AudreamDeviceControl::BuildPayloadResponse(
+    uint8_t opcode,
+    uint16_t request_id,
+    uint8_t status,
+    const std::vector<uint8_t>& payload
+) const {
+    std::vector<uint8_t> response;
+    response.reserve(kRequestHeaderLength + 1 + payload.size());
+    response.push_back(kProtocolVersion);
+    response.push_back(opcode | kResponseOpcodeMask);
+    AppendUInt16(response, request_id);
+    response.push_back(status);
+    response.insert(response.end(), payload.begin(), payload.end());
     return response;
 }
 
@@ -324,6 +374,82 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             }
             ESP_LOGI(kTag, "Stored simulated recording mode: %u", recording_mode);
             break;
+        }
+
+        case Opcode::kGetStorageStatus: {
+            auto status = SdCardStorage::GetInstance().GetStatus();
+            std::vector<uint8_t> payload;
+            payload.reserve(29);
+            payload.push_back(status.mounted ? 1 : 0);
+            AppendUInt64(payload, status.total_bytes);
+            AppendUInt64(payload, status.free_bytes);
+            AppendUInt64(payload, status.recording_bytes);
+            AppendUInt32(payload, status.estimated_remaining_minutes);
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                status.mounted
+                    ? static_cast<uint8_t>(Status::kSuccess)
+                    : static_cast<uint8_t>(Status::kStorageUnavailable),
+                payload
+            );
+        }
+
+        case Opcode::kStartLocalRecording: {
+            auto& recording = LocalRecordingService::GetInstance();
+            if (recording.IsRecording()) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kBusy),
+                    {}
+                );
+            }
+            if (!recording.Start(Application::GetInstance().GetAudioService())) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kStorageUnavailable),
+                    {}
+                );
+            }
+            const auto metadata = recording.CurrentMetadata();
+            std::vector<uint8_t> payload;
+            AppendString(payload, metadata.recording_id);
+            AppendString(payload, metadata.file_name);
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                payload
+            );
+        }
+
+        case Opcode::kStopLocalRecording: {
+            auto& recording = LocalRecordingService::GetInstance();
+            if (!recording.IsRecording()) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kNotRecording),
+                    {}
+                );
+            }
+            const auto metadata = recording.Stop(Application::GetInstance().GetAudioService());
+            std::vector<uint8_t> payload;
+            AppendUInt32(payload, metadata.duration_ms);
+            AppendUInt32(payload, metadata.size_bytes);
+            AppendUInt32(payload, metadata.packet_count);
+            AppendString(payload, metadata.recording_id);
+            AppendString(payload, metadata.file_name);
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                metadata.valid
+                    ? static_cast<uint8_t>(Status::kSuccess)
+                    : static_cast<uint8_t>(Status::kIoError),
+                payload
+            );
         }
 
         case Opcode::kResetSettings:

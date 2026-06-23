@@ -1,6 +1,8 @@
 # Define source files
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_service.cc"
+            "audio/local_recording_service.cc"
+            "audio/ogg_opus_writer.cc"
             "audio/demuxer/ogg_demuxer.cc"
             "audio/codecs/no_audio_codec.cc"
             "audio/codecs/box_audio_codec.cc"
@@ -36,12 +38,13 @@ set(SOURCES "audio/audio_codec.cc"
             "application.cc"
             "ota.cc"
             "settings.cc"
+            "storage/sd_card_storage.cc"
             "device_state_machine.cc"
             "assets.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "storage")
 
 # Add board common files
 list(APPEND SOURCES
@@ -85,6 +88,10 @@ set(BUILTIN_TEXT_FONT font_puhui_14_1)
 set(BUILTIN_ICON_FONT font_awesome_14_1)
 
 set(EMOTE_RESOLUTION "320_240")
+set(AUDREAM_SD_CS_GPIO GPIO_NUM_NC)
+set(AUDREAM_SD_MOSI_GPIO GPIO_NUM_NC)
+set(AUDREAM_SD_MISO_GPIO GPIO_NUM_NC)
+set(AUDREAM_SD_CLK_GPIO GPIO_NUM_NC)
 
 # Add board files according to BOARD_TYPE
 # Set default assets if the board uses partition table V2
@@ -300,6 +307,10 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_06)
     set(BUILTIN_TEXT_FONT font_puhui_basic_30_4)
     set(BUILTIN_ICON_FONT font_awesome_30_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+    set(AUDREAM_SD_CS_GPIO GPIO_NUM_17)
+    set(AUDREAM_SD_MOSI_GPIO GPIO_NUM_1)
+    set(AUDREAM_SD_MISO_GPIO GPIO_NUM_3)
+    set(AUDREAM_SD_CLK_GPIO GPIO_NUM_2)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_C6_TOUCH_AMOLED_2_06)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-c6-touch-amoled-2.06")
@@ -903,6 +914,8 @@ idf_component_register(SRCS ${SOURCES}
                         esp_driver_i2s
                         esp_driver_jpeg
                         esp_driver_ppa
+                        fatfs
+                        sdmmc
                         esp_app_format
                         app_update
                         spi_flash
@@ -919,6 +932,10 @@ endif()
 target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BOARD_TYPE=\"${BOARD_TYPE}\" BOARD_NAME=\"${BOARD_NAME}\"
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
+                    PRIVATE AUDREAM_SD_CS_GPIO=${AUDREAM_SD_CS_GPIO}
+                    PRIVATE AUDREAM_SD_MOSI_GPIO=${AUDREAM_SD_MOSI_GPIO}
+                    PRIVATE AUDREAM_SD_MISO_GPIO=${AUDREAM_SD_MISO_GPIO}
+                    PRIVATE AUDREAM_SD_CLK_GPIO=${AUDREAM_SD_CLK_GPIO}
                     )
 
 # Add generation rules

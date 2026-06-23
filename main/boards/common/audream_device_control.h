@@ -38,4 +38,10 @@ private:
         uint8_t status,
         const DeviceState& state
     ) const;
+    std::vector<uint8_t> BuildPayloadResponse(
+        uint8_t opcode,
+        uint16_t request_id,
+        uint8_t status,
+        const std::vector<uint8_t>& payload
+    ) const;
 };

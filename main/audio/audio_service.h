@@ -5,6 +5,7 @@
 #include <deque>
 #include <condition_variable>
 #include <chrono>
+#include <functional>
 #include <mutex>
 
 #include <freertos/FreeRTOS.h>
@@ -51,6 +52,7 @@
 #define AS_EVENT_WAKE_WORD_RUNNING          (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING    (1 << 2)
 #define AS_EVENT_PLAYBACK_NOT_EMPTY         (1 << 3)
+#define AS_EVENT_LOCAL_RECORDING_RUNNING    (1 << 4)
 
 #define AS_OPUS_GET_FRAME_DRU_ENUM(duration_ms)                   \
     ((duration_ms) == 5 ? ESP_OPUS_ENC_FRAME_DURATION_5_MS :      \
@@ -87,6 +89,7 @@ enum AudioTaskType {
     kAudioTaskTypeEncodeToSendQueue,
     kAudioTaskTypeEncodeToTestingQueue,
     kAudioTaskTypeDecodeToPlaybackQueue,
+    kAudioTaskTypeEncodeToLocalRecording,
 };
 
 struct AudioTask {
@@ -124,6 +127,8 @@ public:
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
+    void EnableLocalRecording(bool enable);
+    void SetLocalRecordingPacketCallback(std::function<void(const uint8_t*, size_t)> callback);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
@@ -179,6 +184,7 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    std::function<void(const uint8_t*, size_t)> local_recording_packet_callback_;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
@@ -188,6 +194,7 @@ private:
     void AudioOutputTask();
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    bool CanProcessEncodeTask() const;
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();
 };

@@ -124,7 +124,13 @@ void AudioService::Initialize(AudioCodec* codec) {
 
 void AudioService::Start() {
     service_stopped_ = false;
-    xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+    xEventGroupClearBits(
+        event_group_,
+        AS_EVENT_AUDIO_TESTING_RUNNING |
+            AS_EVENT_WAKE_WORD_RUNNING |
+            AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+            AS_EVENT_LOCAL_RECORDING_RUNNING
+    );
 
     esp_timer_start_periodic(audio_power_timer_, 1000000);
 
@@ -171,7 +177,8 @@ void AudioService::Stop() {
     service_stopped_ = true;
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
         AS_EVENT_WAKE_WORD_RUNNING |
-        AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+        AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+        AS_EVENT_LOCAL_RECORDING_RUNNING);
 
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     audio_encode_queue_.clear();
@@ -217,7 +224,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     debug_statistics_.input_count++;
 
 #if CONFIG_USE_AUDIO_DEBUGGER
-    // 音频调试：发送原始音频数据
+    // Feed raw audio samples to the audio debugger.
     if (audio_debugger_ == nullptr) {
         audio_debugger_ = std::make_unique<AudioDebugger>();
     }
@@ -230,7 +237,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 void AudioService::AudioInputTask() {
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
-            AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING,
+            AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_LOCAL_RECORDING_RUNNING,
             pdFALSE, pdFALSE, portMAX_DELAY);
 
         if (service_stopped_) {
@@ -240,6 +247,22 @@ void AudioService::AudioInputTask() {
             audio_input_need_warmup_ = false;
             vTaskDelay(pdMS_TO_TICKS(120));
             continue;
+        }
+
+        if (bits & AS_EVENT_LOCAL_RECORDING_RUNNING) {
+            std::vector<int16_t> data;
+            int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
+            if (ReadAudioData(data, 16000, samples)) {
+                if (codec_->input_channels() == 2) {
+                    auto mono_data = std::vector<int16_t>(data.size() / 2);
+                    for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
+                        mono_data[i] = data[j];
+                    }
+                    data = std::move(mono_data);
+                }
+                PushTaskToEncodeQueue(kAudioTaskTypeEncodeToLocalRecording, std::move(data));
+                continue;
+            }
         }
 
         /* Used for audio testing in NetworkConfiguring mode by clicking the BOOT button */
@@ -329,7 +352,7 @@ void AudioService::OpusCodecTask() {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.wait(lock, [this]() {
             return service_stopped_ ||
-                (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) ||
+                CanProcessEncodeTask() ||
                 (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE);
         });
         if (service_stopped_) {
@@ -392,7 +415,7 @@ void AudioService::OpusCodecTask() {
             debug_statistics_.decode_count++;
         }
         /* Encode the audio to send queue */
-        if (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
+        if (CanProcessEncodeTask()) {
             auto task = std::move(audio_encode_queue_.front());
             audio_encode_queue_.pop_front();
             audio_queue_cv_.notify_all();
@@ -429,6 +452,10 @@ void AudioService::OpusCodecTask() {
                     } else if (task->type == kAudioTaskTypeEncodeToTestingQueue) {
                         std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
                         audio_testing_queue_.push_back(std::move(packet));
+                    } else if (task->type == kAudioTaskTypeEncodeToLocalRecording) {
+                        if (local_recording_packet_callback_) {
+                            local_recording_packet_callback_(packet->payload.data(), packet->payload.size());
+                        }
                     }
                     debug_statistics_.encode_count++;
                 } else {
@@ -479,6 +506,17 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
             ESP_LOGE(TAG, "Failed to create output resampler, error code: %d", resampler_ret);
         }
     }
+}
+
+bool AudioService::CanProcessEncodeTask() const {
+    if (audio_encode_queue_.empty()) {
+        return false;
+    }
+    const auto& task = audio_encode_queue_.front();
+    if (task->type == kAudioTaskTypeEncodeToLocalRecording) {
+        return true;
+    }
+    return audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE;
 }
 
 void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm) {
@@ -614,6 +652,19 @@ void AudioService::EnableAudioTesting(bool enable) {
         audio_decode_queue_ = std::move(audio_testing_queue_);
         audio_queue_cv_.notify_all();
     }
+}
+
+void AudioService::EnableLocalRecording(bool enable) {
+    ESP_LOGI(TAG, "%s local recording", enable ? "Enabling" : "Disabling");
+    if (enable) {
+        xEventGroupSetBits(event_group_, AS_EVENT_LOCAL_RECORDING_RUNNING);
+    } else {
+        xEventGroupClearBits(event_group_, AS_EVENT_LOCAL_RECORDING_RUNNING);
+    }
+}
+
+void AudioService::SetLocalRecordingPacketCallback(std::function<void(const uint8_t*, size_t)> callback) {
+    local_recording_packet_callback_ = std::move(callback);
 }
 
 void AudioService::EnableDeviceAec(bool enable) {
