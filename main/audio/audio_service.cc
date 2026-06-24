@@ -122,6 +122,60 @@ void AudioService::Initialize(AudioCodec* codec) {
     esp_timer_create(&audio_power_timer_args, &audio_power_timer_);
 }
 
+void AudioService::InitializeForLocalRecording(AudioCodec* codec) {
+    codec_ = codec;
+    codec_->Start();
+
+    esp_opus_enc_config_t opus_enc_cfg = AS_OPUS_ENC_CONFIG();
+    const auto ret = esp_opus_enc_open(
+        &opus_enc_cfg,
+        sizeof(esp_opus_enc_config_t),
+        &opus_encoder_
+    );
+    if (opus_encoder_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create local recording encoder, error code: %d", ret);
+    } else {
+        encoder_sample_rate_ = 16000;
+        encoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
+        esp_opus_enc_get_frame_size(
+            opus_encoder_,
+            &encoder_frame_size_,
+            &encoder_outbuf_size_
+        );
+        encoder_frame_size_ /= sizeof(int16_t);
+    }
+
+    if (codec->input_sample_rate() != 16000) {
+        esp_ae_rate_cvt_cfg_t input_resampler_cfg = RATE_CVT_CFG(
+            codec->input_sample_rate(),
+            ESP_AUDIO_SAMPLE_RATE_16K,
+            codec->input_channels()
+        );
+        const auto resampler_ret = esp_ae_rate_cvt_open(
+            &input_resampler_cfg,
+            &input_resampler_
+        );
+        if (input_resampler_ == nullptr) {
+            ESP_LOGE(
+                TAG,
+                "Failed to create local recording input resampler, error code: %d",
+                resampler_ret
+            );
+        }
+    }
+
+    esp_timer_create_args_t audio_power_timer_args = {
+        .callback = [](void* arg) {
+            static_cast<AudioService*>(arg)->CheckAndUpdateAudioPowerState();
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "audio_power_timer",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_create(&audio_power_timer_args, &audio_power_timer_);
+}
+
 void AudioService::Start() {
     service_stopped_ = false;
     xEventGroupClearBits(
@@ -170,6 +224,36 @@ void AudioService::Start() {
         audio_service->OpusCodecTask();
         vTaskDelete(NULL);
     }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+}
+
+void AudioService::StartForLocalRecording() {
+    service_stopped_ = false;
+    xEventGroupClearBits(event_group_, AS_EVENT_LOCAL_RECORDING_RUNNING);
+    esp_timer_start_periodic(audio_power_timer_, 1000000);
+
+    xTaskCreate(
+        [](void* arg) {
+            static_cast<AudioService*>(arg)->AudioInputTask();
+            vTaskDelete(nullptr);
+        },
+        "record_input",
+        2048 * 2,
+        this,
+        8,
+        &audio_input_task_handle_
+    );
+
+    xTaskCreate(
+        [](void* arg) {
+            static_cast<AudioService*>(arg)->OpusCodecTask();
+            vTaskDelete(nullptr);
+        },
+        "record_opus",
+        2048 * 12,
+        this,
+        2,
+        &opus_codec_task_handle_
+    );
 }
 
 void AudioService::Stop() {

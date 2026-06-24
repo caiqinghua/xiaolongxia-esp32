@@ -66,6 +66,17 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
+    if (board.IsRecordingOnlyMode()) {
+        ESP_LOGI(TAG, "Starting Audream recording-only mode");
+        auto codec = board.GetAudioCodec();
+        audio_service_.InitializeForLocalRecording(codec);
+        audio_service_.StartForLocalRecording();
+        board.StartNetwork();
+        SetDeviceState(kDeviceStateActivating);
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+
     // Setup the display
     auto display = board.GetDisplay();
     display->SetupUI();

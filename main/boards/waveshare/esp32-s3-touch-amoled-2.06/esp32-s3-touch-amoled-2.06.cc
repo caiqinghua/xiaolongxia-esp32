@@ -4,16 +4,15 @@
 
 #include "codecs/box_audio_codec.h"
 #include "application.h"
-#include "button.h"
 #include "led/single_led.h"
-#include "mcp_server.h"
 #include "config.h"
-#include "power_save_timer.h"
 #include "axp2101.h"
 #include "i2c_device.h"
 #include "storage/sd_card_storage.h"
+#include "blufi.h"
 
 #include <esp_log.h>
+#include <esp_pm.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
@@ -142,23 +141,8 @@ class WaveshareEsp32s3TouchAMOLED2inch06 : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Pmic* pmic_ = nullptr;
-    Button boot_button_;
-    CustomLcdDisplay* display_;
-    CustomBacklight* backlight_;
-    PowerSaveTimer* power_save_timer_;
-
-    void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
-        power_save_timer_->OnEnterSleepMode([this]() {
-            GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(20); });
-        power_save_timer_->OnExitSleepMode([this]() {
-            GetDisplay()->SetPowerSaveMode(false);
-            GetBacklight()->RestoreBrightness(); });
-        power_save_timer_->OnShutdownRequest([this](){ 
-            pmic_->PowerOff(); });
-        power_save_timer_->SetEnabled(true);
-    }
+    CustomLcdDisplay* display_ = nullptr;
+    CustomBacklight* backlight_ = nullptr;
 
     void InitializeCodecI2c() {
         // Initialize I2C peripheral
@@ -179,6 +163,18 @@ private:
         pmic_ = new Pmic(i2c_bus_, 0x34);
     }
 
+    void InitializeRecordingPowerManagement() {
+#if CONFIG_PM_ENABLE
+        const esp_pm_config_t config = {
+            .max_freq_mhz = 240,
+            .min_freq_mhz = 40,
+            .light_sleep_enable = true,
+        };
+        ESP_ERROR_CHECK(esp_pm_configure(&config));
+        ESP_LOGI(TAG, "Automatic light sleep and dynamic CPU frequency are enabled");
+#endif
+    }
+
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
         buscfg.sclk_io_num = EXAMPLE_PIN_NUM_LCD_PCLK;
@@ -189,26 +185,6 @@ private:
         buscfg.max_transfer_sz = DISPLAY_WIDTH*  DISPLAY_HEIGHT*  sizeof(uint16_t);
         buscfg.flags = SPICOMMON_BUSFLAG_QUAD;
         ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    }
-
-    void InitializeButtons() {
-        boot_button_.OnClick([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting) {
-                EnterWifiConfigMode();
-                return;
-            }
-            app.ToggleChatState();
-        });
-
-#if CONFIG_USE_DEVICE_AEC
-        boot_button_.OnDoubleClick([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateIdle) {
-                app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
-            }
-        });
-#endif
     }
 
     void InitializeSH8601Display() {
@@ -281,29 +257,24 @@ private:
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 
-    // 初始化工具
-    void InitializeTools() {
-        auto &mcp_server = McpServer::GetInstance();
-        mcp_server.AddTool("self.system.reconfigure_wifi",
-            "End this conversation and enter WiFi configuration mode.\n"
-            "**CAUTION** You must ask the user to confirm this action.",
-            PropertyList(), [this](const PropertyList& properties) {
-                EnterWifiConfigMode();
-                return true;
-            });
-    }
-
 public:
-    WaveshareEsp32s3TouchAMOLED2inch06() : boot_button_(BOOT_BUTTON_GPIO) {
-        InitializePowerSaveTimer();
+    WaveshareEsp32s3TouchAMOLED2inch06() {
         InitializeCodecI2c();
         InitializeAxp2101();
-        InitializeSpi();
-        InitializeSH8601Display();
-        InitializeTouch();
-        InitializeButtons();
-        InitializeTools();
+        InitializeRecordingPowerManagement();
+        ESP_LOGI(TAG, "Display, touch, buttons, and WiFi application features are disabled");
         SdCardStorage::GetInstance().StartInitializationTask();
+    }
+
+    virtual bool IsRecordingOnlyMode() const override {
+        return true;
+    }
+
+    virtual void StartNetwork() override {
+        const esp_err_t result = Blufi::GetInstance().init(false);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start Audream BLE control: %s", esp_err_to_name(result));
+        }
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -324,32 +295,23 @@ public:
     }
 
     virtual Display* GetDisplay() override {
-        return display_;
+        return Board::GetDisplay();
     }
 
     virtual Backlight* GetBacklight() override {
-        return backlight_;
+        return nullptr;
     }
 
     virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
-        static bool last_discharging = false;
         charging = pmic_->IsCharging();
         discharging = pmic_->IsDischarging();
-        if (discharging != last_discharging)
-        {
-            power_save_timer_->SetEnabled(discharging);
-            last_discharging = discharging;
-        }
 
         level = pmic_->GetBatteryLevel();
         return true;
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
-        if (level != PowerSaveLevel::LOW_POWER) {
-            power_save_timer_->WakeUp();
-        }
-        WifiBoard::SetPowerSaveLevel(level);
+        (void)level;
     }
 };
 

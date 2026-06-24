@@ -111,7 +111,9 @@ public:
     ~AudioService();
 
     void Initialize(AudioCodec* codec);
+    void InitializeForLocalRecording(AudioCodec* codec);
     void Start();
+    void StartForLocalRecording();
     void Stop();
     void EncodeWakeWord();
     std::unique_ptr<AudioStreamPacket> PopWakeWordPacket();

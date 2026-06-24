@@ -295,22 +295,25 @@ Blufi::~Blufi() {
     }
 }
 
-esp_err_t Blufi::init() {
+esp_err_t Blufi::init(bool enable_wifi_provisioning) {
     esp_err_t ret = ESP_FAIL;
     inited_ = true;
+    control_only_mode_ = !enable_wifi_provisioning;
     m_provisioned = false;
     m_deinited = false;
 
-    // Start WiFi scan early to have results ready when user connects
-    auto& wifi_manager = WifiManager::GetInstance();
-    if (!wifi_manager.IsInitialized() || !wifi_manager.IsConfigMode()) {
-        // start scan immediately
-        start_wifi_scan();
+    if (enable_wifi_provisioning) {
+        auto& wifi_manager = WifiManager::GetInstance();
+        if (!wifi_manager.IsInitialized() || !wifi_manager.IsConfigMode()) {
+            start_wifi_scan();
+        } else {
+            ESP_LOGE(BLUFI_TAG,
+                     "Blufi and WiFi hotspot network configuration cannot "
+                     "be used simultaneously.");
+            return ret;
+        }
     } else {
-        ESP_LOGE(BLUFI_TAG,
-                 "Blufi and WiFi hotspot network configuration cannot "
-                 "be used simultaneously.");
-        return ret;
+        ESP_LOGI(BLUFI_TAG, "Starting BLUFI in Audream control-only mode");
     }
 
 #if CONFIG_BT_CONTROLLER_ENABLED || !CONFIG_BT_NIMBLE_ENABLED
@@ -840,6 +843,23 @@ void Blufi::_wifi_scan_event_handler(void* arg, esp_event_base_t event_base, int
 }
 
 void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* param) {
+    if (control_only_mode_) {
+        switch (event) {
+            case ESP_BLUFI_EVENT_SET_WIFI_OPMODE:
+            case ESP_BLUFI_EVENT_REQ_CONNECT_TO_AP:
+            case ESP_BLUFI_EVENT_REQ_DISCONNECT_FROM_AP:
+            case ESP_BLUFI_EVENT_GET_WIFI_STATUS:
+            case ESP_BLUFI_EVENT_RECV_STA_BSSID:
+            case ESP_BLUFI_EVENT_RECV_STA_SSID:
+            case ESP_BLUFI_EVENT_RECV_STA_PASSWD:
+            case ESP_BLUFI_EVENT_GET_WIFI_LIST:
+                ESP_LOGW(BLUFI_TAG, "Ignoring WiFi provisioning event in control-only mode");
+                return;
+            default:
+                break;
+        }
+    }
+
     switch (event) {
         case ESP_BLUFI_EVENT_INIT_FINISH:
             ESP_LOGI(BLUFI_TAG, "BLUFI init finish");
@@ -858,7 +878,7 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
             ESP_LOGI(BLUFI_TAG, "BLUFI ble disconnect");
             m_ble_is_connected = false;
             _security_deinit();
-            if (!m_provisioned) {
+            if (control_only_mode_ || !m_provisioned) {
                 StartAudreamBluFiAdvertising();
             } else {
                 esp_blufi_adv_stop();

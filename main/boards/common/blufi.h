@@ -33,7 +33,7 @@ public:
      * This is the main entry point to start the Blufi process.
      * @return ESP_OK on success, otherwise an error code.
      */
-    esp_err_t init();
+    esp_err_t init(bool enable_wifi_provisioning = true);
 
     /**
      * @brief Deinitializes Blufi and the Bluetooth stack.
@@ -48,6 +48,7 @@ public:
 
 private:
     bool inited_ = false;
+    bool control_only_mode_ = false;
 
     Blufi();
 
