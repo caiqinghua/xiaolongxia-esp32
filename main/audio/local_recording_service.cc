@@ -12,6 +12,7 @@
 #include "esp_rtc_time.h"
 #include "esp_timer.h"
 #include "storage/sd_card_storage.h"
+#include "system/audream_power_manager.h"
 #include "system/device_time_service.h"
 
 namespace {
@@ -131,6 +132,7 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
             HandleOpusPacket(data, size);
         }
     );
+    AudreamPowerManager::GetInstance().SetRecordingActive(true);
     audio_service.EnableLocalRecording(true);
     ESP_LOGI(kTag, "Started local recording: %s", current_.file_path.c_str());
     return true;
@@ -167,6 +169,8 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
     WriteMetadataFile(current_);
     last_ = current_;
     recording_ = false;
+    AudreamPowerManager::GetInstance().SetRecordingActive(false);
+    AudreamPowerManager::GetInstance().NotifyUserActivity("recording_stopped", 120);
     ESP_LOGI(
         kTag,
         "Stopped local recording: id=%s duration=%lu ms size=%lu bytes",

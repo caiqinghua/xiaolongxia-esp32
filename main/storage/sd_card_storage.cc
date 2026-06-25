@@ -19,6 +19,7 @@
 #include "driver/spi_common.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "system/audream_power_manager.h"
 
 #ifndef AUDREAM_SD_CS_GPIO
 #define AUDREAM_SD_CS_GPIO GPIO_NUM_NC
@@ -59,6 +60,17 @@ constexpr uint32_t kProbeMaxAttempts = 3;
 struct RecordingScanEntry {
     StoredRecordingInfo info;
     time_t modified_at = 0;
+};
+
+class ScopedStorageBusy {
+public:
+    ScopedStorageBusy() {
+        AudreamPowerManager::GetInstance().SetStorageBusy(true);
+    }
+
+    ~ScopedStorageBusy() {
+        AudreamPowerManager::GetInstance().SetStorageBusy(false);
+    }
 };
 
 bool EndsWith(const std::string& value, const std::string& suffix) {
@@ -462,6 +474,7 @@ StorageStatus SdCardStorage::GetStatus() {
 }
 
 StorageStatus SdCardStorage::ProbeAndMountStatus() {
+    ScopedStorageBusy storage_busy;
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     StorageStatus status;
     for (uint32_t attempt = 1; attempt <= kProbeMaxAttempts; ++attempt) {
@@ -681,6 +694,7 @@ size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
     uint64_t synced_rtc_time_ms,
     const std::string& rtc_epoch_id
 ) {
+    ScopedStorageBusy storage_busy;
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!GetStatus().mounted || synced_unix_time_ms == 0 ||
         synced_rtc_time_ms == 0 || rtc_epoch_id.empty()) {

@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "lwip/ip4_addr.h"
 #include "storage/sd_card_storage.h"
+#include "system/audream_power_manager.h"
 #include "wifi_manager.h"
 
 namespace {
@@ -116,6 +117,7 @@ TemporaryAPTransferSession TemporaryAPTransferService::Start(const std::string& 
     }
 
     session_.valid = true;
+    AudreamPowerManager::GetInstance().SetTemporaryAPTransferActive(true);
     ESP_LOGI(
         kTag,
         "Temporary AP transfer started for %s as %s",
@@ -164,6 +166,7 @@ void TemporaryAPTransferService::StopLocked(bool stop_expiry_timer) {
     session_ = {};
     file_path_.clear();
     expires_at_us_ = 0;
+    AudreamPowerManager::GetInstance().SetTemporaryAPTransferActive(false);
 }
 
 void TemporaryAPTransferService::ExpiryTimerCallback(void* arg) {

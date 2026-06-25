@@ -11,10 +11,12 @@
 #include "i2c_device.h"
 #include "audio/local_recording_service.h"
 #include "storage/sd_card_storage.h"
+#include "system/audream_power_manager.h"
 #include "blufi.h"
 
 #include <esp_log.h>
 #include <esp_pm.h>
+#include <esp_timer.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
@@ -146,6 +148,7 @@ private:
     CustomLcdDisplay* display_ = nullptr;
     CustomBacklight* backlight_ = nullptr;
     Button boot_button_;
+    esp_timer_handle_t power_status_timer_ = nullptr;
 
     void InitializeCodecI2c() {
         // Initialize I2C peripheral
@@ -176,6 +179,35 @@ private:
         ESP_ERROR_CHECK(esp_pm_configure(&config));
         ESP_LOGI(TAG, "Automatic light sleep and dynamic CPU frequency are enabled");
 #endif
+        auto& power_manager = AudreamPowerManager::GetInstance();
+        power_manager.Start(BOOT_BUTTON_GPIO);
+        power_manager.SetUsbPowered(!pmic_->IsDischarging());
+
+        const esp_timer_create_args_t timer_args = {
+            .callback = [](void* arg) {
+                auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                if (board == nullptr || board->pmic_ == nullptr) {
+                    return;
+                }
+                AudreamPowerManager::GetInstance().SetUsbPowered(!board->pmic_->IsDischarging());
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "audream_power_status",
+            .skip_unhandled_events = true,
+        };
+        const esp_err_t create_result = esp_timer_create(&timer_args, &power_status_timer_);
+        if (create_result != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Failed to create power status timer: %s",
+                esp_err_to_name(create_result)
+            );
+            return;
+        }
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_timer_start_periodic(power_status_timer_, 5000000ULL)
+        );
     }
 
     void InitializeSpi() {
@@ -261,7 +293,11 @@ private:
     }
 
     void InitializeRecordingButton() {
+        boot_button_.OnClick([this]() {
+            AudreamPowerManager::GetInstance().NotifyUserActivity("button_click");
+        });
         boot_button_.OnLongPress([this]() {
+            AudreamPowerManager::GetInstance().NotifyUserActivity("button_long_press");
             Application::GetInstance().Schedule([this]() {
                 ToggleLocalRecordingFromButton();
             });

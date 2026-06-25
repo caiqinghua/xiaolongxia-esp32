@@ -13,6 +13,7 @@
 #include "settings.h"
 #include "storage/sd_card_storage.h"
 #include "storage/temporary_ap_transfer_service.h"
+#include "system/audream_power_manager.h"
 #include "system/device_time_service.h"
 
 namespace {
@@ -81,6 +82,7 @@ enum class Opcode : uint8_t {
     kEraseAndRemove = 0x07,
     kSetRecordingMode = 0x08,
     kSyncTime = 0x09,
+    kForegroundWake = 0x0A,
     kGetStorageStatus = 0x20,
     kStartLocalRecording = 0x21,
     kStopLocalRecording = 0x22,
@@ -102,6 +104,29 @@ enum class Status : uint8_t {
     kNotRecording = 7,
     kIoError = 8,
     kNotFound = 9,
+};
+
+bool IsMaintenanceOpcode(Opcode opcode) {
+    switch (opcode) {
+        case Opcode::kGetDeviceState:
+        case Opcode::kSyncTime:
+        case Opcode::kGetStorageStatus:
+        case Opcode::kListLocalRecordings:
+            return true;
+        default:
+            return false;
+    }
+}
+
+class ScopedBleFileTransfer {
+public:
+    ScopedBleFileTransfer() {
+        AudreamPowerManager::GetInstance().SetBleFileTransferActive(true);
+    }
+
+    ~ScopedBleFileTransfer() {
+        AudreamPowerManager::GetInstance().SetBleFileTransferActive(false);
+    }
 };
 
 uint16_t ReadUInt16(const uint8_t* data) {
@@ -353,6 +378,11 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
     }
 
     const auto opcode = static_cast<Opcode>(opcode_value);
+    if (IsMaintenanceOpcode(opcode)) {
+        AudreamPowerManager::GetInstance().NotifyMaintenanceActivity("device_control");
+    } else {
+        AudreamPowerManager::GetInstance().NotifyUserActivity("device_control");
+    }
     switch (opcode) {
         case Opcode::kGetDeviceState:
             ApplyMicrophoneGain(LoadState().microphone_gain_db);
@@ -461,6 +491,10 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             DeviceTimeService::GetInstance().SyncUnixTimeMs(unix_time_ms);
             break;
         }
+
+        case Opcode::kForegroundWake:
+            ESP_LOGI(kTag, "Foreground wake request received");
+            break;
 
         case Opcode::kGetStorageStatus: {
             auto status = SdCardStorage::GetInstance().GetStatus();
@@ -577,6 +611,7 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
         }
 
         case Opcode::kReadLocalRecordingChunk: {
+            ScopedBleFileTransfer transfer_blocker;
             size_t cursor = kRequestHeaderLength;
             std::string recording_id;
             if (!ReadString(data, length, cursor, recording_id) ||
