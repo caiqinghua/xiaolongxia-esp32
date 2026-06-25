@@ -158,6 +158,27 @@ struct AudreamCustomRequest {
     std::vector<uint8_t> data;
 };
 
+const char* FormatAudreamCustomOpcode(
+    const uint8_t* data,
+    size_t length,
+    char* buffer,
+    size_t buffer_size
+) {
+    if (data == nullptr || length < 2 || buffer == nullptr || buffer_size == 0) {
+        return "unavailable";
+    }
+    std::snprintf(buffer, buffer_size, "0x%02x", data[1]);
+    return buffer;
+}
+
+uint16_t ReadAudreamCustomRequestId(const uint8_t* data, size_t length) {
+    if (data == nullptr || length < 4) {
+        return 0;
+    }
+    return static_cast<uint16_t>(data[2]) |
+        (static_cast<uint16_t>(data[3]) << 8);
+}
+
 QueueHandle_t g_audream_custom_queue = nullptr;
 TaskHandle_t g_audream_custom_task = nullptr;
 
@@ -174,10 +195,20 @@ void AudreamCustomDataTask(void* arg) {
             continue;
         }
 
+        char opcode_buffer[8] = {};
         ESP_LOGI(
             BLUFI_TAG,
-            "Handling Audream custom data off the BLUFI task: %u bytes",
-            static_cast<unsigned>(request->data.size())
+            "Handling Audream custom data off the BLUFI task: %u bytes opcode=%s request_id=%u",
+            static_cast<unsigned>(request->data.size()),
+            FormatAudreamCustomOpcode(
+                request->data.data(),
+                request->data.size(),
+                opcode_buffer,
+                sizeof(opcode_buffer)
+            ),
+            static_cast<unsigned>(
+                ReadAudreamCustomRequestId(request->data.data(), request->data.size())
+            )
         );
         std::vector<uint8_t> response =
             AudreamDeviceControl::GetInstance().HandleRequest(
@@ -1026,10 +1057,23 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
             m_sta_got_ip = false;
             break;
         case ESP_BLUFI_EVENT_RECV_CUSTOM_DATA: {
+            char opcode_buffer[8] = {};
             ESP_LOGI(
                 BLUFI_TAG,
-                "Received Audream custom data: %" PRIu32 " bytes",
-                param->custom_data.data_len
+                "Received Audream custom data: %" PRIu32 " bytes opcode=%s request_id=%u",
+                param->custom_data.data_len,
+                FormatAudreamCustomOpcode(
+                    param->custom_data.data,
+                    param->custom_data.data_len,
+                    opcode_buffer,
+                    sizeof(opcode_buffer)
+                ),
+                static_cast<unsigned>(
+                    ReadAudreamCustomRequestId(
+                        param->custom_data.data,
+                        param->custom_data.data_len
+                    )
+                )
             );
             QueueAudreamCustomData(param->custom_data.data, param->custom_data.data_len);
             break;

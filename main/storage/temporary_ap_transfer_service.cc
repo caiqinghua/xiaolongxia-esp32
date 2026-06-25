@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -35,8 +36,36 @@ std::string RandomHex(size_t bytes) {
     return value;
 }
 
+std::string HexBytes(const uint8_t* bytes, size_t length) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string value;
+    value.reserve(length * 2);
+    for (size_t index = 0; index < length; ++index) {
+        const uint8_t byte = bytes[index];
+        value.push_back(kHex[byte >> 4]);
+        value.push_back(kHex[byte & 0x0F]);
+    }
+    return value;
+}
+
+bool ReadDefaultMac(uint8_t* mac) {
+    return mac != nullptr && esp_efuse_mac_get_default(mac) == ESP_OK;
+}
+
+std::string BuildStableSSID() {
+    uint8_t mac[6] = {};
+    if (ReadDefaultMac(mac)) {
+        return "Audream-" + HexBytes(mac + 3, 3);
+    }
+    return "Audream-" + RandomHex(3);
+}
+
 std::string BuildPassword() {
-    return "Audream" + RandomHex(4);
+    uint8_t mac[6] = {};
+    if (ReadDefaultMac(mac)) {
+        return "Audream" + HexBytes(mac, 6);
+    }
+    return "Audream" + RandomHex(6);
 }
 
 bool QueryValue(httpd_req_t* request, const char* key, char* output, size_t output_size) {
@@ -71,7 +100,7 @@ TemporaryAPTransferSession TemporaryAPTransferService::Start(const std::string& 
 
     session_ = {};
     session_.recording_id = recording_id;
-    session_.ssid = "Audream-" + RandomHex(2);
+    session_.ssid = BuildStableSSID();
     session_.password = BuildPassword();
     session_.token = RandomHex(16);
     session_.size_bytes = total_size;
