@@ -113,6 +113,111 @@ uint32_t ReadMetadataUInt32(const std::string& metadata_path, const std::string&
     return value;
 }
 
+std::string ReadTextFile(const std::string& path) {
+    std::ifstream stream(path);
+    if (!stream.good()) {
+        return "";
+    }
+    return std::string(
+        (std::istreambuf_iterator<char>(stream)),
+        std::istreambuf_iterator<char>()
+    );
+}
+
+uint64_t ReadJsonUInt64(const std::string& content, const std::string& key) {
+    const std::string marker = "\"" + key + "\":";
+    const size_t start = content.find(marker);
+    if (start == std::string::npos) {
+        return 0;
+    }
+    size_t cursor = start + marker.size();
+    while (cursor < content.size() && std::isspace(static_cast<unsigned char>(content[cursor]))) {
+        cursor++;
+    }
+    uint64_t value = 0;
+    while (cursor < content.size() && std::isdigit(static_cast<unsigned char>(content[cursor]))) {
+        value = value * 10 + static_cast<uint64_t>(content[cursor] - '0');
+        cursor++;
+    }
+    return value;
+}
+
+std::string ReadJsonString(const std::string& content, const std::string& key) {
+    const std::string marker = "\"" + key + "\":\"";
+    const size_t start = content.find(marker);
+    if (start == std::string::npos) {
+        return "";
+    }
+    const size_t value_start = start + marker.size();
+    const size_t value_end = content.find('"', value_start);
+    if (value_end == std::string::npos) {
+        return "";
+    }
+    return content.substr(value_start, value_end - value_start);
+}
+
+bool JsonBoolValue(const std::string& content, const std::string& key) {
+    const std::string marker = "\"" + key + "\":";
+    const size_t start = content.find(marker);
+    if (start == std::string::npos) {
+        return false;
+    }
+    size_t cursor = start + marker.size();
+    while (cursor < content.size() && std::isspace(static_cast<unsigned char>(content[cursor]))) {
+        cursor++;
+    }
+    return content.compare(cursor, 4, "true") == 0;
+}
+
+bool WriteRecordingMetadata(
+    const std::string& metadata_path,
+    const std::string& recording_id,
+    const std::string& file_name,
+    const std::string& rtc_epoch_id,
+    uint32_t duration_ms,
+    uint32_t size_bytes,
+    uint64_t started_at_unix_ms,
+    uint64_t started_at_uptime_ms,
+    uint64_t started_at_rtc_ms,
+    bool time_synchronized
+) {
+    FILE* file = fopen(metadata_path.c_str(), "w");
+    if (file == nullptr) {
+        ESP_LOGE(kTag, "Failed to open recording metadata file: %s", metadata_path.c_str());
+        return false;
+    }
+    std::fprintf(
+        file,
+        "{"
+        "\"recording_id\":\"%s\","
+        "\"file_name\":\"%s\","
+        "\"rtc_epoch_id\":\"%s\","
+        "\"duration_ms\":%lu,"
+        "\"size_bytes\":%lu,"
+        "\"started_at_unix_ms\":%s,"
+        "\"started_at_uptime_ms\":%s,"
+        "\"started_at_rtc_ms\":%s,"
+        "\"time_synchronized\":%s,"
+        "\"codec\":\"opus\","
+        "\"container\":\"ogg\","
+        "\"sample_rate\":16000,"
+        "\"channels\":1,"
+        "\"sync_state\":\"pending\""
+        "}\n",
+        recording_id.c_str(),
+        file_name.c_str(),
+        rtc_epoch_id.c_str(),
+        static_cast<unsigned long>(duration_ms),
+        static_cast<unsigned long>(size_bytes),
+        std::to_string(started_at_unix_ms).c_str(),
+        std::to_string(started_at_uptime_ms).c_str(),
+        std::to_string(started_at_rtc_ms).c_str(),
+        time_synchronized ? "true" : "false"
+    );
+    fclose(file);
+    return true;
+}
+
 uint64_t DirectorySizeBytes(const char* path) {
     DIR* dir = opendir(path);
     if (dir == nullptr) {
@@ -569,4 +674,92 @@ bool SdCardStorage::ReadRecordingChunk(
     fclose(file);
     output.resize(bytes_read);
     return bytes_read == length;
+}
+
+size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
+    uint64_t synced_unix_time_ms,
+    uint64_t synced_rtc_time_ms,
+    const std::string& rtc_epoch_id
+) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!GetStatus().mounted || synced_unix_time_ms == 0 ||
+        synced_rtc_time_ms == 0 || rtc_epoch_id.empty()) {
+        return 0;
+    }
+
+    DIR* dir = opendir(kRecordingsDirectory);
+    if (dir == nullptr) {
+        ESP_LOGE(kTag, "Failed to open recordings directory: %s", std::strerror(errno));
+        return 0;
+    }
+
+    size_t updated_count = 0;
+    while (dirent* entry = readdir(dir)) {
+        const std::string file_name = entry->d_name;
+        if (!EndsWith(file_name, ".opus")) {
+            continue;
+        }
+        const std::string recording_id = file_name.substr(0, file_name.size() - 5);
+        if (!IsSafeRecordingID(recording_id)) {
+            continue;
+        }
+
+        const std::string audio_path = std::string(kRecordingsDirectory) + "/" + file_name;
+        const std::string metadata_path = audio_path + ".json";
+        const std::string content = ReadTextFile(metadata_path);
+        if (content.empty() || JsonBoolValue(content, "time_synchronized")) {
+            continue;
+        }
+        if (ReadJsonString(content, "rtc_epoch_id") != rtc_epoch_id) {
+            continue;
+        }
+
+        const uint64_t started_at_rtc_ms = ReadJsonUInt64(content, "started_at_rtc_ms");
+        if (started_at_rtc_ms == 0 || started_at_rtc_ms > synced_rtc_time_ms) {
+            continue;
+        }
+
+        struct stat st = {};
+        if (stat(audio_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+
+        const uint64_t elapsed_before_sync_ms = synced_rtc_time_ms - started_at_rtc_ms;
+        if (synced_unix_time_ms < elapsed_before_sync_ms) {
+            continue;
+        }
+        const uint64_t started_at_unix_ms = synced_unix_time_ms - elapsed_before_sync_ms;
+        const uint64_t started_at_uptime_ms = ReadJsonUInt64(content, "started_at_uptime_ms");
+        const std::string metadata_recording_id = ReadJsonString(content, "recording_id");
+        const std::string metadata_file_name = ReadJsonString(content, "file_name");
+        const uint32_t duration_ms = static_cast<uint32_t>(
+            ReadJsonUInt64(content, "duration_ms")
+        );
+        const uint32_t size_bytes = static_cast<uint32_t>(st.st_size);
+
+        if (WriteRecordingMetadata(
+                metadata_path,
+                metadata_recording_id.empty() ? recording_id : metadata_recording_id,
+                metadata_file_name.empty() ? file_name : metadata_file_name,
+                rtc_epoch_id,
+                duration_ms,
+                size_bytes,
+                started_at_unix_ms,
+                started_at_uptime_ms,
+                started_at_rtc_ms,
+                true
+            )) {
+            updated_count++;
+        }
+    }
+    closedir(dir);
+
+    if (updated_count > 0) {
+        ESP_LOGI(
+            kTag,
+            "Backfilled %u recording metadata timestamps",
+            static_cast<unsigned>(updated_count)
+        );
+    }
+    return updated_count;
 }

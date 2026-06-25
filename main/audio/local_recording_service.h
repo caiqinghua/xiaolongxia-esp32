@@ -12,10 +12,14 @@ struct LocalRecordingMetadata {
     std::string recording_id;
     std::string file_name;
     std::string file_path;
+    std::string rtc_epoch_id;
     uint32_t duration_ms = 0;
     uint32_t size_bytes = 0;
     uint32_t packet_count = 0;
     uint64_t started_at_unix_ms = 0;
+    uint64_t started_at_uptime_ms = 0;
+    uint64_t started_at_rtc_ms = 0;
+    bool time_synchronized = false;
     bool valid = false;
 };
 

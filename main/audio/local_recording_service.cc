@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_random.h"
+#include "esp_rtc_time.h"
 #include "esp_timer.h"
 #include "storage/sd_card_storage.h"
 #include "system/device_time_service.h"
@@ -118,7 +119,12 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
     }
 
     started_at_us_ = esp_timer_get_time();
-    current_.started_at_unix_ms = DeviceTimeService::GetInstance().CurrentUnixTimeMs();
+    auto& time_service = DeviceTimeService::GetInstance();
+    current_.rtc_epoch_id = time_service.RtcEpochID();
+    current_.started_at_uptime_ms = static_cast<uint64_t>(started_at_us_ / 1000);
+    current_.started_at_rtc_ms = esp_rtc_get_time_us() / 1000;
+    current_.started_at_unix_ms = time_service.CurrentUnixTimeMs();
+    current_.time_synchronized = time_service.IsSynchronized();
     recording_ = true;
     audio_service.SetLocalRecordingPacketCallback(
         [this](const uint8_t* data, size_t size) {
@@ -146,6 +152,18 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
     current_.size_bytes = FileSizeBytes(current_.file_path);
     current_.packet_count = writer_.PacketCount();
     current_.valid = current_.size_bytes > 0 && current_.packet_count > 0;
+    auto& time_service = DeviceTimeService::GetInstance();
+    if (!current_.time_synchronized && time_service.IsSynchronized()) {
+        const uint64_t stopped_at_rtc_ms = esp_rtc_get_time_us() / 1000;
+        const uint64_t stopped_at_unix_ms = time_service.CurrentUnixTimeMs();
+        if (current_.started_at_rtc_ms > 0 &&
+            stopped_at_rtc_ms >= current_.started_at_rtc_ms &&
+            stopped_at_unix_ms >= stopped_at_rtc_ms - current_.started_at_rtc_ms) {
+            current_.started_at_unix_ms =
+                stopped_at_unix_ms - (stopped_at_rtc_ms - current_.started_at_rtc_ms);
+            current_.time_synchronized = true;
+        }
+    }
     WriteMetadataFile(current_);
     last_ = current_;
     recording_ = false;
@@ -200,9 +218,13 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
         "{"
         "\"recording_id\":\"%s\","
         "\"file_name\":\"%s\","
+        "\"rtc_epoch_id\":\"%s\","
         "\"duration_ms\":%lu,"
         "\"size_bytes\":%lu,"
         "\"started_at_unix_ms\":%s,"
+        "\"started_at_uptime_ms\":%s,"
+        "\"started_at_rtc_ms\":%s,"
+        "\"time_synchronized\":%s,"
         "\"codec\":\"opus\","
         "\"container\":\"ogg\","
         "\"sample_rate\":16000,"
@@ -211,9 +233,13 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
         "}\n",
         metadata.recording_id.c_str(),
         metadata.file_name.c_str(),
+        metadata.rtc_epoch_id.c_str(),
         static_cast<unsigned long>(metadata.duration_ms),
         static_cast<unsigned long>(metadata.size_bytes),
-        std::to_string(metadata.started_at_unix_ms).c_str()
+        std::to_string(metadata.started_at_unix_ms).c_str(),
+        std::to_string(metadata.started_at_uptime_ms).c_str(),
+        std::to_string(metadata.started_at_rtc_ms).c_str(),
+        metadata.time_synchronized ? "true" : "false"
     );
     fclose(file);
     return true;

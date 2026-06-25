@@ -54,6 +54,11 @@ public:
         std::vector<uint8_t>& output,
         uint32_t& total_size
     );
+    size_t BackfillUnsynchronizedRecordingTimes(
+        uint64_t synced_unix_time_ms,
+        uint64_t synced_rtc_time_ms,
+        const std::string& rtc_epoch_id
+    );
 
 private:
     SdCardStorage() = default;
