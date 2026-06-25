@@ -1,10 +1,12 @@
 #include "audio/local_recording_service.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <sys/stat.h>
 
 #include "audio/audio_service.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "storage/sd_card_storage.h"
@@ -16,14 +18,57 @@ constexpr uint32_t kSampleRate = 16000;
 constexpr uint8_t kChannels = 1;
 constexpr uint32_t kFrameSamples = 960;
 
+void XorBytes(uint8_t* target, size_t target_size, const uint8_t* source, size_t source_size) {
+    for (size_t i = 0; i < source_size; ++i) {
+        target[i % target_size] ^= source[i];
+    }
+}
+
 std::string BuildRecordingID() {
+    static uint32_t sequence = 0;
+
+    uint8_t uuid[16] = {};
+    esp_fill_random(uuid, sizeof(uuid));
+
+    uint8_t mac[6] = {};
+    if (esp_efuse_mac_get_default(mac) == ESP_OK) {
+        XorBytes(uuid, sizeof(uuid), mac, sizeof(mac));
+    }
+
+    const uint64_t uptime_us = static_cast<uint64_t>(esp_timer_get_time());
+    const uint32_t current_sequence = ++sequence;
+    XorBytes(uuid, sizeof(uuid), reinterpret_cast<const uint8_t*>(&uptime_us), sizeof(uptime_us));
+    XorBytes(
+        uuid,
+        sizeof(uuid),
+        reinterpret_cast<const uint8_t*>(&current_sequence),
+        sizeof(current_sequence)
+    );
+
+    uuid[6] = static_cast<uint8_t>((uuid[6] & 0x0f) | 0x40);
+    uuid[8] = static_cast<uint8_t>((uuid[8] & 0x3f) | 0x80);
+
     char buffer[48] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "rec_%lld_%08lx",
-        static_cast<long long>(esp_timer_get_time()),
-        static_cast<unsigned long>(esp_random())
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        static_cast<unsigned int>(uuid[0]),
+        static_cast<unsigned int>(uuid[1]),
+        static_cast<unsigned int>(uuid[2]),
+        static_cast<unsigned int>(uuid[3]),
+        static_cast<unsigned int>(uuid[4]),
+        static_cast<unsigned int>(uuid[5]),
+        static_cast<unsigned int>(uuid[6]),
+        static_cast<unsigned int>(uuid[7]),
+        static_cast<unsigned int>(uuid[8]),
+        static_cast<unsigned int>(uuid[9]),
+        static_cast<unsigned int>(uuid[10]),
+        static_cast<unsigned int>(uuid[11]),
+        static_cast<unsigned int>(uuid[12]),
+        static_cast<unsigned int>(uuid[13]),
+        static_cast<unsigned int>(uuid[14]),
+        static_cast<unsigned int>(uuid[15])
     );
     return std::string(buffer);
 }
