@@ -16,8 +16,10 @@
 
 #include <esp_log.h>
 #include <esp_pm.h>
+#include <esp_sleep.h>
 #include <esp_timer.h>
 #include <esp_lcd_panel_vendor.h>
+#include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
 #include "settings.h"
@@ -27,6 +29,12 @@
 #include <lvgl.h>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch06"
+
+namespace {
+
+constexpr int64_t kDeepSleepWakeRecordHoldUs = 3000LL * 1000LL;
+
+}  // namespace
 
 class Pmic : public Axp2101 {
 public:
@@ -149,6 +157,12 @@ private:
     CustomBacklight* backlight_ = nullptr;
     Button boot_button_;
     esp_timer_handle_t power_status_timer_ = nullptr;
+    esp_timer_handle_t deep_sleep_record_hold_timer_ = nullptr;
+    bool power_source_initialized_ = false;
+    bool usb_powered_ = false;
+    bool pending_deep_sleep_recording_ = false;
+    bool suppress_next_wake_long_press_ = false;
+    int64_t deep_sleep_wake_button_down_us_ = 0;
 
     void InitializeCodecI2c() {
         // Initialize I2C peripheral
@@ -169,6 +183,30 @@ private:
         pmic_ = new Pmic(i2c_bus_, 0x34);
     }
 
+    void UpdateUsbPowerState(bool force_log = false) {
+        if (pmic_ == nullptr) {
+            return;
+        }
+        const uint8_t status1 = pmic_->GetStatus1();
+        const uint8_t status2 = pmic_->GetStatus2();
+        const bool usb_powered = pmic_->IsVbusIn();
+        const bool changed = !power_source_initialized_ || usb_powered_ != usb_powered;
+        usb_powered_ = usb_powered;
+        power_source_initialized_ = true;
+        AudreamPowerManager::GetInstance().SetUsbPowered(usb_powered);
+        if (changed || force_log) {
+            ESP_LOGI(
+                TAG,
+                "Power source status: usb_powered=%d status1=0x%02x status2=0x%02x charging=%d discharging=%d",
+                usb_powered ? 1 : 0,
+                status1,
+                status2,
+                pmic_->IsCharging() ? 1 : 0,
+                pmic_->IsDischarging() ? 1 : 0
+            );
+        }
+    }
+
     void InitializeRecordingPowerManagement() {
 #if CONFIG_PM_ENABLE
         const esp_pm_config_t config = {
@@ -181,15 +219,15 @@ private:
 #endif
         auto& power_manager = AudreamPowerManager::GetInstance();
         power_manager.Start(BOOT_BUTTON_GPIO);
-        power_manager.SetUsbPowered(!pmic_->IsDischarging());
+        UpdateUsbPowerState(true);
 
         const esp_timer_create_args_t timer_args = {
             .callback = [](void* arg) {
                 auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
-                if (board == nullptr || board->pmic_ == nullptr) {
+                if (board == nullptr) {
                     return;
                 }
-                AudreamPowerManager::GetInstance().SetUsbPowered(!board->pmic_->IsDischarging());
+                board->UpdateUsbPowerState();
             },
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,
@@ -294,14 +332,139 @@ private:
 
     void InitializeRecordingButton() {
         boot_button_.OnClick([this]() {
+            if (suppress_next_wake_long_press_) {
+                suppress_next_wake_long_press_ = false;
+                ESP_LOGI(TAG, "Cleared deep sleep wake long press suppression on button release");
+            }
             AudreamPowerManager::GetInstance().NotifyUserActivity("button_click");
         });
         boot_button_.OnLongPress([this]() {
+            if (suppress_next_wake_long_press_) {
+                ESP_LOGI(TAG, "Ignored wake long press because deep sleep recording hold check is pending");
+                return;
+            }
             AudreamPowerManager::GetInstance().NotifyUserActivity("button_long_press");
             Application::GetInstance().Schedule([this]() {
                 ToggleLocalRecordingFromButton();
             });
         });
+    }
+
+    void DetectDeepSleepRecordingIntent() {
+        const esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+        if (wakeup_cause != ESP_SLEEP_WAKEUP_EXT0) {
+            return;
+        }
+        const int button_level = gpio_get_level(BOOT_BUTTON_GPIO);
+        if (button_level != 0) {
+            ESP_LOGI(TAG, "Deep sleep wake by button without held recording intent");
+            return;
+        }
+        pending_deep_sleep_recording_ = true;
+        suppress_next_wake_long_press_ = true;
+        deep_sleep_wake_button_down_us_ = esp_timer_get_time();
+        AudreamPowerManager::GetInstance().NotifyUserActivity("deep_sleep_record_intent", 120);
+        ESP_LOGI(TAG, "Detected deep sleep wake recording candidate");
+    }
+
+    void HandleStorageInitializationComplete(const StorageStatus& status) {
+        if (!pending_deep_sleep_recording_) {
+            return;
+        }
+        if (!status.mounted) {
+            pending_deep_sleep_recording_ = false;
+            ESP_LOGE(
+                TAG,
+                "Deep sleep wake recording was canceled because storage is unavailable, error_code=%lu",
+                static_cast<unsigned long>(status.error_code)
+            );
+            return;
+        }
+        ScheduleDeepSleepRecordingHoldCheck();
+    }
+
+    void ScheduleDeepSleepRecordingHoldCheck() {
+        const int64_t elapsed_us = esp_timer_get_time() - deep_sleep_wake_button_down_us_;
+        const int64_t delay_us = kDeepSleepWakeRecordHoldUs - elapsed_us;
+        if (delay_us <= 0) {
+            Application::GetInstance().Schedule([this]() {
+                EvaluateDeepSleepRecordingHold();
+            });
+            return;
+        }
+        if (deep_sleep_record_hold_timer_ == nullptr) {
+            const esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) {
+                    auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                    if (board == nullptr) {
+                        return;
+                    }
+                    Application::GetInstance().Schedule([board]() {
+                        board->EvaluateDeepSleepRecordingHold();
+                    });
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "audream_wake_record",
+                .skip_unhandled_events = true,
+            };
+            const esp_err_t result = esp_timer_create(&timer_args, &deep_sleep_record_hold_timer_);
+            if (result != ESP_OK) {
+                pending_deep_sleep_recording_ = false;
+                suppress_next_wake_long_press_ = false;
+                ESP_LOGE(
+                    TAG,
+                    "Failed to create deep sleep recording hold timer: %s",
+                    esp_err_to_name(result)
+                );
+                return;
+            }
+        }
+        ESP_LOGI(
+            TAG,
+            "Deep sleep wake recording hold check scheduled in %lld ms",
+            static_cast<long long>(delay_us / 1000)
+        );
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_timer_start_once(deep_sleep_record_hold_timer_, static_cast<uint64_t>(delay_us))
+        );
+    }
+
+    void EvaluateDeepSleepRecordingHold() {
+        if (!pending_deep_sleep_recording_) {
+            return;
+        }
+        if (gpio_get_level(BOOT_BUTTON_GPIO) != 0) {
+            pending_deep_sleep_recording_ = false;
+            suppress_next_wake_long_press_ = false;
+            ESP_LOGI(TAG, "Deep sleep wake recording canceled because button was released before hold threshold");
+            return;
+        }
+        StartPendingDeepSleepRecording();
+    }
+
+    void StartPendingDeepSleepRecording() {
+        if (!pending_deep_sleep_recording_) {
+            return;
+        }
+        pending_deep_sleep_recording_ = false;
+        suppress_next_wake_long_press_ = false;
+        auto& recording = LocalRecordingService::GetInstance();
+        if (recording.IsRecording()) {
+            ESP_LOGI(TAG, "Deep sleep wake recording skipped because recording is already active");
+            return;
+        }
+        auto& audio_service = Application::GetInstance().GetAudioService();
+        if (!recording.Start(audio_service)) {
+            ESP_LOGE(TAG, "Deep sleep wake recording failed to start");
+            return;
+        }
+        const auto metadata = recording.CurrentMetadata();
+        ESP_LOGI(
+            TAG,
+            "Deep sleep wake started local recording: id=%s",
+            metadata.recording_id.c_str()
+        );
     }
 
     void ToggleLocalRecordingFromButton() {
@@ -341,8 +504,13 @@ public:
         InitializeAxp2101();
         InitializeRecordingPowerManagement();
         InitializeRecordingButton();
+        DetectDeepSleepRecordingIntent();
         ESP_LOGI(TAG, "Display, touch, and WiFi application features are disabled");
-        SdCardStorage::GetInstance().StartInitializationTask();
+        auto& storage = SdCardStorage::GetInstance();
+        storage.SetInitializationCompleteCallback([this](const StorageStatus& status) {
+            HandleStorageInitializationComplete(status);
+        });
+        storage.StartInitializationTask();
     }
 
     virtual bool IsRecordingOnlyMode() const override {

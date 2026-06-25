@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -34,6 +35,7 @@ class SdCardStorage {
 public:
     static SdCardStorage& GetInstance();
 
+    void SetInitializationCompleteCallback(std::function<void(const StorageStatus&)> callback);
     void StartInitializationTask();
     bool Mount();
     bool IsMounted() const;
@@ -67,6 +69,7 @@ private:
     bool initialization_task_started_ = false;
     bool mounted_ = false;
     bool ready_ = false;
+    std::function<void(const StorageStatus&)> initialization_complete_callback_;
     StorageStatus cached_status_;
     StorageStatusErrorCode last_error_code_ = StorageStatusErrorCode::kNone;
 };

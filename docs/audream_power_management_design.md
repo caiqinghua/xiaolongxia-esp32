@@ -89,6 +89,10 @@ Active -> Light Sleep -> Deep Sleep
 唤醒方式：
 
 - 第一版只使用用户按键唤醒。
+- 如果设备因按键从 `Deep Sleep` 唤醒，并且启动时按键仍保持按下，固件记录一次 pending recording candidate。
+- pending recording candidate 不会立即录音；它会等待 SD 卡 startup initialization 完成。
+- 如果 SD 卡在 3 秒长按阈值之前 ready，固件会补足剩余时间，到 3 秒时再次读取按键电平。只有按键仍保持按下，才启动本地 OPUS 录音。
+- 该路径会吞掉本次唤醒产生的后续长按事件，避免自动开始录音后又被同一次长按反向停止。
 - RTC 定时唤醒暂不启用，避免增加功耗和行为复杂度。
 
 ## USB 供电规则
@@ -96,6 +100,12 @@ Active -> Light Sleep -> Deep Sleep
 USB 供电或调试连接时，不自动进入 `Deep Sleep`，避免串口断开、烧录和 monitor 被影响。
 
 USB 不阻止进入 `Light Sleep`。如果设备已在 `Light Sleep` 且达到 180 秒，但检测到 USB 供电，应停留在 `Light Sleep`。
+
+On AXP2101 boards, the USB blocker must use the PMIC VBUS input state, not
+`!IsDischarging()`. AXP2101 can report standby or charge-done states that are
+neither charging nor discharging, and treating those states as USB power can
+permanently block deep sleep after the cable is removed. The Waveshare board
+uses `STATUS1.bit5 && !STATUS2.bit3`, matching XPowersLib `isVbusIn()`.
 
 建议日志节流输出：
 

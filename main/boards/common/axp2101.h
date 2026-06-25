@@ -8,7 +8,10 @@ public:
     Axp2101(i2c_master_bus_handle_t i2c_bus, uint8_t addr);
     bool IsCharging();
     bool IsDischarging();
+    bool IsVbusIn();
     bool IsChargingDone();
+    uint8_t GetStatus1();
+    uint8_t GetStatus2();
     int GetBatteryLevel();
     float GetTemperature();
     void PowerOff();

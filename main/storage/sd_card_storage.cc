@@ -6,8 +6,10 @@
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
+#include <functional>
 #include <sys/stat.h>
 #include <sys/unistd.h>
+#include <utility>
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -278,6 +280,13 @@ SdCardStorage& SdCardStorage::GetInstance() {
     return instance;
 }
 
+void SdCardStorage::SetInitializationCompleteCallback(
+    std::function<void(const StorageStatus&)> callback
+) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    initialization_complete_callback_ = std::move(callback);
+}
+
 void SdCardStorage::StartInitializationTask() {
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -305,6 +314,15 @@ void SdCardStorage::StartInitializationTask() {
                     "Startup SD card initialization failed, error_code=%lu",
                     static_cast<unsigned long>(status.error_code)
                 );
+            }
+            std::function<void(const StorageStatus&)> callback;
+            {
+                auto& storage = SdCardStorage::GetInstance();
+                std::lock_guard<std::recursive_mutex> lock(storage.mutex_);
+                callback = storage.initialization_complete_callback_;
+            }
+            if (callback) {
+                callback(status);
             }
             vTaskDelete(nullptr);
         },
