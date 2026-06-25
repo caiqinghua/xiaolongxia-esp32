@@ -15,6 +15,7 @@ struct LocalRecordingMetadata {
     uint32_t duration_ms = 0;
     uint32_t size_bytes = 0;
     uint32_t packet_count = 0;
+    uint64_t started_at_unix_ms = 0;
     bool valid = false;
 };
 

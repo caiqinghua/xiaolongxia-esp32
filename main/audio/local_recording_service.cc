@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <sys/stat.h>
 
 #include "audio/audio_service.h"
@@ -10,6 +11,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "storage/sd_card_storage.h"
+#include "system/device_time_service.h"
 
 namespace {
 
@@ -116,6 +118,7 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
     }
 
     started_at_us_ = esp_timer_get_time();
+    current_.started_at_unix_ms = DeviceTimeService::GetInstance().CurrentUnixTimeMs();
     recording_ = true;
     audio_service.SetLocalRecordingPacketCallback(
         [this](const uint8_t* data, size_t size) {
@@ -199,6 +202,7 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
         "\"file_name\":\"%s\","
         "\"duration_ms\":%lu,"
         "\"size_bytes\":%lu,"
+        "\"started_at_unix_ms\":%s,"
         "\"codec\":\"opus\","
         "\"container\":\"ogg\","
         "\"sample_rate\":16000,"
@@ -208,7 +212,8 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
         metadata.recording_id.c_str(),
         metadata.file_name.c_str(),
         static_cast<unsigned long>(metadata.duration_ms),
-        static_cast<unsigned long>(metadata.size_bytes)
+        static_cast<unsigned long>(metadata.size_bytes),
+        std::to_string(metadata.started_at_unix_ms).c_str()
     );
     fclose(file);
     return true;

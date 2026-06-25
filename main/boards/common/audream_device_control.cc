@@ -13,6 +13,7 @@
 #include "settings.h"
 #include "storage/sd_card_storage.h"
 #include "storage/temporary_ap_transfer_service.h"
+#include "system/device_time_service.h"
 
 namespace {
 
@@ -47,6 +48,7 @@ constexpr uint16_t kCapabilityLocalRecording = 1 << 9;
 constexpr uint16_t kCapabilityRecordingStorage = 1 << 10;
 constexpr uint16_t kCapabilityRecordingFileTransfer = 1 << 11;
 constexpr uint16_t kCapabilityTemporaryAPTransfer = 1 << 12;
+constexpr uint16_t kCapabilityTimeSync = 1 << 13;
 constexpr uint16_t kCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityMicrophoneGain |
@@ -60,7 +62,8 @@ constexpr uint16_t kCapabilities =
     kCapabilityLocalRecording |
     kCapabilityRecordingStorage |
     kCapabilityRecordingFileTransfer |
-    kCapabilityTemporaryAPTransfer;
+    kCapabilityTemporaryAPTransfer |
+    kCapabilityTimeSync;
 constexpr uint16_t kSimulatedCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityCallGain |
@@ -77,6 +80,7 @@ enum class Opcode : uint8_t {
     kResetSettings = 0x06,
     kEraseAndRemove = 0x07,
     kSetRecordingMode = 0x08,
+    kSyncTime = 0x09,
     kGetStorageStatus = 0x20,
     kStartLocalRecording = 0x21,
     kStopLocalRecording = 0x22,
@@ -192,6 +196,14 @@ uint32_t ReadUInt32(const uint8_t* data) {
         (static_cast<uint32_t>(data[1]) << 8) |
         (static_cast<uint32_t>(data[2]) << 16) |
         (static_cast<uint32_t>(data[3]) << 24);
+}
+
+uint64_t ReadUInt64(const uint8_t* data) {
+    uint64_t value = 0;
+    for (int shift = 0; shift < 64; shift += 8) {
+        value |= static_cast<uint64_t>(data[shift / 8]) << shift;
+    }
+    return value;
 }
 
 bool IsValidAutoPowerOff(int32_t seconds) {
@@ -433,6 +445,20 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 settings.SetInt(kRecordingModeKey, recording_mode);
             }
             ESP_LOGI(kTag, "Stored simulated recording mode: %u", recording_mode);
+            break;
+        }
+
+        case Opcode::kSyncTime: {
+            if (length != kRequestHeaderLength + sizeof(uint64_t)) {
+                return BuildResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    LoadState()
+                );
+            }
+            const uint64_t unix_time_ms = ReadUInt64(&data[kRequestHeaderLength]);
+            DeviceTimeService::GetInstance().SyncUnixTimeMs(unix_time_ms);
             break;
         }
 
