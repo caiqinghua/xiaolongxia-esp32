@@ -486,6 +486,9 @@ std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t max_count)
         info.file_name = file_name;
         info.size_bytes = static_cast<uint32_t>(st.st_size);
         info.duration_ms = ReadMetadataUInt32(path + ".json", "duration_ms");
+        if (info.duration_ms == 0 || info.size_bytes == 0) {
+            continue;
+        }
         entries.push_back({
             .info = info,
             .modified_at = st.st_mtime,

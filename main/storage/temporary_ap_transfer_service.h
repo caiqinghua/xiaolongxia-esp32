@@ -6,6 +6,7 @@
 
 #include "esp_http_server.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 
 struct TemporaryAPTransferSession {
     bool valid = false;
@@ -23,6 +24,7 @@ public:
     static TemporaryAPTransferService& GetInstance();
 
     TemporaryAPTransferSession Start(const std::string& recording_id);
+    bool Complete(const std::string& recording_id, const std::string& token);
     void Stop();
     bool IsActive() const;
 
@@ -34,13 +36,19 @@ private:
     mutable std::mutex mutex_;
     httpd_handle_t server_ = nullptr;
     esp_netif_t* ap_netif_ = nullptr;
+    esp_timer_handle_t expiry_timer_ = nullptr;
     TemporaryAPTransferSession session_;
     std::string file_path_;
     int64_t expires_at_us_ = 0;
 
-    void StopLocked();
+    static void ExpiryTimerCallback(void* arg);
+
+    void StopLocked(bool stop_expiry_timer = true);
+    void StopFromExpiry();
     bool StartAccessPointLocked();
     bool StartHttpServerLocked();
+    bool StartExpiryTimerLocked();
     bool IsExpiredLocked() const;
     bool IsTokenValidLocked(const std::string& token) const;
+    bool IsSessionMatchLocked(const std::string& recording_id, const std::string& token) const;
 };

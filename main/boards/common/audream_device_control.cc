@@ -632,8 +632,13 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             );
         }
 
-        case Opcode::kCompleteTemporaryAPTransfer:
-            if (length != kRequestHeaderLength) {
+        case Opcode::kCompleteTemporaryAPTransfer: {
+            size_t cursor = kRequestHeaderLength;
+            std::string recording_id;
+            std::string token;
+            if (!ReadString(data, length, cursor, recording_id) ||
+                !ReadString(data, length, cursor, token) ||
+                cursor != length) {
                 return BuildPayloadResponse(
                     opcode_value,
                     request_id,
@@ -641,13 +646,21 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     {}
                 );
             }
-            TemporaryAPTransferService::GetInstance().Stop();
+            if (!TemporaryAPTransferService::GetInstance().Complete(recording_id, token)) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kNotFound),
+                    {}
+                );
+            }
             return BuildPayloadResponse(
                 opcode_value,
                 request_id,
                 static_cast<uint8_t>(Status::kSuccess),
                 {}
             );
+        }
 
         case Opcode::kResetSettings:
             ResetSettings();

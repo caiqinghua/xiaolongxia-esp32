@@ -11,6 +11,8 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_wifi_default.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lwip/ip4_addr.h"
 #include "storage/sd_card_storage.h"
 #include "wifi_manager.h"
@@ -79,7 +81,7 @@ TemporaryAPTransferSession TemporaryAPTransferService::Start(const std::string& 
     expires_at_us_ = esp_timer_get_time() +
         static_cast<int64_t>(kSessionExpirySeconds) * 1000000LL;
 
-    if (!StartAccessPointLocked() || !StartHttpServerLocked()) {
+    if (!StartAccessPointLocked() || !StartHttpServerLocked() || !StartExpiryTimerLocked()) {
         StopLocked();
         return {};
     }
@@ -99,7 +101,28 @@ void TemporaryAPTransferService::Stop() {
     StopLocked();
 }
 
-void TemporaryAPTransferService::StopLocked() {
+bool TemporaryAPTransferService::Complete(
+    const std::string& recording_id,
+    const std::string& token
+) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!IsSessionMatchLocked(recording_id, token)) {
+        ESP_LOGW(
+            kTag,
+            "Ignored temporary AP completion for a non-current transfer: %s",
+            recording_id.c_str()
+        );
+        return false;
+    }
+    ESP_LOGI(kTag, "Temporary AP transfer completed for %s", recording_id.c_str());
+    StopLocked();
+    return true;
+}
+
+void TemporaryAPTransferService::StopLocked(bool stop_expiry_timer) {
+    if (stop_expiry_timer && expiry_timer_ != nullptr && esp_timer_is_active(expiry_timer_)) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(expiry_timer_));
+    }
     if (server_ != nullptr) {
         httpd_stop(server_);
         server_ = nullptr;
@@ -112,6 +135,36 @@ void TemporaryAPTransferService::StopLocked() {
     session_ = {};
     file_path_.clear();
     expires_at_us_ = 0;
+}
+
+void TemporaryAPTransferService::ExpiryTimerCallback(void* arg) {
+    auto* service = static_cast<TemporaryAPTransferService*>(arg);
+    if (service == nullptr) {
+        return;
+    }
+    const BaseType_t created = xTaskCreate(
+        [](void* task_arg) {
+            static_cast<TemporaryAPTransferService*>(task_arg)->StopFromExpiry();
+            vTaskDelete(nullptr);
+        },
+        "ap_expiry",
+        4096,
+        service,
+        3,
+        nullptr
+    );
+    if (created != pdPASS) {
+        ESP_LOGE(kTag, "Failed to create temporary AP expiry task");
+    }
+}
+
+void TemporaryAPTransferService::StopFromExpiry() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!session_.valid) {
+        return;
+    }
+    ESP_LOGI(kTag, "Temporary AP transfer expired for %s", session_.recording_id.c_str());
+    StopLocked(false);
 }
 
 bool TemporaryAPTransferService::IsActive() const {
@@ -200,12 +253,56 @@ bool TemporaryAPTransferService::StartHttpServerLocked() {
     return true;
 }
 
+bool TemporaryAPTransferService::StartExpiryTimerLocked() {
+    if (expiry_timer_ == nullptr) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = &TemporaryAPTransferService::ExpiryTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ap_transfer_expiry",
+            .skip_unhandled_events = true,
+        };
+        const esp_err_t create_result = esp_timer_create(&timer_args, &expiry_timer_);
+        if (create_result != ESP_OK) {
+            ESP_LOGE(
+                kTag,
+                "Failed to create temporary AP expiry timer: %s",
+                esp_err_to_name(create_result)
+            );
+            return false;
+        }
+    } else if (esp_timer_is_active(expiry_timer_)) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(expiry_timer_));
+    }
+
+    const esp_err_t start_result = esp_timer_start_once(
+        expiry_timer_,
+        static_cast<uint64_t>(kSessionExpirySeconds) * 1000000ULL
+    );
+    if (start_result != ESP_OK) {
+        ESP_LOGE(
+            kTag,
+            "Failed to start temporary AP expiry timer: %s",
+            esp_err_to_name(start_result)
+        );
+        return false;
+    }
+    return true;
+}
+
 bool TemporaryAPTransferService::IsExpiredLocked() const {
     return expires_at_us_ <= 0 || esp_timer_get_time() > expires_at_us_;
 }
 
 bool TemporaryAPTransferService::IsTokenValidLocked(const std::string& token) const {
     return session_.valid && !IsExpiredLocked() && token == session_.token;
+}
+
+bool TemporaryAPTransferService::IsSessionMatchLocked(
+    const std::string& recording_id,
+    const std::string& token
+) const {
+    return IsTokenValidLocked(token) && recording_id == session_.recording_id;
 }
 
 esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {

@@ -4,10 +4,12 @@
 
 #include "codecs/box_audio_codec.h"
 #include "application.h"
+#include "button.h"
 #include "led/single_led.h"
 #include "config.h"
 #include "axp2101.h"
 #include "i2c_device.h"
+#include "audio/local_recording_service.h"
 #include "storage/sd_card_storage.h"
 #include "blufi.h"
 
@@ -143,6 +145,7 @@ private:
     Pmic* pmic_ = nullptr;
     CustomLcdDisplay* display_ = nullptr;
     CustomBacklight* backlight_ = nullptr;
+    Button boot_button_;
 
     void InitializeCodecI2c() {
         // Initialize I2C peripheral
@@ -257,12 +260,52 @@ private:
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 
+    void InitializeRecordingButton() {
+        boot_button_.OnLongPress([this]() {
+            Application::GetInstance().Schedule([this]() {
+                ToggleLocalRecordingFromButton();
+            });
+        });
+    }
+
+    void ToggleLocalRecordingFromButton() {
+        auto& recording = LocalRecordingService::GetInstance();
+        auto& audio_service = Application::GetInstance().GetAudioService();
+        if (recording.IsRecording()) {
+            const auto metadata = recording.Stop(audio_service);
+            if (metadata.valid) {
+                ESP_LOGI(
+                    TAG,
+                    "Button stopped local recording: id=%s duration=%lu ms size=%lu bytes",
+                    metadata.recording_id.c_str(),
+                    static_cast<unsigned long>(metadata.duration_ms),
+                    static_cast<unsigned long>(metadata.size_bytes)
+                );
+            } else {
+                ESP_LOGW(TAG, "Button stopped local recording without valid metadata");
+            }
+            return;
+        }
+
+        if (recording.Start(audio_service)) {
+            const auto metadata = recording.CurrentMetadata();
+            ESP_LOGI(
+                TAG,
+                "Button started local recording: id=%s",
+                metadata.recording_id.c_str()
+            );
+        } else {
+            ESP_LOGE(TAG, "Button failed to start local recording");
+        }
+    }
+
 public:
-    WaveshareEsp32s3TouchAMOLED2inch06() {
+    WaveshareEsp32s3TouchAMOLED2inch06() : boot_button_(BOOT_BUTTON_GPIO, false, 3000) {
         InitializeCodecI2c();
         InitializeAxp2101();
         InitializeRecordingPowerManagement();
-        ESP_LOGI(TAG, "Display, touch, buttons, and WiFi application features are disabled");
+        InitializeRecordingButton();
+        ESP_LOGI(TAG, "Display, touch, and WiFi application features are disabled");
         SdCardStorage::GetInstance().StartInitializationTask();
     }
 
