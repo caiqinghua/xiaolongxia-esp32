@@ -41,6 +41,8 @@ public:
      */
     esp_err_t deinit();
 
+    esp_err_t SendDeviceWillSleepEvent();
+
     // Delete copy constructor and assignment operator for singleton
     Blufi(const Blufi &) = delete;
 

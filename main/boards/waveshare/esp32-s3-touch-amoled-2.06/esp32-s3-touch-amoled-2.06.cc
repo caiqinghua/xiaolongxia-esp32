@@ -353,7 +353,11 @@ public:
         const esp_err_t result = Blufi::GetInstance().init(false);
         if (result != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start Audream BLE control: %s", esp_err_to_name(result));
+            return;
         }
+        AudreamPowerManager::GetInstance().SetBeforeDeepSleepCallback([]() {
+            Blufi::GetInstance().SendDeviceWillSleepEvent();
+        });
     }
 
     virtual AudioCodec* GetAudioCodec() override {

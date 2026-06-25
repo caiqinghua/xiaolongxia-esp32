@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 
 #include "driver/gpio.h"
@@ -25,6 +26,7 @@ public:
     void SetTemporaryAPTransferActive(bool active);
     void SetStorageBusy(bool busy);
     void SetUsbPowered(bool powered);
+    void SetBeforeDeepSleepCallback(std::function<void()> callback);
     AudreamPowerState State() const;
 
 private:
@@ -43,6 +45,7 @@ private:
     bool temporary_ap_transfer_active_ = false;
     bool storage_busy_ = false;
     bool usb_powered_ = false;
+    std::function<void()> before_deep_sleep_callback_;
 
     static void TaskEntry(void* arg);
     void Run();

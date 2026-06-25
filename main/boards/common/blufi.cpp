@@ -326,6 +326,20 @@ Blufi::~Blufi() {
     }
 }
 
+esp_err_t Blufi::SendDeviceWillSleepEvent() {
+    uint8_t payload[] = {0x01, 0xF0, 0x01};
+    const esp_err_t result = esp_blufi_send_custom_data(
+        payload,
+        sizeof(payload)
+    );
+    if (result != ESP_OK) {
+        ESP_LOGW(BLUFI_TAG, "Failed to send device will sleep event: %s", esp_err_to_name(result));
+    } else {
+        ESP_LOGI(BLUFI_TAG, "Sent device will sleep event");
+    }
+    return result;
+}
+
 esp_err_t Blufi::init(bool enable_wifi_provisioning) {
     esp_err_t ret = ESP_FAIL;
     inited_ = true;

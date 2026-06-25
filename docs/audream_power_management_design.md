@@ -77,8 +77,8 @@ Active -> Light Sleep -> Deep Sleep
 
 进入前动作：
 
-- 如果 BLE 仍连接，向 iOS 发送 `deviceWillSleep` 状态或通知。
-- 等待 1-2 秒，让 iOS 更新 UI 和停止轮询。
+- 如果 BLE 仍连接，向 iOS 发送 `deviceWillSleep` 事件。
+- 等待约 500 ms，让 iOS 更新 UI 和停止轮询。
 - 主动断开 BLE。
 - 停止 Wi-Fi STA/AP。
 - 关闭 codec、麦克风输入、屏幕和非必要外设。
@@ -145,6 +145,14 @@ iOS 可以继续使用 BLE background mode，但后台轮询不能阻止设备�
 - App 后台：使用退避轮询，例如 10 秒、30 秒、60 秒、120 秒。
 - 收到 `deviceWillSleep` 或 BLE 断开后，停止密集轮询。
 - 用户再次打开 App 时重新扫描并连接设备。
+
+`deviceWillSleep` 使用现有 BLUFI custom data 通道发送单向事件，不占用 request/response：
+
+```text
+[version=0x01, event_opcode=0xF0, event_id=0x01]
+```
+
+iOS 收到该事件后应停止 `DeviceRecordingAutoSyncService`，标记设备断开，取消当前 BLE 连接，并等待用户操作或系统重连。
 
 ## 固件实现建议
 

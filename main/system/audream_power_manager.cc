@@ -1,5 +1,7 @@
 #include "system/audream_power_manager.h"
 
+#include <utility>
+
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
@@ -147,6 +149,11 @@ void AudreamPowerManager::SetUsbPowered(bool powered) {
     ESP_LOGI(kTag, "USB power state: %s", powered ? "powered" : "not_powered");
 }
 
+void AudreamPowerManager::SetBeforeDeepSleepCallback(std::function<void()> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    before_deep_sleep_callback_ = std::move(callback);
+}
+
 AudreamPowerState AudreamPowerManager::State() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return state_;
@@ -236,6 +243,15 @@ void AudreamPowerManager::EnterLightSleepLocked(int64_t now_us) {
 
 void AudreamPowerManager::EnterDeepSleep() {
     ESP_LOGI(kTag, "Entering deep sleep");
+    std::function<void()> before_sleep_callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        before_sleep_callback = before_deep_sleep_callback_;
+    }
+    if (before_sleep_callback) {
+        before_sleep_callback();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
     esp_wifi_stop();
     if (wake_gpio_ != GPIO_NUM_NC) {
         gpio_set_direction(wake_gpio_, GPIO_MODE_INPUT);
