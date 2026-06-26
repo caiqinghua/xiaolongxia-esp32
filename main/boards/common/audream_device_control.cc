@@ -592,6 +592,7 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             std::vector<uint8_t> payload;
             payload.push_back(0);
             uint8_t appended_count = 0;
+            std::string first_appended_id;
             for (size_t index = offset; index < recordings.size(); ++index) {
                 const auto& recording = recordings[index];
                 const size_t entry_size =
@@ -602,6 +603,9 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 if (payload.size() + entry_size > kMaxListRecordingsPayloadBytes) {
                     break;
                 }
+                if (first_appended_id.empty()) {
+                    first_appended_id = recording.recording_id;
+                }
                 AppendString(payload, recording.recording_id);
                 AppendString(payload, recording.file_name);
                 AppendUInt32(payload, recording.duration_ms);
@@ -611,12 +615,13 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             payload[0] = appended_count;
             ESP_LOGI(
                 kTag,
-                "Listed local recordings: requested=%u offset=%u available=%u appended=%u payload_size=%u",
+                "Listed local recordings: requested=%u offset=%u available=%u appended=%u payload_size=%u first=%s",
                 static_cast<unsigned>(requested_count),
                 static_cast<unsigned>(offset),
                 static_cast<unsigned>(recordings.size()),
                 static_cast<unsigned>(appended_count),
-                static_cast<unsigned>(payload.size())
+                static_cast<unsigned>(payload.size()),
+                first_appended_id.c_str()
             );
             return BuildPayloadResponse(
                 opcode_value,

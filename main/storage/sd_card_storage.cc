@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
 #include <functional>
 #include <sys/stat.h>
+#include <sys/utime.h>
 #include <sys/unistd.h>
 #include <utility>
 
@@ -52,6 +54,8 @@ namespace {
 constexpr char kTag[] = "AudreamStorage";
 constexpr char kMountPoint[] = "/sdcard";
 constexpr char kRecordingsDirectory[] = "/sdcard/audream/recordings";
+constexpr char kRecordingsIndexPath[] = "/sdcard/audream/recordings/index.jsonl";
+constexpr char kRecordingsIndexTempPath[] = "/sdcard/audream/recordings/index.tmp";
 constexpr uint32_t kEstimatedOpusBytesPerMinute = 180000;
 constexpr uint32_t kInitializationTaskStackSize = 8192;
 constexpr UBaseType_t kInitializationTaskPriority = 4;
@@ -61,7 +65,7 @@ constexpr uint32_t kProbeMaxAttempts = 3;
 
 struct RecordingScanEntry {
     StoredRecordingInfo info;
-    time_t modified_at = 0;
+    uint64_t sort_key = 0;
 };
 
 class ScopedStorageBusy {
@@ -101,32 +105,6 @@ uint32_t FileSizeBytes(const std::string& path) {
     return static_cast<uint32_t>(st.st_size);
 }
 
-uint32_t ReadMetadataUInt32(const std::string& metadata_path, const std::string& key) {
-    std::ifstream stream(metadata_path);
-    if (!stream.good()) {
-        return 0;
-    }
-    const std::string content(
-        (std::istreambuf_iterator<char>(stream)),
-        std::istreambuf_iterator<char>()
-    );
-    const std::string marker = "\"" + key + "\":";
-    const size_t start = content.find(marker);
-    if (start == std::string::npos) {
-        return 0;
-    }
-    size_t cursor = start + marker.size();
-    while (cursor < content.size() && std::isspace(static_cast<unsigned char>(content[cursor]))) {
-        cursor++;
-    }
-    uint32_t value = 0;
-    while (cursor < content.size() && std::isdigit(static_cast<unsigned char>(content[cursor]))) {
-        value = value * 10 + static_cast<uint32_t>(content[cursor] - '0');
-        cursor++;
-    }
-    return value;
-}
-
 std::string ReadTextFile(const std::string& path) {
     std::ifstream stream(path);
     if (!stream.good()) {
@@ -154,6 +132,35 @@ uint64_t ReadJsonUInt64(const std::string& content, const std::string& key) {
         cursor++;
     }
     return value;
+}
+
+uint64_t RecordingSortKey(const std::string& metadata_content, time_t modified_at) {
+    uint64_t value = ReadJsonUInt64(metadata_content, "started_at_unix_ms");
+    if (value > 0) {
+        return value;
+    }
+    value = ReadJsonUInt64(metadata_content, "started_at_rtc_ms");
+    if (value > 0) {
+        return value;
+    }
+    value = ReadJsonUInt64(metadata_content, "started_at_uptime_ms");
+    if (value > 0) {
+        return value;
+    }
+    return static_cast<uint64_t>(modified_at);
+}
+
+uint64_t RecordingSortKey(const StoredRecordingInfo& info) {
+    if (info.started_at_unix_ms > 0) {
+        return info.started_at_unix_ms;
+    }
+    if (info.started_at_rtc_ms > 0) {
+        return info.started_at_rtc_ms;
+    }
+    if (info.started_at_uptime_ms > 0) {
+        return info.started_at_uptime_ms;
+    }
+    return 0;
 }
 
 std::string ReadJsonString(const std::string& content, const std::string& key) {
@@ -230,6 +237,136 @@ bool WriteRecordingMetadata(
     );
     fclose(file);
     return true;
+}
+
+bool ApplyRecordingMtime(
+    const std::string& audio_path,
+    const std::string& metadata_path,
+    uint64_t started_at_unix_ms
+) {
+    if (started_at_unix_ms == 0) {
+        return true;
+    }
+    const time_t timestamp = static_cast<time_t>(started_at_unix_ms / 1000);
+    struct utimbuf times = {};
+    times.actime = timestamp;
+    times.modtime = timestamp;
+    bool success = true;
+    if (utime(audio_path.c_str(), &times) != 0) {
+        ESP_LOGW(kTag, "Failed to update recording mtime: %s", audio_path.c_str());
+        success = false;
+    }
+    if (utime(metadata_path.c_str(), &times) != 0) {
+        ESP_LOGW(kTag, "Failed to update metadata mtime: %s", metadata_path.c_str());
+        success = false;
+    }
+    return success;
+}
+
+StoredRecordingInfo ReadIndexLine(const std::string& line) {
+    StoredRecordingInfo info;
+    info.recording_id = ReadJsonString(line, "recording_id");
+    info.file_name = ReadJsonString(line, "file_name");
+    info.duration_ms = static_cast<uint32_t>(ReadJsonUInt64(line, "duration_ms"));
+    info.size_bytes = static_cast<uint32_t>(ReadJsonUInt64(line, "size_bytes"));
+    info.started_at_unix_ms = ReadJsonUInt64(line, "started_at_unix_ms");
+    info.started_at_uptime_ms = ReadJsonUInt64(line, "started_at_uptime_ms");
+    info.started_at_rtc_ms = ReadJsonUInt64(line, "started_at_rtc_ms");
+    return info;
+}
+
+bool IsUsableIndexedRecording(const StoredRecordingInfo& info) {
+    return IsSafeRecordingID(info.recording_id) &&
+        info.file_name == info.recording_id + ".opus" &&
+        info.duration_ms > 0 &&
+        info.size_bytes > 0;
+}
+
+std::vector<StoredRecordingInfo> LoadRecordingIndex(size_t max_entries = 0) {
+    std::vector<StoredRecordingInfo> entries;
+    std::ifstream stream(kRecordingsIndexPath);
+    if (!stream.good()) {
+        return entries;
+    }
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto info = ReadIndexLine(line);
+        if (!IsUsableIndexedRecording(info)) {
+            continue;
+        }
+        const std::string audio_path = BuildRecordingPath(info.recording_id);
+        struct stat st = {};
+        if (stat(audio_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0) {
+            continue;
+        }
+        info.size_bytes = static_cast<uint32_t>(st.st_size);
+        entries.push_back(info);
+        if (max_entries > 0 && entries.size() >= max_entries) {
+            break;
+        }
+    }
+    return entries;
+}
+
+bool WriteRecordingIndex(const std::vector<StoredRecordingInfo>& entries) {
+    FILE* file = fopen(kRecordingsIndexTempPath, "w");
+    if (file == nullptr) {
+        ESP_LOGE(kTag, "Failed to open recording index temp file");
+        return false;
+    }
+    for (const auto& info : entries) {
+        std::fprintf(
+            file,
+            "{"
+            "\"recording_id\":\"%s\","
+            "\"file_name\":\"%s\","
+            "\"duration_ms\":%lu,"
+            "\"size_bytes\":%lu,"
+            "\"started_at_unix_ms\":%s,"
+            "\"started_at_uptime_ms\":%s,"
+            "\"started_at_rtc_ms\":%s"
+            "}\n",
+            info.recording_id.c_str(),
+            info.file_name.c_str(),
+            static_cast<unsigned long>(info.duration_ms),
+            static_cast<unsigned long>(info.size_bytes),
+            std::to_string(info.started_at_unix_ms).c_str(),
+            std::to_string(info.started_at_uptime_ms).c_str(),
+            std::to_string(info.started_at_rtc_ms).c_str()
+        );
+    }
+    fclose(file);
+    remove(kRecordingsIndexPath);
+    if (rename(kRecordingsIndexTempPath, kRecordingsIndexPath) != 0) {
+        ESP_LOGE(kTag, "Failed to replace recording index: %s", std::strerror(errno));
+        remove(kRecordingsIndexTempPath);
+        return false;
+    }
+    return true;
+}
+
+void SortRecordingsNewestFirst(std::vector<StoredRecordingInfo>& entries) {
+    std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+        const uint64_t left_key = RecordingSortKey(left);
+        const uint64_t right_key = RecordingSortKey(right);
+        if (left_key != right_key) {
+            return left_key > right_key;
+        }
+        return left.recording_id > right.recording_id;
+    });
+}
+
+void MergeRecordingIndexEntry(
+    std::vector<StoredRecordingInfo>& entries,
+    const StoredRecordingInfo& info
+) {
+    for (auto& entry : entries) {
+        if (entry.recording_id == info.recording_id) {
+            entry = info;
+            return;
+        }
+    }
+    entries.push_back(info);
 }
 
 uint64_t DirectorySizeBytes(const char* path) {
@@ -589,10 +726,42 @@ bool SdCardStorage::EnsureRecordingsDirectory() {
     return EnsureDirectory(kRecordingsDirectory);
 }
 
+bool SdCardStorage::UpsertRecordingIndex(const StoredRecordingInfo& info) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!IsUsableIndexedRecording(info)) {
+        return false;
+    }
+    if (!EnsureRecordingsDirectory()) {
+        return false;
+    }
+
+    auto entries = LoadRecordingIndex();
+    MergeRecordingIndexEntry(entries, info);
+    SortRecordingsNewestFirst(entries);
+
+    const std::string audio_path = BuildRecordingPath(info.recording_id);
+    const std::string metadata_path = audio_path + ".json";
+    ApplyRecordingMtime(audio_path, metadata_path, info.started_at_unix_ms);
+    return WriteRecordingIndex(entries);
+}
+
 std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t max_count) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<StoredRecordingInfo> result;
     if (!GetStatus().mounted) {
+        return result;
+    }
+
+    auto indexed_entries = LoadRecordingIndex(max_count);
+    if (!indexed_entries.empty()) {
+        SortRecordingsNewestFirst(indexed_entries);
+        result.reserve(std::min(max_count, indexed_entries.size()));
+        for (const auto& entry : indexed_entries) {
+            if (result.size() >= max_count) {
+                break;
+            }
+            result.push_back(entry);
+        }
         return result;
     }
 
@@ -621,20 +790,40 @@ std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t max_count)
         info.recording_id = recording_id;
         info.file_name = file_name;
         info.size_bytes = static_cast<uint32_t>(st.st_size);
-        info.duration_ms = ReadMetadataUInt32(path + ".json", "duration_ms");
+        const std::string metadata_content = ReadTextFile(path + ".json");
+        info.duration_ms = static_cast<uint32_t>(ReadJsonUInt64(metadata_content, "duration_ms"));
+        info.started_at_unix_ms = ReadJsonUInt64(metadata_content, "started_at_unix_ms");
+        info.started_at_uptime_ms = ReadJsonUInt64(metadata_content, "started_at_uptime_ms");
+        info.started_at_rtc_ms = ReadJsonUInt64(metadata_content, "started_at_rtc_ms");
         if (info.duration_ms == 0 || info.size_bytes == 0) {
             continue;
         }
         entries.push_back({
             .info = info,
-            .modified_at = st.st_mtime,
+            .sort_key = RecordingSortKey(metadata_content, st.st_mtime),
         });
     }
     closedir(dir);
 
     std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
-        return left.modified_at > right.modified_at;
+        if (left.sort_key != right.sort_key) {
+            return left.sort_key > right.sort_key;
+        }
+        return left.info.recording_id > right.info.recording_id;
     });
+
+    std::vector<StoredRecordingInfo> rebuilt_index;
+    rebuilt_index.reserve(entries.size());
+    for (const auto& entry : entries) {
+        rebuilt_index.push_back(entry.info);
+    }
+    if (!rebuilt_index.empty() && WriteRecordingIndex(rebuilt_index)) {
+        ESP_LOGI(
+            kTag,
+            "Rebuilt recording index from %u files",
+            static_cast<unsigned>(rebuilt_index.size())
+        );
+    }
 
     result.reserve(std::min(max_count, entries.size()));
     for (const auto& entry : entries) {
@@ -726,6 +915,7 @@ size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
     }
 
     size_t updated_count = 0;
+    std::vector<StoredRecordingInfo> updated_index_entries;
     while (dirent* entry = readdir(dir)) {
         const std::string file_name = entry->d_name;
         if (!EndsWith(file_name, ".opus")) {
@@ -769,7 +959,7 @@ size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
         );
         const uint32_t size_bytes = static_cast<uint32_t>(st.st_size);
 
-        if (WriteRecordingMetadata(
+        const bool metadata_written = WriteRecordingMetadata(
                 metadata_path,
                 metadata_recording_id.empty() ? recording_id : metadata_recording_id,
                 metadata_file_name.empty() ? file_name : metadata_file_name,
@@ -780,11 +970,35 @@ size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
                 started_at_uptime_ms,
                 started_at_rtc_ms,
                 true
-            )) {
+            );
+        if (metadata_written) {
+            StoredRecordingInfo updated_info;
+            updated_info.recording_id = metadata_recording_id.empty()
+                ? recording_id
+                : metadata_recording_id;
+            updated_info.file_name = metadata_file_name.empty()
+                ? file_name
+                : metadata_file_name;
+            updated_info.duration_ms = duration_ms;
+            updated_info.size_bytes = size_bytes;
+            updated_info.started_at_unix_ms = started_at_unix_ms;
+            updated_info.started_at_uptime_ms = started_at_uptime_ms;
+            updated_info.started_at_rtc_ms = started_at_rtc_ms;
+            ApplyRecordingMtime(audio_path, metadata_path, started_at_unix_ms);
+            updated_index_entries.push_back(updated_info);
             updated_count++;
         }
     }
     closedir(dir);
+
+    if (!updated_index_entries.empty()) {
+        auto index_entries = LoadRecordingIndex();
+        for (const auto& info : updated_index_entries) {
+            MergeRecordingIndexEntry(index_entries, info);
+        }
+        SortRecordingsNewestFirst(index_entries);
+        WriteRecordingIndex(index_entries);
+    }
 
     if (updated_count > 0) {
         ESP_LOGI(

@@ -29,6 +29,9 @@ struct StoredRecordingInfo {
     std::string file_name;
     uint32_t duration_ms = 0;
     uint32_t size_bytes = 0;
+    uint64_t started_at_unix_ms = 0;
+    uint64_t started_at_uptime_ms = 0;
+    uint64_t started_at_rtc_ms = 0;
 };
 
 class SdCardStorage {
@@ -43,6 +46,7 @@ public:
     StorageStatus GetStatus();
     std::string RecordingsDirectory() const;
     bool EnsureRecordingsDirectory();
+    bool UpsertRecordingIndex(const StoredRecordingInfo& info);
     std::vector<StoredRecordingInfo> ListRecordings(size_t max_count);
     bool GetRecordingFilePath(
         const std::string& recording_id,
