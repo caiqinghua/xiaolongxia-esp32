@@ -17,12 +17,15 @@
 
 #include <esp_log.h>
 #include <esp_pm.h>
+#include <esp_rom_sys.h>
 #include <esp_sleep.h>
 #include <esp_timer.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "settings.h"
 
 #include <esp_lcd_touch_ft5x06.h>
@@ -33,7 +36,10 @@
 
 namespace {
 
-constexpr int64_t kDeepSleepWakeRecordHoldUs = 3000LL * 1000LL;
+constexpr uint16_t kRecordingButtonHoldMs = 1500;
+constexpr int64_t kDeepSleepWakeRecordHoldUs = static_cast<int64_t>(kRecordingButtonHoldMs) * 1000LL;
+constexpr uint64_t kRecordingFeedbackScreenOnUs = 3000ULL * 1000ULL;
+constexpr uint64_t kRecordingHoldRetryUs = 200ULL * 1000ULL;
 
 }  // namespace
 
@@ -135,23 +141,54 @@ class CustomBacklight : public Backlight {
 public:
     CustomBacklight(esp_lcd_panel_io_handle_t panel_io) : Backlight(), panel_io_(panel_io) {}
 
+    void SetImmediateBrightness(uint8_t brightness) {
+        if (brightness > 100) {
+            brightness = 100;
+        }
+        if (transition_timer_ != nullptr) {
+            esp_timer_stop(transition_timer_);
+        }
+        brightness_ = brightness;
+        target_brightness_ = brightness;
+        SetBrightnessImpl(brightness);
+    }
+
+    void WakeForRecordingFeedback() {
+        if (!panel_awake_) {
+            SendCommand(0x11, nullptr, 0);
+            esp_rom_delay_us(120000);
+            panel_awake_ = true;
+        }
+        SendCommand(0x29, nullptr, 0);
+    }
+
 protected:
     esp_lcd_panel_io_handle_t panel_io_;
+    bool panel_awake_ = false;
+
+    void SendCommand(uint8_t command, const void* data, size_t size) {
+        int lcd_cmd = command;
+        lcd_cmd &= 0xff;
+        lcd_cmd <<= 8;
+        lcd_cmd |= LCD_OPCODE_WRITE_CMD << 24;
+        esp_lcd_panel_io_tx_param(panel_io_, lcd_cmd, data, size);
+    }
 
     virtual void SetBrightnessImpl(uint8_t brightness) override {
         auto display = Board::GetInstance().GetDisplay();
         DisplayLockGuard lock(display);
         uint8_t data[1] = {((uint8_t)((255*  brightness) / 100))};
-        int lcd_cmd = 0x51;
-        lcd_cmd &= 0xff;
-        lcd_cmd <<= 8;
-        lcd_cmd |= LCD_OPCODE_WRITE_CMD << 24;
-        esp_lcd_panel_io_tx_param(panel_io_, lcd_cmd, &data, sizeof(data));
+        SendCommand(0x51, &data, sizeof(data));
     }
 };
 
 class WaveshareEsp32s3TouchAMOLED2inch06 : public WifiBoard {
 private:
+    enum class RecordingHoldStartSource {
+        kButton,
+        kDeepSleepWake,
+    };
+
     i2c_master_bus_handle_t i2c_bus_;
     Pmic* pmic_ = nullptr;
     CustomLcdDisplay* display_ = nullptr;
@@ -159,8 +196,16 @@ private:
     Button boot_button_;
     esp_timer_handle_t power_status_timer_ = nullptr;
     esp_timer_handle_t deep_sleep_record_hold_timer_ = nullptr;
+    esp_timer_handle_t recording_feedback_screen_timer_ = nullptr;
+    esp_timer_handle_t recording_hold_retry_timer_ = nullptr;
     bool power_source_initialized_ = false;
     bool usb_powered_ = false;
+    bool recording_button_pressed_ = false;
+    bool recording_hold_start_pending_ = false;
+    RecordingHoldStartSource recording_hold_start_source_ = RecordingHoldStartSource::kButton;
+    bool recording_feedback_display_task_started_ = false;
+    bool recording_feedback_display_initialized_ = false;
+    bool recording_feedback_spi_initialized_ = false;
     bool pending_deep_sleep_recording_ = false;
     bool suppress_next_wake_long_press_ = false;
     int64_t deep_sleep_wake_button_down_us_ = 0;
@@ -300,6 +345,103 @@ private:
         backlight_->RestoreBrightness();
     }
 
+    void InitializeRecordingFeedbackDisplay() {
+        if (recording_feedback_display_task_started_) {
+            return;
+        }
+        recording_feedback_display_task_started_ = true;
+        const BaseType_t created = xTaskCreate(
+            [](void* arg) {
+                auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                if (board != nullptr) {
+                    board->InitializeRecordingFeedbackDisplayTask();
+                }
+                vTaskDelete(nullptr);
+            },
+            "rec_display",
+            8192,
+            this,
+            4,
+            nullptr
+        );
+        if (created != pdPASS) {
+            recording_feedback_display_task_started_ = false;
+            ESP_LOGE(TAG, "Failed to create recording feedback display task");
+        }
+    }
+
+    void InitializeRecordingFeedbackDisplayTask() {
+        ESP_LOGI(TAG, "Recording feedback display initialization started");
+        if (!recording_feedback_spi_initialized_) {
+            InitializeSpi();
+            recording_feedback_spi_initialized_ = true;
+            ESP_LOGI(TAG, "Recording feedback display SPI initialized");
+        }
+
+        esp_lcd_panel_io_handle_t panel_io = nullptr;
+        esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(
+            EXAMPLE_PIN_NUM_LCD_CS,
+            nullptr,
+            nullptr);
+        const esp_err_t io_result = esp_lcd_new_panel_io_spi(SPI2_HOST, &io_config, &panel_io);
+        if (io_result != ESP_OK) {
+            recording_feedback_display_task_started_ = false;
+            ESP_LOGE(TAG, "Failed to create recording feedback panel IO: %s", esp_err_to_name(io_result));
+            return;
+        }
+
+        backlight_ = new CustomBacklight(panel_io);
+        recording_feedback_display_initialized_ = true;
+        ESP_LOGI(TAG, "Recording feedback display initialized");
+        PulseRecordingFeedbackScreen();
+    }
+
+    void PulseRecordingFeedbackScreen() {
+        if (!recording_feedback_display_initialized_) {
+            InitializeRecordingFeedbackDisplay();
+            return;
+        }
+        if (backlight_ == nullptr) {
+            return;
+        }
+        backlight_->WakeForRecordingFeedback();
+        backlight_->RestoreBrightness();
+        if (recording_feedback_screen_timer_ == nullptr) {
+            const esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) {
+                    auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                    if (board == nullptr) {
+                        return;
+                    }
+                    board->TurnOffRecordingFeedbackScreen();
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "audream_rec_screen",
+                .skip_unhandled_events = true,
+            };
+            const esp_err_t result = esp_timer_create(&timer_args, &recording_feedback_screen_timer_);
+            if (result != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to create recording feedback screen timer: %s", esp_err_to_name(result));
+                return;
+            }
+        }
+        const esp_err_t stop_result = esp_timer_stop(recording_feedback_screen_timer_);
+        if (stop_result != ESP_OK && stop_result != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to stop recording feedback screen timer: %s", esp_err_to_name(stop_result));
+        }
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_timer_start_once(recording_feedback_screen_timer_, kRecordingFeedbackScreenOnUs)
+        );
+    }
+
+    void TurnOffRecordingFeedbackScreen() {
+        if (backlight_ == nullptr) {
+            return;
+        }
+        backlight_->SetImmediateBrightness(0);
+    }
+
     void InitializeTouch() {
         esp_lcd_touch_handle_t tp;
         esp_lcd_touch_config_t tp_cfg = {
@@ -332,6 +474,17 @@ private:
     }
 
     void InitializeRecordingButton() {
+        boot_button_.OnPressDown([this]() {
+            recording_button_pressed_ = true;
+        });
+        boot_button_.OnPressUp([this]() {
+            recording_button_pressed_ = false;
+            recording_hold_start_pending_ = false;
+            if (suppress_next_wake_long_press_) {
+                suppress_next_wake_long_press_ = false;
+                ESP_LOGI(TAG, "Cleared deep sleep wake long press suppression on button release");
+            }
+        });
         boot_button_.OnClick([this]() {
             if (suppress_next_wake_long_press_) {
                 suppress_next_wake_long_press_ = false;
@@ -344,9 +497,10 @@ private:
                 ESP_LOGI(TAG, "Ignored wake long press because deep sleep recording hold check is pending");
                 return;
             }
+            recording_button_pressed_ = true;
             AudreamPowerManager::GetInstance().NotifyUserActivity("button_long_press");
             Application::GetInstance().Schedule([this]() {
-                ToggleLocalRecordingFromButton();
+                HandleRecordingLongPressTrigger();
             });
         });
     }
@@ -446,38 +600,18 @@ private:
             ESP_LOGI(TAG, "Deep sleep wake recording canceled because button was released before hold threshold");
             return;
         }
-        StartPendingDeepSleepRecording();
-    }
-
-    void StartPendingDeepSleepRecording() {
-        if (!pending_deep_sleep_recording_) {
-            return;
-        }
         pending_deep_sleep_recording_ = false;
-        suppress_next_wake_long_press_ = false;
-        auto& recording = LocalRecordingService::GetInstance();
-        if (recording.IsRecording()) {
-            ESP_LOGI(TAG, "Deep sleep wake recording skipped because recording is already active");
-            return;
-        }
-        auto& audio_service = Application::GetInstance().GetAudioService();
-        if (!recording.Start(audio_service)) {
-            ESP_LOGE(TAG, "Deep sleep wake recording failed to start");
-            return;
-        }
-        const auto metadata = recording.CurrentMetadata();
-        ESP_LOGI(
-            TAG,
-            "Deep sleep wake started local recording: id=%s",
-            metadata.recording_id.c_str()
-        );
+        recording_button_pressed_ = true;
+        BeginRecordingHoldStart(RecordingHoldStartSource::kDeepSleepWake);
     }
 
-    void ToggleLocalRecordingFromButton() {
+    void HandleRecordingLongPressTrigger() {
         auto& recording = LocalRecordingService::GetInstance();
         auto& audio_service = Application::GetInstance().GetAudioService();
         if (recording.IsRecording()) {
+            recording_hold_start_pending_ = false;
             const auto metadata = recording.Stop(audio_service);
+            PulseRecordingFeedbackScreen();
             if (metadata.valid) {
                 ESP_LOGI(
                     TAG,
@@ -492,15 +626,90 @@ private:
             return;
         }
 
+        BeginRecordingHoldStart(RecordingHoldStartSource::kButton);
+    }
+
+    void BeginRecordingHoldStart(RecordingHoldStartSource source) {
+        recording_hold_start_source_ = source;
+        recording_hold_start_pending_ = true;
+        TryStartRecordingFromHold();
+    }
+
+    const char* RecordingHoldStartSourceName() const {
+        switch (recording_hold_start_source_) {
+            case RecordingHoldStartSource::kDeepSleepWake:
+                return "Deep sleep wake";
+            case RecordingHoldStartSource::kButton:
+            default:
+                return "Button";
+        }
+    }
+
+    void TryStartRecordingFromHold() {
+        if (!recording_hold_start_pending_) {
+            return;
+        }
+        if (!recording_button_pressed_ && gpio_get_level(BOOT_BUTTON_GPIO) != 0) {
+            recording_hold_start_pending_ = false;
+            ESP_LOGI(TAG, "Recording hold start canceled because the button was released");
+            return;
+        }
+        const auto storage_status = SdCardStorage::GetInstance().GetStatus();
+        if (!storage_status.mounted) {
+            ScheduleRecordingHoldStartRetry();
+            return;
+        }
+
+        auto& recording = LocalRecordingService::GetInstance();
+        if (recording.IsRecording()) {
+            recording_hold_start_pending_ = false;
+            ESP_LOGI(TAG, "%s recording hold start skipped because recording is already active", RecordingHoldStartSourceName());
+            return;
+        }
+        auto& audio_service = Application::GetInstance().GetAudioService();
         if (recording.Start(audio_service)) {
+            recording_hold_start_pending_ = false;
             const auto metadata = recording.CurrentMetadata();
+            PulseRecordingFeedbackScreen();
             ESP_LOGI(
                 TAG,
-                "Button started local recording: id=%s",
+                "%s started local recording: id=%s",
+                RecordingHoldStartSourceName(),
                 metadata.recording_id.c_str()
             );
         } else {
-            ESP_LOGE(TAG, "Button failed to start local recording");
+            ScheduleRecordingHoldStartRetry();
+        }
+    }
+
+    void ScheduleRecordingHoldStartRetry() {
+        if (recording_hold_retry_timer_ == nullptr) {
+            const esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) {
+                    auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                    if (board == nullptr) {
+                        return;
+                    }
+                    Application::GetInstance().Schedule([board]() {
+                        board->TryStartRecordingFromHold();
+                    });
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "audream_rec_hold",
+                .skip_unhandled_events = true,
+            };
+            const esp_err_t result = esp_timer_create(&timer_args, &recording_hold_retry_timer_);
+            if (result != ESP_OK) {
+                recording_hold_start_pending_ = false;
+                ESP_LOGE(TAG, "Failed to create recording hold retry timer: %s", esp_err_to_name(result));
+                return;
+            }
+        }
+        const esp_err_t result = esp_timer_start_once(recording_hold_retry_timer_, kRecordingHoldRetryUs);
+        if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
+            recording_hold_start_pending_ = false;
+            ESP_LOGE(TAG, "Failed to schedule recording hold retry: %s", esp_err_to_name(result));
         }
     }
 
@@ -514,14 +723,15 @@ private:
     }
 
 public:
-    WaveshareEsp32s3TouchAMOLED2inch06() : boot_button_(BOOT_BUTTON_GPIO, false, 3000) {
+    WaveshareEsp32s3TouchAMOLED2inch06() : boot_button_(BOOT_BUTTON_GPIO, false, kRecordingButtonHoldMs) {
         LogWakeContext();
         InitializeCodecI2c();
         InitializeAxp2101();
+        InitializeRecordingFeedbackDisplay();
         InitializeRecordingPowerManagement();
         InitializeRecordingButton();
         DetectDeepSleepRecordingIntent();
-        ESP_LOGI(TAG, "Display, touch, and WiFi application features are disabled");
+        ESP_LOGI(TAG, "Touch and WiFi application features are disabled");
         auto& storage = SdCardStorage::GetInstance();
         storage.SetInitializationCompleteCallback([this](const StorageStatus& status) {
             HandleStorageInitializationComplete(status);
@@ -562,11 +772,14 @@ public:
     }
 
     virtual Display* GetDisplay() override {
-        return Board::GetDisplay();
+        if (display_ == nullptr) {
+            return Board::GetDisplay();
+        }
+        return display_;
     }
 
     virtual Backlight* GetBacklight() override {
-        return nullptr;
+        return backlight_;
     }
 
     virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
