@@ -121,7 +121,7 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
 
     started_at_us_ = esp_timer_get_time();
     auto& time_service = DeviceTimeService::GetInstance();
-    current_.rtc_epoch_id = time_service.RtcEpochID();
+    current_.rtc_epoch_seq = time_service.RtcEpochSeq();
     current_.started_at_uptime_ms = static_cast<uint64_t>(started_at_us_ / 1000);
     current_.started_at_rtc_ms = esp_rtc_get_time_us() / 1000;
     current_.started_at_unix_ms = time_service.CurrentUnixTimeMs();
@@ -226,7 +226,7 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
         "{"
         "\"recording_id\":\"%s\","
         "\"file_name\":\"%s\","
-        "\"rtc_epoch_id\":\"%s\","
+        "\"rtc_epoch_seq\":%s,"
         "\"duration_ms\":%lu,"
         "\"size_bytes\":%lu,"
         "\"started_at_unix_ms\":%s,"
@@ -241,7 +241,7 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
         "}\n",
         metadata.recording_id.c_str(),
         metadata.file_name.c_str(),
-        metadata.rtc_epoch_id.c_str(),
+        std::to_string(metadata.rtc_epoch_seq).c_str(),
         static_cast<unsigned long>(metadata.duration_ms),
         static_cast<unsigned long>(metadata.size_bytes),
         std::to_string(metadata.started_at_unix_ms).c_str(),

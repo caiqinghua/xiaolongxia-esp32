@@ -1,12 +1,7 @@
 #include "system/device_time_service.h"
 
-#include <cstdio>
-#include <cstring>
-
 #include "esp_attr.h"
 #include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_random.h"
 #include "esp_rtc_time.h"
 #include "esp_sleep.h"
 #include "nvs.h"
@@ -19,52 +14,12 @@ constexpr char kTag[] = "DeviceTime";
 constexpr char kNamespace[] = "audream_time";
 constexpr char kUnixTimeMsKey[] = "unix_ms";
 constexpr char kRtcTimeUsKey[] = "rtc_us";
+constexpr char kRtcEpochSeqKey[] = "rtc_epoch_seq";
 constexpr uint64_t kMinimumValidUnixTimeMs = 1600000000000ULL;
 constexpr uint32_t kRtcEpochMagic = 0xAD0E2026;
 
 RTC_DATA_ATTR uint32_t s_rtc_epoch_magic = 0;
-RTC_DATA_ATTR char s_rtc_epoch_id[33] = {};
-
-std::string BuildRtcEpochID() {
-    uint8_t bytes[16] = {};
-    esp_fill_random(bytes, sizeof(bytes));
-
-    uint8_t mac[6] = {};
-    if (esp_efuse_mac_get_default(mac) == ESP_OK) {
-        for (size_t i = 0; i < sizeof(mac); ++i) {
-            bytes[i % sizeof(bytes)] ^= mac[i];
-        }
-    }
-
-    const uint64_t rtc_time_us = esp_rtc_get_time_us();
-    for (size_t i = 0; i < sizeof(rtc_time_us); ++i) {
-        bytes[i % sizeof(bytes)] ^= static_cast<uint8_t>((rtc_time_us >> (i * 8)) & 0xff);
-    }
-
-    char buffer[33] = {};
-    std::snprintf(
-        buffer,
-        sizeof(buffer),
-        "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-        static_cast<unsigned int>(bytes[0]),
-        static_cast<unsigned int>(bytes[1]),
-        static_cast<unsigned int>(bytes[2]),
-        static_cast<unsigned int>(bytes[3]),
-        static_cast<unsigned int>(bytes[4]),
-        static_cast<unsigned int>(bytes[5]),
-        static_cast<unsigned int>(bytes[6]),
-        static_cast<unsigned int>(bytes[7]),
-        static_cast<unsigned int>(bytes[8]),
-        static_cast<unsigned int>(bytes[9]),
-        static_cast<unsigned int>(bytes[10]),
-        static_cast<unsigned int>(bytes[11]),
-        static_cast<unsigned int>(bytes[12]),
-        static_cast<unsigned int>(bytes[13]),
-        static_cast<unsigned int>(bytes[14]),
-        static_cast<unsigned int>(bytes[15])
-    );
-    return std::string(buffer);
-}
+RTC_DATA_ATTR uint64_t s_rtc_epoch_seq = 0;
 
 }  // namespace
 
@@ -75,7 +30,7 @@ DeviceTimeService& DeviceTimeService::GetInstance() {
 
 void DeviceTimeService::Initialize() {
     std::lock_guard<std::mutex> lock(mutex_);
-    EnsureRtcEpochIDLocked();
+    EnsureRtcEpochSeqLocked();
 
     nvs_handle_t handle = 0;
     esp_err_t result = nvs_open(kNamespace, NVS_READONLY, &handle);
@@ -116,11 +71,11 @@ void DeviceTimeService::Initialize() {
 
 void DeviceTimeService::SyncUnixTimeMs(uint64_t unix_time_ms) {
     const uint64_t synced_rtc_time_ms = esp_rtc_get_time_us() / 1000;
-    std::string rtc_epoch_id;
+    uint64_t rtc_epoch_seq = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        EnsureRtcEpochIDLocked();
-        rtc_epoch_id = rtc_epoch_id_;
+        EnsureRtcEpochSeqLocked();
+        rtc_epoch_seq = rtc_epoch_seq_;
         synced_unix_time_ms_ = unix_time_ms;
         synced_rtc_time_us_ = esp_rtc_get_time_us();
         synchronized_ = true;
@@ -130,7 +85,7 @@ void DeviceTimeService::SyncUnixTimeMs(uint64_t unix_time_ms) {
     SdCardStorage::GetInstance().BackfillUnsynchronizedRecordingTimes(
         unix_time_ms,
         synced_rtc_time_ms,
-        rtc_epoch_id
+        rtc_epoch_seq
     );
 }
 
@@ -152,9 +107,9 @@ uint64_t DeviceTimeService::CurrentUnixTimeMs() const {
     return synced_unix_time_ms_ + static_cast<uint64_t>(elapsed_us / 1000);
 }
 
-std::string DeviceTimeService::RtcEpochID() const {
+uint64_t DeviceTimeService::RtcEpochSeq() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return rtc_epoch_id_;
+    return rtc_epoch_seq_;
 }
 
 bool DeviceTimeService::PersistLocked() const {
@@ -170,6 +125,9 @@ bool DeviceTimeService::PersistLocked() const {
         result = nvs_set_u64(handle, kRtcTimeUsKey, synced_rtc_time_us_);
     }
     if (result == ESP_OK) {
+        result = nvs_set_u64(handle, kRtcEpochSeqKey, rtc_epoch_seq_);
+    }
+    if (result == ESP_OK) {
         result = nvs_commit(handle);
     }
     nvs_close(handle);
@@ -181,19 +139,60 @@ bool DeviceTimeService::PersistLocked() const {
     return true;
 }
 
-void DeviceTimeService::EnsureRtcEpochIDLocked() {
-    if (!rtc_epoch_id_.empty()) {
+bool DeviceTimeService::PersistRtcEpochSeqLocked() const {
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(kNamespace, NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "Failed to open RTC epoch sequence storage: %s", esp_err_to_name(result));
+        return false;
+    }
+
+    result = nvs_set_u64(handle, kRtcEpochSeqKey, rtc_epoch_seq_);
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "Failed to persist RTC epoch sequence: %s", esp_err_to_name(result));
+        return false;
+    }
+    return true;
+}
+
+void DeviceTimeService::EnsureRtcEpochSeqLocked() {
+    if (rtc_epoch_seq_ > 0) {
         return;
     }
 
-    if (s_rtc_epoch_magic != kRtcEpochMagic ||
-        strnlen(s_rtc_epoch_id, sizeof(s_rtc_epoch_id)) != 32) {
-        const std::string generated_id = BuildRtcEpochID();
-        std::memset(s_rtc_epoch_id, 0, sizeof(s_rtc_epoch_id));
-        std::memcpy(s_rtc_epoch_id, generated_id.c_str(), generated_id.size());
-        s_rtc_epoch_magic = kRtcEpochMagic;
+    if (s_rtc_epoch_magic == kRtcEpochMagic && s_rtc_epoch_seq > 0) {
+        rtc_epoch_seq_ = s_rtc_epoch_seq;
+        ESP_LOGI(
+            kTag,
+            "RTC epoch sequence restored from RTC memory: %llu",
+            static_cast<unsigned long long>(rtc_epoch_seq_)
+        );
+        return;
     }
 
-    rtc_epoch_id_ = std::string(s_rtc_epoch_id);
-    ESP_LOGI(kTag, "RTC epoch ID initialized");
+    uint64_t stored_epoch_seq = 0;
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(kNamespace, NVS_READONLY, &handle);
+    if (result == ESP_OK) {
+        result = nvs_get_u64(handle, kRtcEpochSeqKey, &stored_epoch_seq);
+        nvs_close(handle);
+    }
+    if (result != ESP_OK) {
+        stored_epoch_seq = 0;
+    }
+
+    rtc_epoch_seq_ = stored_epoch_seq + 1;
+    s_rtc_epoch_seq = rtc_epoch_seq_;
+    s_rtc_epoch_magic = kRtcEpochMagic;
+    PersistRtcEpochSeqLocked();
+    ESP_LOGI(
+        kTag,
+        "RTC epoch sequence initialized: %llu",
+        static_cast<unsigned long long>(rtc_epoch_seq_)
+    );
 }

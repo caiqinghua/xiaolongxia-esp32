@@ -62,6 +62,7 @@ constexpr TickType_t kStartupProbeDelay = pdMS_TO_TICKS(1000);
 constexpr TickType_t kProbeRetryDelay = pdMS_TO_TICKS(500);
 constexpr uint32_t kProbeMaxAttempts = 3;
 constexpr time_t kMinimumReasonableRecordingMtime = 1704067200;
+constexpr uint64_t kEpochSortStrideMs = 1000000000000ULL;
 
 struct RecordingScanEntry {
     StoredRecordingInfo info;
@@ -141,9 +142,13 @@ uint64_t RecordingSortKey(const std::string& metadata_content, time_t modified_a
     if (value > 0) {
         return value;
     }
-    value = ReadJsonUInt64(metadata_content, "started_at_rtc_ms");
-    if (value > 0) {
-        return value;
+    const uint64_t epoch_seq = ReadJsonUInt64(metadata_content, "rtc_epoch_seq");
+    const uint64_t rtc_ms = ReadJsonUInt64(metadata_content, "started_at_rtc_ms");
+    if (epoch_seq > 0 && rtc_ms > 0) {
+        return epoch_seq * kEpochSortStrideMs + std::min(rtc_ms, kEpochSortStrideMs - 1);
+    }
+    if (rtc_ms > 0) {
+        return rtc_ms;
     }
     value = ReadJsonUInt64(metadata_content, "started_at_uptime_ms");
     if (value > 0) {
@@ -183,7 +188,7 @@ bool WriteRecordingMetadata(
     const std::string& metadata_path,
     const std::string& recording_id,
     const std::string& file_name,
-    const std::string& rtc_epoch_id,
+    uint64_t rtc_epoch_seq,
     uint32_t duration_ms,
     uint32_t size_bytes,
     uint64_t started_at_unix_ms,
@@ -201,7 +206,7 @@ bool WriteRecordingMetadata(
         "{"
         "\"recording_id\":\"%s\","
         "\"file_name\":\"%s\","
-        "\"rtc_epoch_id\":\"%s\","
+        "\"rtc_epoch_seq\":%s,"
         "\"duration_ms\":%lu,"
         "\"size_bytes\":%lu,"
         "\"started_at_unix_ms\":%s,"
@@ -216,7 +221,7 @@ bool WriteRecordingMetadata(
         "}\n",
         recording_id.c_str(),
         file_name.c_str(),
-        rtc_epoch_id.c_str(),
+        std::to_string(rtc_epoch_seq).c_str(),
         static_cast<unsigned long>(duration_ms),
         static_cast<unsigned long>(size_bytes),
         std::to_string(started_at_unix_ms).c_str(),
@@ -790,12 +795,12 @@ bool SdCardStorage::ReadRecordingChunk(
 size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
     uint64_t synced_unix_time_ms,
     uint64_t synced_rtc_time_ms,
-    const std::string& rtc_epoch_id
+    uint64_t rtc_epoch_seq
 ) {
     ScopedStorageBusy storage_busy;
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!GetStatus().mounted || synced_unix_time_ms == 0 ||
-        synced_rtc_time_ms == 0 || rtc_epoch_id.empty()) {
+        synced_rtc_time_ms == 0 || rtc_epoch_seq == 0) {
         return 0;
     }
 
@@ -822,7 +827,7 @@ size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
         if (content.empty() || JsonBoolValue(content, "time_synchronized")) {
             continue;
         }
-        if (ReadJsonString(content, "rtc_epoch_id") != rtc_epoch_id) {
+        if (ReadJsonUInt64(content, "rtc_epoch_seq") != rtc_epoch_seq) {
             continue;
         }
 
@@ -853,7 +858,7 @@ size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
                 metadata_path,
                 metadata_recording_id.empty() ? recording_id : metadata_recording_id,
                 metadata_file_name.empty() ? file_name : metadata_file_name,
-                rtc_epoch_id,
+                rtc_epoch_seq,
                 duration_ms,
                 size_bytes,
                 started_at_unix_ms,

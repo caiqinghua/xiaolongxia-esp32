@@ -63,7 +63,7 @@ public:
     size_t BackfillUnsynchronizedRecordingTimes(
         uint64_t synced_unix_time_ms,
         uint64_t synced_rtc_time_ms,
-        const std::string& rtc_epoch_id
+        uint64_t rtc_epoch_seq
     );
 
 private:
