@@ -8,12 +8,17 @@
 #include <freertos/task.h>
 
 #include "application.h"
+#include "system/boot_diagnostics.h"
 #include "system/device_time_service.h"
 
 #define TAG "main"
 
 extern "C" void app_main(void)
 {
+    auto& boot_diagnostics = BootDiagnostics::GetInstance();
+    boot_diagnostics.CaptureEarlyBoot();
+    boot_diagnostics.Log(TAG);
+
     // Initialize NVS flash for WiFi configuration
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

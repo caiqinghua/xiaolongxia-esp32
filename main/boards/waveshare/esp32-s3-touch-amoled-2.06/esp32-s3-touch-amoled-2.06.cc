@@ -11,6 +11,7 @@
 #include "i2c_device.h"
 #include "audio/local_recording_service.h"
 #include "storage/sd_card_storage.h"
+#include "system/boot_diagnostics.h"
 #include "system/audream_power_manager.h"
 #include "blufi.h"
 
@@ -85,7 +86,7 @@ static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
     {0x51, (uint8_t []){0xFF}, 1, 0},
 };
 
-// 在waveshare_amoled_2_06类之前添加新的显示类
+// Display class for the Waveshare AMOLED panel.
 class CustomLcdDisplay : public SpiLcdDisplay {
 public:
     static void rounder_event_cb(lv_event_t* e) {
@@ -264,7 +265,7 @@ private:
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
 
-        // 液晶屏控制IO初始化
+        // Initialize LCD panel IO.
         ESP_LOGD(TAG, "Install panel IO");
         esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(
             EXAMPLE_PIN_NUM_LCD_CS,
@@ -272,7 +273,7 @@ private:
             nullptr);
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI2_HOST, &io_config, &panel_io));
 
-        // 初始化液晶屏驱动芯片
+        // Initialize LCD panel driver.
         ESP_LOGD(TAG, "Install LCD driver");
         const sh8601_vendor_config_t vendor_config = {
             .init_cmds = &vendor_specific_init[0],
@@ -368,6 +369,11 @@ private:
     }
 
     void HandleStorageInitializationComplete(const StorageStatus& status) {
+        if (status.mounted) {
+            auto& diagnostics = BootDiagnostics::GetInstance();
+            diagnostics.Log(TAG);
+            diagnostics.AppendToFile("/sdcard/audream/boot_diagnostics.log");
+        }
         if (!pending_deep_sleep_recording_) {
             return;
         }
@@ -498,8 +504,18 @@ private:
         }
     }
 
+    void LogWakeContext() {
+        gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
+        gpio_pullup_en(BOOT_BUTTON_GPIO);
+        gpio_pulldown_dis(BOOT_BUTTON_GPIO);
+        auto& diagnostics = BootDiagnostics::GetInstance();
+        diagnostics.SetBootGpioLevel(gpio_get_level(BOOT_BUTTON_GPIO));
+        diagnostics.Log(TAG);
+    }
+
 public:
     WaveshareEsp32s3TouchAMOLED2inch06() : boot_button_(BOOT_BUTTON_GPIO, false, 3000) {
+        LogWakeContext();
         InitializeCodecI2c();
         InitializeAxp2101();
         InitializeRecordingPowerManagement();

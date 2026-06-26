@@ -73,7 +73,6 @@ Active -> Light Sleep -> Deep Sleep
 - 当前没有录音。
 - 当前没有 BLE/Wi-Fi 文件传输。
 - 当前没有 SD 卡写入、metadata flush 或 mount/probe。
-- 当前不是 USB 供电或调试连接。
 
 进入前动作：
 
@@ -83,12 +82,17 @@ Active -> Light Sleep -> Deep Sleep
 - 停止 Wi-Fi STA/AP。
 - 关闭 codec、麦克风输入、屏幕和非必要外设。
 - flush 必要 metadata。
+- 配置 wake GPIO 前检查按键电平并打印诊断日志。如果 wake GPIO 已经处于 active level，取消本次 Deep Sleep，避免刚进入就被立刻唤醒。
 - 配置按键 GPIO wakeup。
 - 进入 deep sleep。
 
 唤醒方式：
 
 - 第一版只使用用户按键唤醒。
+- 每次启动都会打印 wake cause 和 BOOT GPIO 电平，用于判断设备是正常上电、按键从 Deep Sleep 唤醒，还是被错误的 GPIO 电平立即唤醒。
+- `app_main()` 会先打印 reset reason 和 wake cause。USB 调试场景下如果看到 `reset=usb` 或 `reset=poweron`，说明设备不是被 EXT0 正常唤醒，而是 USB/供电/调试链路触发了 reset-style boot。
+- 因为 USB deep sleep 会让 `idf.py monitor` 断开并可能错过早期串口日志，固件会在 `app_main()` 第一时间把 boot diagnostics 保存到 RAM。SD 卡初始化完成后，固件会再次打印诊断信息，并追加写入 `/sdcard/audream/boot_diagnostics.log`。
+- 进入 Audream Deep Sleep 前，固件必须先调用 `esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL)` 清理旧 wake source，再只启用按键 EXT0。旧 `SleepTimer` light sleep 代码会设置 30 秒 timer wake source，如果不清理，会导致 Deep Sleep 立即或定时被 `wake=timer` 唤醒。
 - 如果设备因按键从 `Deep Sleep` 唤醒，并且启动时按键仍保持按下，固件记录一次 pending recording candidate。
 - pending recording candidate 不会立即录音；它会等待 SD 卡 startup initialization 完成。
 - 如果 SD 卡在 3 秒长按阈值之前 ready，固件会补足剩余时间，到 3 秒时再次读取按键电平。只有按键仍保持按下，才启动本地 OPUS 录音。
@@ -97,9 +101,11 @@ Active -> Light Sleep -> Deep Sleep
 
 ## USB 供电规则
 
-USB 供电或调试连接时，不自动进入 `Deep Sleep`，避免串口断开、烧录和 monitor 被影响。
+当前调试版本中，固件仍检测和打印 USB 供电状态，但 USB 供电不会阻止进入 `Deep Sleep`。这样可以在串口 monitor 中验证 `deviceWillSleep` 事件和 `esp_deep_sleep_start()` 路径是否真的执行。
 
-USB 不阻止进入 `Light Sleep`。如果设备已在 `Light Sleep` 且达到 180 秒，但检测到 USB 供电，应停留在 `Light Sleep`。
+正式版本可以恢复 USB 供电阻塞规则：USB 供电或调试连接时，不自动进入 `Deep Sleep`，避免串口断开、烧录和 monitor 被影响。
+
+USB 不阻止进入 `Light Sleep`。正式版本如果设备已在 `Light Sleep` 且达到 180 秒，但检测到 USB 供电，应停留在 `Light Sleep`。
 
 On AXP2101 boards, the USB blocker must use the PMIC VBUS input state, not
 `!IsDischarging()`. AXP2101 can report standby or charge-done states that are
@@ -107,7 +113,7 @@ neither charging nor discharging, and treating those states as USB power can
 permanently block deep sleep after the cable is removed. The Waveshare board
 uses `STATUS1.bit5 && !STATUS2.bit3`, matching XPowersLib `isVbusIn()`.
 
-建议日志节流输出：
+正式版本建议日志节流输出：
 
 ```text
 Deep sleep blocked by USB power
@@ -115,7 +121,7 @@ Deep sleep blocked by USB power
 
 不要每秒刷屏。建议同一原因至少间隔 60 秒再打印一次。
 
-如果 USB 拔掉，设备仍处于 `Light Sleep` 且已经满足 180 秒条件，则下一次 power manager tick 可以进入 `Deep Sleep`。
+正式版本如果 USB 拔掉，设备仍处于 `Light Sleep` 且已经满足 180 秒条件，则下一次 power manager tick 可以进入 `Deep Sleep`。
 
 ## 未同步录音策略
 
@@ -204,7 +210,7 @@ Power manager 每 1 秒 tick 一次即可。日志需要节流，避免影响功
 - 有效活动与后台维护活动区分。
 - 停止录音后的 120 秒同步窗口。
 - Light Sleep 180 秒后尝试 Deep Sleep。
-- USB 供电阻止 Deep Sleep。
+- 当前调试版本中 USB 供电不阻止 Deep Sleep。
 - 按键唤醒。
 
 暂不实现：

@@ -39,7 +39,6 @@ private:
     int64_t last_user_activity_us_ = 0;
     int64_t active_timeout_us_ = 45LL * 1000000LL;
     int64_t light_sleep_started_us_ = 0;
-    int64_t last_usb_block_log_us_ = 0;
     bool recording_active_ = false;
     bool ble_file_transfer_active_ = false;
     bool temporary_ap_transfer_active_ = false;

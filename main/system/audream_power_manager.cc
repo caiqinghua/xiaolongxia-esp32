@@ -15,7 +15,6 @@ namespace {
 constexpr char kTag[] = "AudreamPower";
 constexpr int64_t kLightSleepToDeepSleepUs = 180LL * 1000000LL;
 constexpr int64_t kTickDelayMs = 1000;
-constexpr int64_t kUsbBlockLogIntervalUs = 60LL * 1000000LL;
 
 const char* StateName(AudreamPowerState state) {
     switch (state) {
@@ -198,13 +197,6 @@ void AudreamPowerManager::Tick() {
             if (now_us - light_sleep_started_us_ < kLightSleepToDeepSleepUs) {
                 return;
             }
-            if (usb_powered_) {
-                if (now_us - last_usb_block_log_us_ >= kUsbBlockLogIntervalUs) {
-                    last_usb_block_log_us_ = now_us;
-                    ESP_LOGI(kTag, "Deep sleep blocked by USB power");
-                }
-                return;
-            }
             state_ = AudreamPowerState::kDeepSleepPreparing;
             should_enter_deep_sleep = true;
         }
@@ -243,20 +235,37 @@ void AudreamPowerManager::EnterLightSleepLocked(int64_t now_us) {
 
 void AudreamPowerManager::EnterDeepSleep() {
     ESP_LOGI(kTag, "Entering deep sleep");
-    std::function<void()> before_sleep_callback;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        before_sleep_callback = before_deep_sleep_callback_;
+    const esp_err_t disable_result = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    if (disable_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "Failed to clear existing wake sources before deep sleep: %s",
+            esp_err_to_name(disable_result)
+        );
     }
-    if (before_sleep_callback) {
-        before_sleep_callback();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    esp_wifi_stop();
     if (wake_gpio_ != GPIO_NUM_NC) {
         gpio_set_direction(wake_gpio_, GPIO_MODE_INPUT);
         gpio_pullup_en(wake_gpio_);
         gpio_pulldown_dis(wake_gpio_);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        const int wake_level = gpio_get_level(wake_gpio_);
+        ESP_LOGI(
+            kTag,
+            "Deep sleep wake GPIO %d level before sleep: %d",
+            static_cast<int>(wake_gpio_),
+            wake_level
+        );
+        if (wake_level == 0) {
+            ESP_LOGW(
+                kTag,
+                "Deep sleep canceled because wake GPIO %d is already active",
+                static_cast<int>(wake_gpio_)
+            );
+            std::lock_guard<std::mutex> lock(mutex_);
+            state_ = AudreamPowerState::kLightSleep;
+            light_sleep_started_us_ = esp_timer_get_time();
+            return;
+        }
         const esp_err_t wake_result = esp_sleep_enable_ext0_wakeup(wake_gpio_, 0);
         if (wake_result != ESP_OK) {
             ESP_LOGE(
@@ -270,5 +279,16 @@ void AudreamPowerManager::EnterDeepSleep() {
             return;
         }
     }
+
+    std::function<void()> before_sleep_callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        before_sleep_callback = before_deep_sleep_callback_;
+    }
+    if (before_sleep_callback) {
+        before_sleep_callback();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    esp_wifi_stop();
     esp_deep_sleep_start();
 }
