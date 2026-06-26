@@ -46,7 +46,7 @@ public:
     StorageStatus GetStatus();
     std::string RecordingsDirectory() const;
     bool EnsureRecordingsDirectory();
-    bool UpsertRecordingIndex(const StoredRecordingInfo& info);
+    bool SetRecordingMtime(const std::string& recording_id, uint64_t started_at_unix_ms);
     std::vector<StoredRecordingInfo> ListRecordings(size_t max_count);
     bool GetRecordingFilePath(
         const std::string& recording_id,

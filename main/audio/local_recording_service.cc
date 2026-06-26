@@ -167,15 +167,10 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
         }
     }
     WriteMetadataFile(current_);
-    StoredRecordingInfo stored_info;
-    stored_info.recording_id = current_.recording_id;
-    stored_info.file_name = current_.file_name;
-    stored_info.duration_ms = current_.duration_ms;
-    stored_info.size_bytes = current_.size_bytes;
-    stored_info.started_at_unix_ms = current_.started_at_unix_ms;
-    stored_info.started_at_uptime_ms = current_.started_at_uptime_ms;
-    stored_info.started_at_rtc_ms = current_.started_at_rtc_ms;
-    SdCardStorage::GetInstance().UpsertRecordingIndex(stored_info);
+    SdCardStorage::GetInstance().SetRecordingMtime(
+        current_.recording_id,
+        current_.started_at_unix_ms
+    );
     last_ = current_;
     recording_ = false;
     AudreamPowerManager::GetInstance().SetRecordingActive(false);
