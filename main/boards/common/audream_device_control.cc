@@ -29,6 +29,7 @@ constexpr uint8_t kProtocolVersion = 1;
 constexpr size_t kRequestHeaderLength = 4;
 constexpr uint8_t kResponseOpcodeMask = 0x80;
 constexpr size_t kMaxReadChunkBytes = 96;
+constexpr size_t kMaxListRecordingsPayloadBytes = 180;
 
 constexpr int32_t kDefaultAutoPowerOffSeconds = -1;
 constexpr uint8_t kDefaultMicrophoneGainDb = 24;
@@ -576,10 +577,7 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
         }
 
         case Opcode::kListLocalRecordings: {
-            uint8_t max_count = 8;
-            if (length == kRequestHeaderLength + 1) {
-                max_count = std::clamp<uint8_t>(data[kRequestHeaderLength], 1, 16);
-            } else if (length != kRequestHeaderLength) {
+            if (length != kRequestHeaderLength + 3) {
                 return BuildPayloadResponse(
                     opcode_value,
                     request_id,
@@ -587,12 +585,21 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     {}
                 );
             }
-            auto recordings = SdCardStorage::GetInstance().ListRecordings(max_count);
+            const uint8_t max_count = std::clamp<uint8_t>(data[kRequestHeaderLength], 1, 16);
+            const uint16_t offset = ReadUInt16(&data[kRequestHeaderLength + 1]);
+            const size_t requested_count = static_cast<size_t>(offset) + max_count;
+            auto recordings = SdCardStorage::GetInstance().ListRecordings(requested_count);
             std::vector<uint8_t> payload;
             payload.push_back(0);
             uint8_t appended_count = 0;
-            for (const auto& recording : recordings) {
-                if (payload.size() > 180) {
+            for (size_t index = offset; index < recordings.size(); ++index) {
+                const auto& recording = recordings[index];
+                const size_t entry_size =
+                    1 + std::min<size_t>(recording.recording_id.size(), 255) +
+                    1 + std::min<size_t>(recording.file_name.size(), 255) +
+                    sizeof(uint32_t) +
+                    sizeof(uint32_t);
+                if (payload.size() + entry_size > kMaxListRecordingsPayloadBytes) {
                     break;
                 }
                 AppendString(payload, recording.recording_id);
@@ -602,6 +609,15 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 appended_count++;
             }
             payload[0] = appended_count;
+            ESP_LOGI(
+                kTag,
+                "Listed local recordings: requested=%u offset=%u available=%u appended=%u payload_size=%u",
+                static_cast<unsigned>(requested_count),
+                static_cast<unsigned>(offset),
+                static_cast<unsigned>(recordings.size()),
+                static_cast<unsigned>(appended_count),
+                static_cast<unsigned>(payload.size())
+            );
             return BuildPayloadResponse(
                 opcode_value,
                 request_id,
