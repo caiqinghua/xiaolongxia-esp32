@@ -84,32 +84,16 @@ TemporaryAPTransferService& TemporaryAPTransferService::GetInstance() {
     return instance;
 }
 
-TemporaryAPTransferSession TemporaryAPTransferService::Start(const std::string& recording_id) {
+TemporaryAPTransferSession TemporaryAPTransferService::Start() {
     std::lock_guard<std::mutex> lock(mutex_);
     StopLocked();
 
-    uint32_t total_size = 0;
-    std::string file_path;
-    if (!SdCardStorage::GetInstance().GetRecordingFilePath(
-            recording_id,
-            file_path,
-            total_size
-        )) {
-        ESP_LOGE(kTag, "Recording is not available for fast transfer: %s", recording_id.c_str());
-        return {};
-    }
-
     session_ = {};
-    session_.recording_id = recording_id;
     session_.ssid = BuildStableSSID();
     session_.password = BuildPassword();
     session_.token = RandomHex(16);
-    session_.size_bytes = total_size;
     session_.expires_in_seconds = kSessionExpirySeconds;
     session_.url = "http://192.168.4.1/download?token=" + session_.token;
-    file_path_ = file_path;
-    expires_at_us_ = esp_timer_get_time() +
-        static_cast<int64_t>(kSessionExpirySeconds) * 1000000LL;
 
     if (!StartAccessPointLocked() || !StartHttpServerLocked() || !StartExpiryTimerLocked()) {
         StopLocked();
@@ -120,8 +104,7 @@ TemporaryAPTransferSession TemporaryAPTransferService::Start(const std::string& 
     AudreamPowerManager::GetInstance().SetTemporaryAPTransferActive(true);
     ESP_LOGI(
         kTag,
-        "Temporary AP transfer started for %s as %s",
-        recording_id.c_str(),
+        "Temporary AP transfer batch started as %s",
         session_.ssid.c_str()
     );
     return session_;
@@ -133,19 +116,14 @@ void TemporaryAPTransferService::Stop() {
 }
 
 bool TemporaryAPTransferService::Complete(
-    const std::string& recording_id,
     const std::string& token
 ) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!IsSessionMatchLocked(recording_id, token)) {
-        ESP_LOGW(
-            kTag,
-            "Ignored temporary AP completion for a non-current transfer: %s",
-            recording_id.c_str()
-        );
+    if (!IsTokenValidLocked(token)) {
+        ESP_LOGW(kTag, "Ignored temporary AP completion with an invalid token");
         return false;
     }
-    ESP_LOGI(kTag, "Temporary AP transfer completed for %s", recording_id.c_str());
+    ESP_LOGI(kTag, "Temporary AP transfer batch completed");
     StopLocked();
     return true;
 }
@@ -164,7 +142,6 @@ void TemporaryAPTransferService::StopLocked(bool stop_expiry_timer) {
         ap_netif_ = nullptr;
     }
     session_ = {};
-    file_path_.clear();
     expires_at_us_ = 0;
     AudreamPowerManager::GetInstance().SetTemporaryAPTransferActive(false);
 }
@@ -195,7 +172,7 @@ void TemporaryAPTransferService::StopFromExpiry() {
     if (!session_.valid) {
         return;
     }
-    ESP_LOGI(kTag, "Temporary AP transfer expired for %s", session_.recording_id.c_str());
+    ESP_LOGI(kTag, "Temporary AP transfer batch expired");
     StopLocked(false);
 }
 
@@ -307,6 +284,8 @@ bool TemporaryAPTransferService::StartExpiryTimerLocked() {
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(expiry_timer_));
     }
 
+    expires_at_us_ = esp_timer_get_time() +
+        static_cast<int64_t>(kSessionExpirySeconds) * 1000000LL;
     const esp_err_t start_result = esp_timer_start_once(
         expiry_timer_,
         static_cast<uint64_t>(kSessionExpirySeconds) * 1000000ULL
@@ -330,31 +309,38 @@ bool TemporaryAPTransferService::IsTokenValidLocked(const std::string& token) co
     return session_.valid && !IsExpiredLocked() && token == session_.token;
 }
 
-bool TemporaryAPTransferService::IsSessionMatchLocked(
-    const std::string& recording_id,
-    const std::string& token
-) const {
-    return IsTokenValidLocked(token) && recording_id == session_.recording_id;
-}
-
 esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
     auto* service = static_cast<TemporaryAPTransferService*>(request->user_ctx);
     char token[80] = {};
-    if (service == nullptr || !QueryValue(request, "token", token, sizeof(token))) {
-        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing token");
+    char recording_id[80] = {};
+    if (service == nullptr ||
+        !QueryValue(request, "token", token, sizeof(token)) ||
+        !QueryValue(request, "recording_id", recording_id, sizeof(recording_id))) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing token or recording_id");
         return ESP_FAIL;
     }
 
-    std::string file_path;
-    uint32_t size_bytes = 0;
     {
         std::lock_guard<std::mutex> lock(service->mutex_);
         if (!service->IsTokenValidLocked(token)) {
             httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Invalid token");
             return ESP_FAIL;
         }
-        file_path = service->file_path_;
-        size_bytes = service->session_.size_bytes;
+        if (!service->StartExpiryTimerLocked()) {
+            httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to extend session");
+            return ESP_FAIL;
+        }
+    }
+
+    std::string file_path;
+    uint32_t size_bytes = 0;
+    if (!SdCardStorage::GetInstance().GetRecordingFilePath(
+            recording_id,
+            file_path,
+            size_bytes
+        )) {
+        httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "Recording not found");
+        return ESP_FAIL;
     }
 
     FILE* file = fopen(file_path.c_str(), "rb");

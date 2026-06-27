@@ -679,9 +679,7 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
         }
 
         case Opcode::kStartTemporaryAPTransfer: {
-            size_t cursor = kRequestHeaderLength;
-            std::string recording_id;
-            if (!ReadString(data, length, cursor, recording_id) || cursor != length) {
+            if (length != kRequestHeaderLength) {
                 return BuildPayloadResponse(
                     opcode_value,
                     request_id,
@@ -689,7 +687,7 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     {}
                 );
             }
-            auto session = TemporaryAPTransferService::GetInstance().Start(recording_id);
+            auto session = TemporaryAPTransferService::GetInstance().Start();
             if (!session.valid) {
                 return BuildPayloadResponse(
                     opcode_value,
@@ -699,12 +697,10 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 );
             }
             std::vector<uint8_t> payload;
-            AppendString(payload, session.recording_id);
             AppendString(payload, session.ssid);
             AppendString(payload, session.password);
             AppendString(payload, session.url);
             AppendString(payload, session.token);
-            AppendUInt32(payload, session.size_bytes);
             AppendUInt32(payload, session.expires_in_seconds);
             return BuildPayloadResponse(
                 opcode_value,
@@ -716,10 +712,8 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
 
         case Opcode::kCompleteTemporaryAPTransfer: {
             size_t cursor = kRequestHeaderLength;
-            std::string recording_id;
             std::string token;
-            if (!ReadString(data, length, cursor, recording_id) ||
-                !ReadString(data, length, cursor, token) ||
+            if (!ReadString(data, length, cursor, token) ||
                 cursor != length) {
                 return BuildPayloadResponse(
                     opcode_value,
@@ -728,7 +722,7 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     {}
                 );
             }
-            if (!TemporaryAPTransferService::GetInstance().Complete(recording_id, token)) {
+            if (!TemporaryAPTransferService::GetInstance().Complete(token)) {
                 return BuildPayloadResponse(
                     opcode_value,
                     request_id,
