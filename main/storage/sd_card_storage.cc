@@ -69,6 +69,7 @@ struct RecordingScanEntry {
     uint64_t sort_key = 0;
     time_t modified_at = 0;
     std::string audio_path;
+    bool metadata_loaded = false;
 };
 
 class ScopedStorageBusy {
@@ -155,6 +156,27 @@ uint64_t RecordingSortKey(const std::string& metadata_content, time_t modified_a
         return value;
     }
     return static_cast<uint64_t>(modified_at) * 1000;
+}
+
+void PopulateRecordingInfo(
+    const std::string& metadata_content,
+    StoredRecordingInfo& info
+) {
+    info.duration_ms = static_cast<uint32_t>(
+        ReadJsonUInt64(metadata_content, "duration_ms")
+    );
+    info.started_at_unix_ms = ReadJsonUInt64(
+        metadata_content,
+        "started_at_unix_ms"
+    );
+    info.started_at_uptime_ms = ReadJsonUInt64(
+        metadata_content,
+        "started_at_uptime_ms"
+    );
+    info.started_at_rtc_ms = ReadJsonUInt64(
+        metadata_content,
+        "started_at_rtc_ms"
+    );
 }
 
 std::string ReadJsonString(const std::string& content, const std::string& key) {
@@ -680,6 +702,7 @@ std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t max_count)
     closedir(dir);
 
     size_t corrected_count = 0;
+    size_t repaired_mtime_count = 0;
     for (auto& entry : entries) {
         const bool invalid_mtime = entry.modified_at < kMinimumReasonableRecordingMtime;
         const bool duplicate_mtime = mtime_counts[entry.modified_at] > 1;
@@ -690,17 +713,41 @@ std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t max_count)
         if (metadata_content.empty()) {
             continue;
         }
-        const uint64_t corrected_sort_key = RecordingSortKey(metadata_content, entry.modified_at);
+        entry.metadata_loaded = true;
+        PopulateRecordingInfo(metadata_content, entry.info);
+        const uint64_t started_at_unix_ms = entry.info.started_at_unix_ms;
+        if (started_at_unix_ms > 0) {
+            const time_t corrected_mtime = static_cast<time_t>(started_at_unix_ms / 1000);
+            if (corrected_mtime != entry.modified_at && ApplyRecordingMtime(
+                    entry.audio_path,
+                    entry.audio_path + ".json",
+                    started_at_unix_ms
+                )) {
+                entry.modified_at = corrected_mtime;
+                repaired_mtime_count++;
+            }
+        }
+        const uint64_t corrected_sort_key = RecordingSortKey(
+            metadata_content,
+            entry.modified_at
+        );
         if (corrected_sort_key != entry.sort_key) {
             entry.sort_key = corrected_sort_key;
             corrected_count++;
         }
     }
     if (corrected_count > 0) {
+        ESP_LOGD(
+            kTag,
+            "Applied recording sort keys from metadata: %u",
+            static_cast<unsigned>(corrected_count)
+        );
+    }
+    if (repaired_mtime_count > 0) {
         ESP_LOGI(
             kTag,
-            "Corrected recording sort keys from metadata: %u",
-            static_cast<unsigned>(corrected_count)
+            "Repaired recording mtimes from metadata: %u",
+            static_cast<unsigned>(repaired_mtime_count)
         );
     }
 
@@ -716,13 +763,10 @@ std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t max_count)
         if (result.size() >= max_count) {
             break;
         }
-        const std::string metadata_content = ReadTextFile(entry.audio_path + ".json");
-        entry.info.duration_ms = static_cast<uint32_t>(
-            ReadJsonUInt64(metadata_content, "duration_ms")
-        );
-        entry.info.started_at_unix_ms = ReadJsonUInt64(metadata_content, "started_at_unix_ms");
-        entry.info.started_at_uptime_ms = ReadJsonUInt64(metadata_content, "started_at_uptime_ms");
-        entry.info.started_at_rtc_ms = ReadJsonUInt64(metadata_content, "started_at_rtc_ms");
+        if (!entry.metadata_loaded) {
+            const std::string metadata_content = ReadTextFile(entry.audio_path + ".json");
+            PopulateRecordingInfo(metadata_content, entry.info);
+        }
         if (entry.info.duration_ms == 0) {
             continue;
         }
