@@ -16,6 +16,7 @@
 #include "blufi.h"
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <esp_pm.h>
 #include <esp_rom_sys.h>
 #include <esp_sleep.h>
@@ -32,6 +33,8 @@
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
 
+#include <algorithm>
+
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch06"
 
 namespace {
@@ -40,6 +43,8 @@ constexpr uint16_t kRecordingButtonHoldMs = 1500;
 constexpr int64_t kDeepSleepWakeRecordHoldUs = static_cast<int64_t>(kRecordingButtonHoldMs) * 1000LL;
 constexpr uint64_t kRecordingFeedbackScreenOnUs = 3000ULL * 1000ULL;
 constexpr uint64_t kRecordingHoldRetryUs = 200ULL * 1000ULL;
+constexpr size_t kRecordingFeedbackDrawRows = 4;
+constexpr uint16_t kRecordingFeedbackColor = 0xFFFF;
 
 }  // namespace
 
@@ -139,7 +144,8 @@ public:
 
 class CustomBacklight : public Backlight {
 public:
-    CustomBacklight(esp_lcd_panel_io_handle_t panel_io) : Backlight(), panel_io_(panel_io) {}
+    CustomBacklight(esp_lcd_panel_io_handle_t panel_io, bool panel_awake = false)
+        : Backlight(), panel_io_(panel_io), panel_awake_(panel_awake) {}
 
     void SetImmediateBrightness(uint8_t brightness) {
         if (brightness > 100) {
@@ -153,25 +159,39 @@ public:
         SetBrightnessImpl(brightness);
     }
 
-    void WakeForRecordingFeedback() {
+    bool WakeForRecordingFeedback() {
         if (!panel_awake_) {
-            SendCommand(0x11, nullptr, 0);
+            const esp_err_t sleep_out_result = SendCommand(0x11, nullptr, 0);
+            if (sleep_out_result != ESP_OK) {
+                return false;
+            }
             esp_rom_delay_us(120000);
             panel_awake_ = true;
         }
-        SendCommand(0x29, nullptr, 0);
+        const esp_err_t display_on_result = SendCommand(0x29, nullptr, 0);
+        return display_on_result == ESP_OK;
     }
 
 protected:
     esp_lcd_panel_io_handle_t panel_io_;
     bool panel_awake_ = false;
 
-    void SendCommand(uint8_t command, const void* data, size_t size) {
+    esp_err_t SendCommand(uint8_t command, const void* data, size_t size) {
         int lcd_cmd = command;
         lcd_cmd &= 0xff;
         lcd_cmd <<= 8;
         lcd_cmd |= LCD_OPCODE_WRITE_CMD << 24;
-        esp_lcd_panel_io_tx_param(panel_io_, lcd_cmd, data, size);
+        const esp_err_t result = esp_lcd_panel_io_tx_param(panel_io_, lcd_cmd, data, size);
+        if (result != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Recording feedback panel command failed: command=0x%02x size=%u result=%s",
+                command,
+                static_cast<unsigned int>(size),
+                esp_err_to_name(result)
+            );
+        }
+        return result;
     }
 
     virtual void SetBrightnessImpl(uint8_t brightness) override {
@@ -206,6 +226,9 @@ private:
     bool recording_feedback_display_task_started_ = false;
     bool recording_feedback_display_initialized_ = false;
     bool recording_feedback_spi_initialized_ = false;
+    bool recording_feedback_pulse_pending_ = false;
+    esp_lcd_panel_handle_t recording_feedback_panel_ = nullptr;
+    uint16_t* recording_feedback_draw_buffer_ = nullptr;
     bool pending_deep_sleep_recording_ = false;
     bool suppress_next_wake_long_press_ = false;
     int64_t deep_sleep_wake_button_down_us_ = 0;
@@ -367,15 +390,62 @@ private:
         if (created != pdPASS) {
             recording_feedback_display_task_started_ = false;
             ESP_LOGE(TAG, "Failed to create recording feedback display task");
+            return;
         }
     }
 
+    bool DrawRecordingFeedbackFrame() {
+        if (recording_feedback_panel_ == nullptr) {
+            ESP_LOGE(TAG, "Cannot draw recording feedback frame because the panel is unavailable");
+            return false;
+        }
+        constexpr size_t pixel_count = DISPLAY_WIDTH * kRecordingFeedbackDrawRows;
+        if (recording_feedback_draw_buffer_ == nullptr) {
+            recording_feedback_draw_buffer_ = static_cast<uint16_t*>(heap_caps_malloc(
+                pixel_count * sizeof(uint16_t),
+                MALLOC_CAP_DMA | MALLOC_CAP_8BIT
+            ));
+            if (recording_feedback_draw_buffer_ == nullptr) {
+                ESP_LOGE(
+                    TAG,
+                    "Failed to allocate recording feedback draw buffer: bytes=%u",
+                    static_cast<unsigned int>(pixel_count * sizeof(uint16_t))
+                );
+                return false;
+            }
+        }
+        std::fill_n(recording_feedback_draw_buffer_, pixel_count, kRecordingFeedbackColor);
+
+        for (int y = 0; y < DISPLAY_HEIGHT; y += kRecordingFeedbackDrawRows) {
+            const int y_end = std::min(
+                y + static_cast<int>(kRecordingFeedbackDrawRows),
+                static_cast<int>(DISPLAY_HEIGHT)
+            );
+            const esp_err_t draw_result = esp_lcd_panel_draw_bitmap(
+                recording_feedback_panel_,
+                0,
+                y,
+                DISPLAY_WIDTH,
+                y_end,
+                recording_feedback_draw_buffer_
+            );
+            if (draw_result != ESP_OK) {
+                ESP_LOGE(
+                    TAG,
+                    "Failed to draw recording feedback frame: y=%d result=%s",
+                    y,
+                    esp_err_to_name(draw_result)
+                );
+                return false;
+            }
+        }
+        return true;
+    }
+
     void InitializeRecordingFeedbackDisplayTask() {
-        ESP_LOGI(TAG, "Recording feedback display initialization started");
         if (!recording_feedback_spi_initialized_) {
             InitializeSpi();
             recording_feedback_spi_initialized_ = true;
-            ESP_LOGI(TAG, "Recording feedback display SPI initialized");
         }
 
         esp_lcd_panel_io_handle_t panel_io = nullptr;
@@ -389,22 +459,88 @@ private:
             ESP_LOGE(TAG, "Failed to create recording feedback panel IO: %s", esp_err_to_name(io_result));
             return;
         }
+        const sh8601_vendor_config_t vendor_config = {
+            .init_cmds = &vendor_specific_init[0],
+            .init_cmds_size = sizeof(vendor_specific_init) / sizeof(sh8601_lcd_init_cmd_t),
+            .flags = {
+                .use_qspi_interface = 1,
+            },
+        };
+        esp_lcd_panel_dev_config_t panel_config = {};
+        panel_config.reset_gpio_num = EXAMPLE_PIN_NUM_LCD_RST;
+        panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
+        panel_config.bits_per_pixel = 16;
+        panel_config.vendor_config = const_cast<sh8601_vendor_config_t*>(&vendor_config);
 
-        backlight_ = new CustomBacklight(panel_io);
+        esp_lcd_panel_handle_t panel = nullptr;
+        const esp_err_t panel_create_result =
+            esp_lcd_new_panel_sh8601(panel_io, &panel_config, &panel);
+        if (panel_create_result != ESP_OK) {
+            recording_feedback_display_task_started_ = false;
+            ESP_LOGE(
+                TAG,
+                "Failed to create recording feedback SH8601 panel: %s",
+                esp_err_to_name(panel_create_result)
+            );
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_del(panel_io));
+            return;
+        }
+
+        const auto run_panel_step = [](const char* name, esp_err_t result) {
+            if (result == ESP_OK) {
+                return true;
+            }
+            ESP_LOGE(
+                TAG,
+                "Recording feedback panel step failed: step=%s result=%s",
+                name,
+                esp_err_to_name(result)
+            );
+            return false;
+        };
+        const bool panel_initialized =
+            run_panel_step("set_gap", esp_lcd_panel_set_gap(panel, 0x16, 0)) &&
+            run_panel_step("reset", esp_lcd_panel_reset(panel)) &&
+            run_panel_step("initialize", esp_lcd_panel_init(panel)) &&
+            run_panel_step("invert", esp_lcd_panel_invert_color(panel, false)) &&
+            run_panel_step("mirror", esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y)) &&
+            run_panel_step("display_on", esp_lcd_panel_disp_on_off(panel, true));
+        if (!panel_initialized) {
+            recording_feedback_display_task_started_ = false;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_del(panel));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_del(panel_io));
+            return;
+        }
+
+        recording_feedback_panel_ = panel;
+        backlight_ = new CustomBacklight(panel_io, true);
+        backlight_->SetImmediateBrightness(0);
+        if (!DrawRecordingFeedbackFrame()) {
+            recording_feedback_display_task_started_ = false;
+            return;
+        }
         recording_feedback_display_initialized_ = true;
         ESP_LOGI(TAG, "Recording feedback display initialized");
-        PulseRecordingFeedbackScreen();
+        if (recording_feedback_pulse_pending_) {
+            PulseRecordingFeedbackScreen();
+        }
     }
 
     void PulseRecordingFeedbackScreen() {
         if (!recording_feedback_display_initialized_) {
+            recording_feedback_pulse_pending_ = true;
             InitializeRecordingFeedbackDisplay();
             return;
         }
         if (backlight_ == nullptr) {
+            ESP_LOGE(TAG, "Recording feedback screen pulse skipped because backlight is unavailable");
             return;
         }
-        backlight_->WakeForRecordingFeedback();
+        if (!backlight_->WakeForRecordingFeedback()) {
+            ESP_LOGE(TAG, "Recording feedback screen pulse stopped because panel wake failed");
+            return;
+        }
+        recording_feedback_pulse_pending_ = false;
         backlight_->RestoreBrightness();
         if (recording_feedback_screen_timer_ == nullptr) {
             const esp_timer_create_args_t timer_args = {
@@ -430,13 +566,21 @@ private:
         if (stop_result != ESP_OK && stop_result != ESP_ERR_INVALID_STATE) {
             ESP_LOGW(TAG, "Failed to stop recording feedback screen timer: %s", esp_err_to_name(stop_result));
         }
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            esp_timer_start_once(recording_feedback_screen_timer_, kRecordingFeedbackScreenOnUs)
-        );
+        const esp_err_t start_result =
+            esp_timer_start_once(recording_feedback_screen_timer_, kRecordingFeedbackScreenOnUs);
+        if (start_result != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Failed to start recording feedback screen timer: %s",
+                esp_err_to_name(start_result)
+            );
+            return;
+        }
     }
 
     void TurnOffRecordingFeedbackScreen() {
         if (backlight_ == nullptr) {
+            ESP_LOGW(TAG, "Recording feedback screen off skipped because backlight is unavailable");
             return;
         }
         backlight_->SetImmediateBrightness(0);
@@ -727,7 +871,6 @@ public:
         LogWakeContext();
         InitializeCodecI2c();
         InitializeAxp2101();
-        InitializeRecordingFeedbackDisplay();
         InitializeRecordingPowerManagement();
         InitializeRecordingButton();
         DetectDeepSleepRecordingIntent();
