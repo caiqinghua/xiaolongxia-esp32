@@ -44,7 +44,29 @@ constexpr int64_t kDeepSleepWakeRecordHoldUs = static_cast<int64_t>(kRecordingBu
 constexpr uint64_t kRecordingFeedbackScreenOnUs = 3000ULL * 1000ULL;
 constexpr uint64_t kRecordingHoldRetryUs = 200ULL * 1000ULL;
 constexpr size_t kRecordingFeedbackDrawRows = 4;
-constexpr uint16_t kRecordingFeedbackColor = 0xFFFF;
+constexpr int kAudreamLogoGlyphWidth = 5;
+constexpr int kAudreamLogoGlyphHeight = 7;
+constexpr int kAudreamLogoGlyphScale = 8;
+constexpr int kAudreamLogoGlyphSpacing = kAudreamLogoGlyphScale;
+constexpr int kAudreamLogoGlyphCount = 7;
+constexpr int kAudreamLogoWidth =
+    kAudreamLogoGlyphCount * kAudreamLogoGlyphWidth * kAudreamLogoGlyphScale +
+    (kAudreamLogoGlyphCount - 1) * kAudreamLogoGlyphSpacing;
+constexpr int kAudreamLogoHeight = kAudreamLogoGlyphHeight * kAudreamLogoGlyphScale;
+constexpr uint16_t kAudreamLogoBackgroundColor = 0x0000;
+constexpr uint16_t kAudreamLogoForegroundColor = 0xFFFF;
+static_assert(kAudreamLogoWidth <= DISPLAY_WIDTH);
+static_assert(kAudreamLogoHeight <= DISPLAY_HEIGHT);
+
+constexpr uint8_t kAudreamLogoGlyphs[kAudreamLogoGlyphCount][kAudreamLogoGlyphHeight] = {
+    {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001},  // A
+    {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110},  // U
+    {0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110},  // D
+    {0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001},  // R
+    {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111},  // E
+    {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001},  // A
+    {0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001},  // M
+};
 
 }  // namespace
 
@@ -229,6 +251,7 @@ private:
     bool recording_feedback_pulse_pending_ = false;
     esp_lcd_panel_handle_t recording_feedback_panel_ = nullptr;
     uint16_t* recording_feedback_draw_buffer_ = nullptr;
+    uint16_t* recording_feedback_logo_tile_buffer_ = nullptr;
     bool pending_deep_sleep_recording_ = false;
     bool suppress_next_wake_long_press_ = false;
     int64_t deep_sleep_wake_button_down_us_ = 0;
@@ -414,7 +437,11 @@ private:
                 return false;
             }
         }
-        std::fill_n(recording_feedback_draw_buffer_, pixel_count, kRecordingFeedbackColor);
+        std::fill_n(
+            recording_feedback_draw_buffer_,
+            pixel_count,
+            kAudreamLogoBackgroundColor
+        );
 
         for (int y = 0; y < DISPLAY_HEIGHT; y += kRecordingFeedbackDrawRows) {
             const int y_end = std::min(
@@ -437,6 +464,66 @@ private:
                     esp_err_to_name(draw_result)
                 );
                 return false;
+            }
+        }
+
+        constexpr size_t logo_tile_pixel_count =
+            kAudreamLogoGlyphScale * kAudreamLogoGlyphScale;
+        if (recording_feedback_logo_tile_buffer_ == nullptr) {
+            recording_feedback_logo_tile_buffer_ = static_cast<uint16_t*>(heap_caps_malloc(
+                logo_tile_pixel_count * sizeof(uint16_t),
+                MALLOC_CAP_DMA | MALLOC_CAP_8BIT
+            ));
+            if (recording_feedback_logo_tile_buffer_ == nullptr) {
+                ESP_LOGE(
+                    TAG,
+                    "Failed to allocate recording feedback logo buffer: bytes=%u",
+                    static_cast<unsigned int>(logo_tile_pixel_count * sizeof(uint16_t))
+                );
+                return false;
+            }
+        }
+        std::fill_n(
+            recording_feedback_logo_tile_buffer_,
+            logo_tile_pixel_count,
+            kAudreamLogoForegroundColor
+        );
+
+        const int logo_x = ((DISPLAY_WIDTH - kAudreamLogoWidth) / 2) & ~1;
+        const int logo_y = ((DISPLAY_HEIGHT - kAudreamLogoHeight) / 2) & ~1;
+        const int glyph_advance =
+            kAudreamLogoGlyphWidth * kAudreamLogoGlyphScale + kAudreamLogoGlyphSpacing;
+        for (int glyph = 0; glyph < kAudreamLogoGlyphCount; ++glyph) {
+            for (int row = 0; row < kAudreamLogoGlyphHeight; ++row) {
+                const uint8_t row_bits = kAudreamLogoGlyphs[glyph][row];
+                for (int column = 0; column < kAudreamLogoGlyphWidth; ++column) {
+                    const uint8_t mask = 1U << (kAudreamLogoGlyphWidth - column - 1);
+                    if ((row_bits & mask) == 0) {
+                        continue;
+                    }
+                    const int x = logo_x + glyph * glyph_advance +
+                        column * kAudreamLogoGlyphScale;
+                    const int y = logo_y + row * kAudreamLogoGlyphScale;
+                    const esp_err_t draw_result = esp_lcd_panel_draw_bitmap(
+                        recording_feedback_panel_,
+                        x,
+                        y,
+                        x + kAudreamLogoGlyphScale,
+                        y + kAudreamLogoGlyphScale,
+                        recording_feedback_logo_tile_buffer_
+                    );
+                    if (draw_result != ESP_OK) {
+                        ESP_LOGE(
+                            TAG,
+                            "Failed to draw recording feedback logo: glyph=%d row=%d column=%d result=%s",
+                            glyph,
+                            row,
+                            column,
+                            esp_err_to_name(draw_result)
+                        );
+                        return false;
+                    }
+                }
             }
         }
         return true;
