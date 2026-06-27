@@ -24,7 +24,7 @@
 namespace {
 
 constexpr char kTag[] = "TempAPTransfer";
-constexpr uint32_t kSessionExpirySeconds = 300;
+constexpr uint32_t kInactivityExpirySeconds = 45;
 constexpr size_t kHttpBufferSize = 2048;
 constexpr size_t kMinimumInternalHeapBeforeWifi = 48 * 1024;
 
@@ -118,7 +118,7 @@ TemporaryAPTransferSession TemporaryAPTransferService::Start() {
     session_.ssid = BuildStableSSID();
     session_.password = BuildPassword();
     session_.token = RandomHex(16);
-    session_.expires_in_seconds = kSessionExpirySeconds;
+    session_.expires_in_seconds = kInactivityExpirySeconds;
     session_.url = "http://192.168.4.1/download?token=" + session_.token;
 
     if (!StartAccessPointLocked() || !StartHttpServerLocked() || !StartExpiryTimerLocked()) {
@@ -169,6 +169,7 @@ void TemporaryAPTransferService::StopLocked(bool stop_expiry_timer) {
     }
     session_ = {};
     expires_at_us_ = 0;
+    active_downloads_ = 0;
     AudreamPowerManager::GetInstance().SetTemporaryAPTransferActive(false);
 }
 
@@ -198,8 +199,23 @@ void TemporaryAPTransferService::StopFromExpiry() {
     if (!session_.valid) {
         return;
     }
-    ESP_LOGI(kTag, "Temporary AP transfer batch expired");
+    if (active_downloads_ > 0) {
+        ESP_LOGI(kTag, "Temporary AP transfer expiry delayed because a download is active");
+        StartExpiryTimerLocked();
+        return;
+    }
+    ESP_LOGI(kTag, "Temporary AP transfer batch expired after inactivity");
     StopLocked(false);
+}
+
+void TemporaryAPTransferService::FinishDownload() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_downloads_ > 0) {
+        active_downloads_--;
+    }
+    if (session_.valid) {
+        StartExpiryTimerLocked();
+    }
 }
 
 bool TemporaryAPTransferService::IsActive() const {
@@ -320,10 +336,10 @@ bool TemporaryAPTransferService::StartExpiryTimerLocked() {
     }
 
     expires_at_us_ = esp_timer_get_time() +
-        static_cast<int64_t>(kSessionExpirySeconds) * 1000000LL;
+        static_cast<int64_t>(kInactivityExpirySeconds) * 1000000LL;
     const esp_err_t start_result = esp_timer_start_once(
         expiry_timer_,
-        static_cast<uint64_t>(kSessionExpirySeconds) * 1000000ULL
+        static_cast<uint64_t>(kInactivityExpirySeconds) * 1000000ULL
     );
     if (start_result != ESP_OK) {
         ESP_LOGE(
@@ -361,11 +377,22 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
             httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Invalid token");
             return ESP_FAIL;
         }
+        service->active_downloads_++;
         if (!service->StartExpiryTimerLocked()) {
+            service->active_downloads_--;
             httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to extend session");
             return ESP_FAIL;
         }
     }
+
+    struct DownloadGuard {
+        TemporaryAPTransferService* service = nullptr;
+        ~DownloadGuard() {
+            if (service != nullptr) {
+                service->FinishDownload();
+            }
+        }
+    } download_guard{service};
 
     std::string file_path;
     uint32_t size_bytes = 0;

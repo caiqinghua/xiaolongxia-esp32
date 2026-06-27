@@ -37,11 +37,13 @@ private:
     esp_timer_handle_t expiry_timer_ = nullptr;
     TemporaryAPTransferSession session_;
     int64_t expires_at_us_ = 0;
+    size_t active_downloads_ = 0;
 
     static void ExpiryTimerCallback(void* arg);
 
     void StopLocked(bool stop_expiry_timer = true);
     void StopFromExpiry();
+    void FinishDownload();
     bool StartAccessPointLocked();
     bool StartHttpServerLocked();
     bool StartExpiryTimerLocked();
