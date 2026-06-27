@@ -103,6 +103,22 @@ bool EnsureWifiDriverInitialized() {
     return true;
 }
 
+void StopWifiDriver() {
+    esp_err_t ret = esp_wifi_stop();
+    if (ret != ESP_OK &&
+        ret != ESP_ERR_WIFI_NOT_INIT &&
+        ret != ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGW(kTag, "Failed to stop WiFi driver: %s", esp_err_to_name(ret));
+    }
+}
+
+void DeinitializeWifiDriver() {
+    const esp_err_t ret = esp_wifi_deinit();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(kTag, "Failed to deinitialize WiFi driver: %s", esp_err_to_name(ret));
+    }
+}
+
 }  // namespace
 
 TemporaryAPTransferService& TemporaryAPTransferService::GetInstance() {
@@ -112,6 +128,19 @@ TemporaryAPTransferService& TemporaryAPTransferService::GetInstance() {
 
 TemporaryAPTransferSession TemporaryAPTransferService::Start() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (session_.valid && !IsExpiredLocked()) {
+        if (!StartExpiryTimerLocked()) {
+            StopLocked();
+            return {};
+        }
+        ESP_LOGI(
+            kTag,
+            "Reusing active temporary AP transfer batch as %s",
+            session_.ssid.c_str()
+        );
+        return session_;
+    }
+
     StopLocked();
 
     session_ = {};
@@ -162,11 +191,12 @@ void TemporaryAPTransferService::StopLocked(bool stop_expiry_timer) {
         httpd_stop(server_);
         server_ = nullptr;
     }
-    esp_wifi_stop();
+    StopWifiDriver();
     if (ap_netif_ != nullptr) {
         esp_netif_destroy_default_wifi(ap_netif_);
         ap_netif_ = nullptr;
     }
+    DeinitializeWifiDriver();
     session_ = {};
     expires_at_us_ = 0;
     active_downloads_ = 0;
