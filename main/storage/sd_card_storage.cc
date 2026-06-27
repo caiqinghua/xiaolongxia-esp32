@@ -754,6 +754,57 @@ bool SdCardStorage::GetRecordingFilePath(
     return true;
 }
 
+bool SdCardStorage::DeleteRecording(const std::string& recording_id) {
+    ScopedStorageBusy storage_busy;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!IsSafeRecordingID(recording_id) || !GetStatus().mounted) {
+        return false;
+    }
+
+    const std::string audio_path = BuildRecordingPath(recording_id);
+    struct stat audio_stat = {};
+    if (stat(audio_path.c_str(), &audio_stat) != 0 || !S_ISREG(audio_stat.st_mode)) {
+        return false;
+    }
+    if (unlink(audio_path.c_str()) != 0) {
+        ESP_LOGE(
+            kTag,
+            "Failed to delete recording audio file: path=%s error=%s",
+            audio_path.c_str(),
+            std::strerror(errno)
+        );
+        return false;
+    }
+
+    const std::string metadata_path = audio_path + ".json";
+    struct stat metadata_stat = {};
+    const bool metadata_exists = stat(metadata_path.c_str(), &metadata_stat) == 0;
+    if (metadata_exists && unlink(metadata_path.c_str()) != 0) {
+        ESP_LOGW(
+            kTag,
+            "Recording audio was deleted but metadata deletion failed: path=%s error=%s",
+            metadata_path.c_str(),
+            std::strerror(errno)
+        );
+    }
+
+    const uint64_t deleted_bytes = static_cast<uint64_t>(audio_stat.st_size) +
+        (metadata_exists ? static_cast<uint64_t>(metadata_stat.st_size) : 0);
+    cached_status_.recording_bytes =
+        deleted_bytes >= cached_status_.recording_bytes
+            ? 0
+            : cached_status_.recording_bytes - deleted_bytes;
+    cached_status_.free_bytes = std::min(
+        cached_status_.total_bytes,
+        cached_status_.free_bytes + deleted_bytes
+    );
+    cached_status_.estimated_remaining_minutes = static_cast<uint32_t>(
+        cached_status_.free_bytes / kEstimatedOpusBytesPerMinute
+    );
+    ESP_LOGI(kTag, "Deleted synchronized recording: %s", recording_id.c_str());
+    return true;
+}
+
 bool SdCardStorage::ReadRecordingChunk(
     const std::string& recording_id,
     uint32_t offset,

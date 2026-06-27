@@ -92,6 +92,7 @@ enum class Opcode : uint8_t {
     kStartTemporaryAPTransfer = 0x25,
     kCompleteTemporaryAPTransfer = 0x26,
     kRefreshStorageStatus = 0x27,
+    kDeleteLocalRecording = 0x28,
 };
 
 enum class Status : uint8_t {
@@ -723,6 +724,43 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 );
             }
             if (!TemporaryAPTransferService::GetInstance().Complete(token)) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kNotFound),
+                    {}
+                );
+            }
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                {}
+            );
+        }
+
+        case Opcode::kDeleteLocalRecording: {
+            size_t cursor = kRequestHeaderLength;
+            std::string recording_id;
+            if (!ReadString(data, length, cursor, recording_id) || cursor != length) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            auto& recording_service = LocalRecordingService::GetInstance();
+            if (recording_service.IsRecording() &&
+                recording_service.CurrentMetadata().recording_id == recording_id) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kBusy),
+                    {}
+                );
+            }
+            if (!SdCardStorage::GetInstance().DeleteRecording(recording_id)) {
                 return BuildPayloadResponse(
                     opcode_value,
                     request_id,

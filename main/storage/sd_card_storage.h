@@ -53,6 +53,7 @@ public:
         std::string& file_path,
         uint32_t& total_size
     );
+    bool DeleteRecording(const std::string& recording_id);
     bool ReadRecordingChunk(
         const std::string& recording_id,
         uint32_t offset,
