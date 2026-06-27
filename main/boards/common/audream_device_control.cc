@@ -588,14 +588,12 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             }
             const uint8_t max_count = std::clamp<uint8_t>(data[kRequestHeaderLength], 1, 16);
             const uint16_t offset = ReadUInt16(&data[kRequestHeaderLength + 1]);
-            const size_t requested_count = static_cast<size_t>(offset) + max_count;
-            auto recordings = SdCardStorage::GetInstance().ListRecordings(requested_count);
+            auto recordings = SdCardStorage::GetInstance().ListRecordings(offset, max_count);
             std::vector<uint8_t> payload;
             payload.push_back(0);
             uint8_t appended_count = 0;
             std::string first_appended_id;
-            for (size_t index = offset; index < recordings.size(); ++index) {
-                const auto& recording = recordings[index];
+            for (const auto& recording : recordings) {
                 const size_t entry_size =
                     1 + std::min<size_t>(recording.recording_id.size(), 255) +
                     1 + std::min<size_t>(recording.file_name.size(), 255) +
@@ -616,9 +614,9 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             payload[0] = appended_count;
             ESP_LOGI(
                 kTag,
-                "Listed local recordings: requested=%u offset=%u available=%u appended=%u payload_size=%u first=%s",
-                static_cast<unsigned>(requested_count),
+                "Listed local recordings: offset=%u requested=%u returned=%u appended=%u payload_size=%u first=%s",
                 static_cast<unsigned>(offset),
+                static_cast<unsigned>(max_count),
                 static_cast<unsigned>(recordings.size()),
                 static_cast<unsigned>(appended_count),
                 static_cast<unsigned>(payload.size()),
