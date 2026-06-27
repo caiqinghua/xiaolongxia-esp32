@@ -588,7 +588,12 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             }
             const uint8_t max_count = std::clamp<uint8_t>(data[kRequestHeaderLength], 1, 16);
             const uint16_t offset = ReadUInt16(&data[kRequestHeaderLength + 1]);
-            auto recordings = SdCardStorage::GetInstance().ListRecordings(offset, max_count);
+            size_t total_count = 0;
+            auto recordings = SdCardStorage::GetInstance().ListRecordings(
+                offset,
+                max_count,
+                &total_count
+            );
             std::vector<uint8_t> payload;
             payload.push_back(0);
             uint8_t appended_count = 0;
@@ -612,13 +617,14 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 appended_count++;
             }
             payload[0] = appended_count;
+            const bool has_more = offset + appended_count < total_count;
             ESP_LOGI(
                 kTag,
-                "Listed local recordings: offset=%u requested=%u returned=%u appended=%u payload_size=%u first=%s",
+                "Listed local recordings: offset=%u total=%u returned=%u has_more=%d payload_size=%u first=%s",
                 static_cast<unsigned>(offset),
-                static_cast<unsigned>(max_count),
-                static_cast<unsigned>(recordings.size()),
+                static_cast<unsigned>(total_count),
                 static_cast<unsigned>(appended_count),
+                has_more ? 1 : 0,
                 static_cast<unsigned>(payload.size()),
                 first_appended_id.c_str()
             );

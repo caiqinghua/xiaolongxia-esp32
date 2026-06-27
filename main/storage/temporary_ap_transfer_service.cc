@@ -12,18 +12,21 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_wifi_default.h"
+#include "esp_heap_caps.h"
+#include "esp_event.h"
+#include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/ip4_addr.h"
 #include "storage/sd_card_storage.h"
 #include "system/audream_power_manager.h"
-#include "wifi_manager.h"
 
 namespace {
 
 constexpr char kTag[] = "TempAPTransfer";
 constexpr uint32_t kSessionExpirySeconds = 300;
 constexpr size_t kHttpBufferSize = 2048;
+constexpr size_t kMinimumInternalHeapBeforeWifi = 48 * 1024;
 
 std::string RandomHex(size_t bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
@@ -75,6 +78,29 @@ bool QueryValue(httpd_req_t* request, const char* key, char* output, size_t outp
         return false;
     }
     return httpd_query_key_value(query, key, output, output_size) == ESP_OK;
+}
+
+bool EnsureWifiDriverInitialized() {
+    esp_err_t ret = esp_netif_init();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(kTag, "Failed to initialize network interface: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(kTag, "Failed to create default event loop: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
+    config.nvs_enable = false;
+    ret = esp_wifi_init(&config);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(kTag, "Failed to initialize WiFi driver: %s", esp_err_to_name(ret));
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -182,9 +208,18 @@ bool TemporaryAPTransferService::IsActive() const {
 }
 
 bool TemporaryAPTransferService::StartAccessPointLocked() {
-    auto& wifi_manager = WifiManager::GetInstance();
-    if (!wifi_manager.IsInitialized() && !wifi_manager.Initialize()) {
-        ESP_LOGE(kTag, "Failed to initialize WiFi manager");
+    const size_t internal_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (internal_heap < kMinimumInternalHeapBeforeWifi) {
+        ESP_LOGE(
+            kTag,
+            "Insufficient internal heap for temporary AP transfer: free=%u required=%u",
+            static_cast<unsigned>(internal_heap),
+            static_cast<unsigned>(kMinimumInternalHeapBeforeWifi)
+        );
+        return false;
+    }
+
+    if (!EnsureWifiDriverInitialized()) {
         return false;
     }
 
@@ -218,9 +253,9 @@ bool TemporaryAPTransferService::StartAccessPointLocked() {
     wifi_config.ap.channel = 6;
     wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
-    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_AP);
     if (ret != ESP_OK) {
-        ESP_LOGE(kTag, "Failed to set WiFi APSTA mode: %s", esp_err_to_name(ret));
+        ESP_LOGE(kTag, "Failed to set WiFi AP mode: %s", esp_err_to_name(ret));
         return false;
     }
     ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);

@@ -334,6 +334,11 @@ void AudioService::AudioInputTask() {
         }
 
         if (bits & AS_EVENT_LOCAL_RECORDING_RUNNING) {
+            {
+                std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+                local_recording_input_active_ = true;
+                audio_queue_cv_.notify_all();
+            }
             std::vector<int16_t> data;
             int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
             if (ReadAudioData(data, 16000, samples)) {
@@ -345,7 +350,17 @@ void AudioService::AudioInputTask() {
                     data = std::move(mono_data);
                 }
                 PushTaskToEncodeQueue(kAudioTaskTypeEncodeToLocalRecording, std::move(data));
+                {
+                    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+                    local_recording_input_active_ = false;
+                    audio_queue_cv_.notify_all();
+                }
                 continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+                local_recording_input_active_ = false;
+                audio_queue_cv_.notify_all();
             }
         }
 
@@ -502,6 +517,8 @@ void AudioService::OpusCodecTask() {
         if (CanProcessEncodeTask()) {
             auto task = std::move(audio_encode_queue_.front());
             audio_encode_queue_.pop_front();
+            local_recording_encode_active_ =
+                task->type == kAudioTaskTypeEncodeToLocalRecording;
             audio_queue_cv_.notify_all();
             lock.unlock();
 
@@ -550,6 +567,10 @@ void AudioService::OpusCodecTask() {
                          task->pcm.size(), encoder_frame_size_);
             }
             lock.lock();
+            if (local_recording_encode_active_) {
+                local_recording_encode_active_ = false;
+                audio_queue_cv_.notify_all();
+            }
         }
     }
 
@@ -601,6 +622,21 @@ bool AudioService::CanProcessEncodeTask() const {
         return true;
     }
     return audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE;
+}
+
+bool AudioService::HasLocalRecordingEncodeWorkLocked() const {
+    if (local_recording_input_active_) {
+        return true;
+    }
+    if (local_recording_encode_active_) {
+        return true;
+    }
+    for (const auto& task : audio_encode_queue_) {
+        if (task && task->type == kAudioTaskTypeEncodeToLocalRecording) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm) {
@@ -753,6 +789,14 @@ void AudioService::EnableLocalRecording(bool enable) {
             codec_->EnableInput(false);
         }
     }
+}
+
+bool AudioService::WaitForLocalRecordingDrain(uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    const auto timeout = std::chrono::milliseconds(timeout_ms);
+    return audio_queue_cv_.wait_for(lock, timeout, [this]() {
+        return !HasLocalRecordingEncodeWorkLocked();
+    });
 }
 
 void AudioService::SetLocalRecordingPacketCallback(std::function<void(const uint8_t*, size_t)> callback) {

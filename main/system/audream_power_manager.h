@@ -10,7 +10,7 @@
 
 enum class AudreamPowerState {
     kActive,
-    kLightSleep,
+    kIdle,
     kDeepSleepPreparing,
 };
 
@@ -38,7 +38,7 @@ private:
     AudreamPowerState state_ = AudreamPowerState::kActive;
     int64_t last_user_activity_us_ = 0;
     int64_t active_timeout_us_ = 45LL * 1000000LL;
-    int64_t light_sleep_started_us_ = 0;
+    int64_t idle_started_us_ = 0;
     bool recording_active_ = false;
     bool ble_file_transfer_active_ = false;
     bool temporary_ap_transfer_active_ = false;
@@ -51,6 +51,6 @@ private:
     void Tick();
     bool HasBlockerLocked() const;
     void EnterActiveLocked(const char* reason, int64_t now_us);
-    void EnterLightSleepLocked(int64_t now_us);
+    void EnterIdleLocked(int64_t now_us);
     void EnterDeepSleep();
 };

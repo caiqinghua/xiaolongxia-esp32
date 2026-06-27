@@ -13,15 +13,15 @@
 namespace {
 
 constexpr char kTag[] = "AudreamPower";
-constexpr int64_t kLightSleepToDeepSleepUs = 180LL * 1000000LL;
+constexpr int64_t kIdleToDeepSleepUs = 180LL * 1000000LL;
 constexpr int64_t kTickDelayMs = 1000;
 
 const char* StateName(AudreamPowerState state) {
     switch (state) {
         case AudreamPowerState::kActive:
             return "active";
-        case AudreamPowerState::kLightSleep:
-            return "light_sleep";
+        case AudreamPowerState::kIdle:
+            return "idle";
         case AudreamPowerState::kDeepSleepPreparing:
             return "deep_sleep_preparing";
     }
@@ -184,17 +184,17 @@ void AudreamPowerManager::Tick() {
 
         if (state_ == AudreamPowerState::kActive) {
             if (!HasBlockerLocked() && now_us - last_user_activity_us_ >= active_timeout_us_) {
-                EnterLightSleepLocked(now_us);
+                EnterIdleLocked(now_us);
             }
             return;
         }
 
-        if (state_ == AudreamPowerState::kLightSleep) {
+        if (state_ == AudreamPowerState::kIdle) {
             if (HasBlockerLocked()) {
                 EnterActiveLocked("blocker_started", now_us);
                 return;
             }
-            if (now_us - light_sleep_started_us_ < kLightSleepToDeepSleepUs) {
+            if (now_us - idle_started_us_ < kIdleToDeepSleepUs) {
                 return;
             }
             state_ = AudreamPowerState::kDeepSleepPreparing;
@@ -217,7 +217,7 @@ bool AudreamPowerManager::HasBlockerLocked() const {
 void AudreamPowerManager::EnterActiveLocked(const char* reason, int64_t now_us) {
     const auto previous_state = state_;
     state_ = AudreamPowerState::kActive;
-    light_sleep_started_us_ = 0;
+    idle_started_us_ = 0;
     last_user_activity_us_ = now_us;
     ESP_LOGI(
         kTag,
@@ -227,10 +227,10 @@ void AudreamPowerManager::EnterActiveLocked(const char* reason, int64_t now_us) 
     );
 }
 
-void AudreamPowerManager::EnterLightSleepLocked(int64_t now_us) {
-    state_ = AudreamPowerState::kLightSleep;
-    light_sleep_started_us_ = now_us;
-    ESP_LOGI(kTag, "Power state active -> light_sleep");
+void AudreamPowerManager::EnterIdleLocked(int64_t now_us) {
+    state_ = AudreamPowerState::kIdle;
+    idle_started_us_ = now_us;
+    ESP_LOGI(kTag, "Power state active -> idle");
 }
 
 void AudreamPowerManager::EnterDeepSleep() {
@@ -262,8 +262,8 @@ void AudreamPowerManager::EnterDeepSleep() {
                 static_cast<int>(wake_gpio_)
             );
             std::lock_guard<std::mutex> lock(mutex_);
-            state_ = AudreamPowerState::kLightSleep;
-            light_sleep_started_us_ = esp_timer_get_time();
+            state_ = AudreamPowerState::kIdle;
+            idle_started_us_ = esp_timer_get_time();
             return;
         }
         const esp_err_t wake_result = esp_sleep_enable_ext0_wakeup(wake_gpio_, 0);
@@ -275,7 +275,7 @@ void AudreamPowerManager::EnterDeepSleep() {
                 esp_err_to_name(wake_result)
             );
             std::lock_guard<std::mutex> lock(mutex_);
-            state_ = AudreamPowerState::kLightSleep;
+            state_ = AudreamPowerState::kIdle;
             return;
         }
     }

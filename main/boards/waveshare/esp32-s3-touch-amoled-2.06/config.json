@@ -8,7 +8,10 @@
                 "CONFIG_USE_WECHAT_MESSAGE_STYLE=n",
                 "CONFIG_USE_DEVICE_AEC=y",
                 "CONFIG_PM_ENABLE=y",
-                "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y"
+                "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y",
+                "CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/32m.csv\"",
+                "# CONFIG_LIBC_NEWLIB_NANO_FORMAT is not set"
             ]
         }
     ]

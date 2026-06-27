@@ -980,7 +980,10 @@ public:
             return;
         }
         AudreamPowerManager::GetInstance().SetBeforeDeepSleepCallback([]() {
-            Blufi::GetInstance().SendDeviceWillSleepEvent();
+            auto& blufi = Blufi::GetInstance();
+            blufi.SendDeviceWillSleepEvent();
+            vTaskDelay(pdMS_TO_TICKS(200));
+            blufi.deinit();
         });
     }
 

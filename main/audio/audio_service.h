@@ -130,6 +130,7 @@ public:
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
     void EnableLocalRecording(bool enable);
+    bool WaitForLocalRecordingDrain(uint32_t timeout_ms);
     void SetLocalRecordingPacketCallback(std::function<void(const uint8_t*, size_t)> callback);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
@@ -186,6 +187,8 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    bool local_recording_input_active_ = false;
+    bool local_recording_encode_active_ = false;
     std::function<void(const uint8_t*, size_t)> local_recording_packet_callback_;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
@@ -197,6 +200,7 @@ private:
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     bool CanProcessEncodeTask() const;
+    bool HasLocalRecordingEncodeWorkLocked() const;
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();
 };

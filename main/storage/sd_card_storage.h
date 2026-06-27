@@ -47,7 +47,11 @@ public:
     std::string RecordingsDirectory() const;
     bool EnsureRecordingsDirectory();
     bool SetRecordingMtime(const std::string& recording_id, uint64_t started_at_unix_ms);
-    std::vector<StoredRecordingInfo> ListRecordings(size_t offset, size_t max_count);
+    std::vector<StoredRecordingInfo> ListRecordings(
+        size_t offset,
+        size_t max_count,
+        size_t* total_count = nullptr
+    );
     bool GetRecordingFilePath(
         const std::string& recording_id,
         std::string& file_path,

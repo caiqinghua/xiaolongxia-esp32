@@ -655,9 +655,16 @@ bool SdCardStorage::SetRecordingMtime(
     return ApplyRecordingMtime(audio_path, metadata_path, started_at_unix_ms);
 }
 
-std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t offset, size_t max_count) {
+std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(
+    size_t offset,
+    size_t max_count,
+    size_t* total_count
+) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<StoredRecordingInfo> result;
+    if (total_count != nullptr) {
+        *total_count = 0;
+    }
     if (!GetStatus().mounted) {
         return result;
     }
@@ -761,7 +768,7 @@ std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t offset, si
     result.reserve(std::min(max_count, entries.size()));
     size_t valid_index = 0;
     for (auto& entry : entries) {
-        if (result.size() >= max_count) {
+        if (total_count == nullptr && result.size() >= max_count) {
             break;
         }
         if (!entry.metadata_loaded) {
@@ -771,7 +778,14 @@ std::vector<StoredRecordingInfo> SdCardStorage::ListRecordings(size_t offset, si
         if (entry.info.duration_ms == 0) {
             continue;
         }
-        if (valid_index++ < offset) {
+        const size_t current_index = valid_index++;
+        if (total_count != nullptr) {
+            *total_count = valid_index;
+        }
+        if (current_index < offset) {
+            continue;
+        }
+        if (result.size() >= max_count) {
             continue;
         }
         result.push_back(entry.info);

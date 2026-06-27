@@ -35,6 +35,13 @@ public:
     LocalRecordingMetadata LastMetadata() const;
 
 private:
+    enum class State {
+        kClosed,
+        kOpening,
+        kRecording,
+        kStopping,
+    };
+
     LocalRecordingService() = default;
 
     mutable std::mutex mutex_;
@@ -42,7 +49,7 @@ private:
     LocalRecordingMetadata current_;
     LocalRecordingMetadata last_;
     int64_t started_at_us_ = 0;
-    bool recording_ = false;
+    State state_ = State::kClosed;
 
     bool WriteMetadataFile(const LocalRecordingMetadata& metadata) const;
 };

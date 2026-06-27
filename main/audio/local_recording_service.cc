@@ -21,6 +21,7 @@ constexpr char kTag[] = "LocalRecording";
 constexpr uint32_t kSampleRate = 16000;
 constexpr uint8_t kChannels = 1;
 constexpr uint32_t kFrameSamples = 960;
+constexpr uint32_t kStopDrainTimeoutMs = 3000;
 
 void XorBytes(uint8_t* target, size_t target_size, const uint8_t* source, size_t source_size) {
     for (size_t i = 0; i < source_size; ++i) {
@@ -93,59 +94,92 @@ LocalRecordingService& LocalRecordingService::GetInstance() {
 }
 
 bool LocalRecordingService::Start(AudioService& audio_service) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (recording_) {
-        ESP_LOGW(kTag, "Local recording start ignored because recording is already active");
-        return false;
-    }
-    auto& storage = SdCardStorage::GetInstance();
-    auto storage_status = storage.GetStatus();
-    if (!storage_status.mounted) {
-        ESP_LOGE(
-            kTag,
-            "Local recording start failed because storage is unavailable, error_code=%lu",
-            static_cast<unsigned long>(storage_status.error_code)
-        );
-        return false;
-    }
-
-    current_ = {};
-    current_.recording_id = BuildRecordingID();
-    current_.file_name = current_.recording_id + ".opus";
-    current_.file_path = storage.RecordingsDirectory() + "/" + current_.file_name;
-    if (!writer_.Open(current_.file_path.c_str(), kSampleRate, kChannels, kFrameSamples)) {
-        ESP_LOGE(kTag, "Failed to open local recording writer: %s", current_.file_path.c_str());
-        current_ = {};
-        return false;
-    }
-
-    started_at_us_ = esp_timer_get_time();
-    auto& time_service = DeviceTimeService::GetInstance();
-    current_.rtc_epoch_seq = time_service.RtcEpochSeq();
-    current_.started_at_uptime_ms = static_cast<uint64_t>(started_at_us_ / 1000);
-    current_.started_at_rtc_ms = esp_rtc_get_time_us() / 1000;
-    current_.started_at_unix_ms = time_service.CurrentUnixTimeMs();
-    current_.time_synchronized = time_service.IsSynchronized();
-    recording_ = true;
-    audio_service.SetLocalRecordingPacketCallback(
-        [this](const uint8_t* data, size_t size) {
-            HandleOpusPacket(data, size);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != State::kClosed) {
+            ESP_LOGW(kTag, "Local recording start ignored because the recorder is busy");
+            return false;
         }
-    );
-    AudreamPowerManager::GetInstance().SetRecordingActive(true);
-    audio_service.EnableLocalRecording(true);
-    ESP_LOGI(kTag, "Started local recording: %s", current_.file_path.c_str());
+        state_ = State::kOpening;
+    }
+
+    bool started = false;
+    do {
+        auto& storage = SdCardStorage::GetInstance();
+        auto storage_status = storage.GetStatus();
+        if (!storage_status.mounted) {
+            ESP_LOGE(
+                kTag,
+                "Local recording start failed because storage is unavailable, error_code=%lu",
+                static_cast<unsigned long>(storage_status.error_code)
+            );
+            break;
+        }
+
+        LocalRecordingMetadata metadata = {};
+        metadata.recording_id = BuildRecordingID();
+        metadata.file_name = metadata.recording_id + ".opus";
+        metadata.file_path = storage.RecordingsDirectory() + "/" + metadata.file_name;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            current_ = metadata;
+            if (!writer_.Open(current_.file_path.c_str(), kSampleRate, kChannels, kFrameSamples)) {
+                ESP_LOGE(kTag, "Failed to open local recording writer: %s", current_.file_path.c_str());
+                current_ = {};
+                break;
+            }
+
+            started_at_us_ = esp_timer_get_time();
+            auto& time_service = DeviceTimeService::GetInstance();
+            current_.rtc_epoch_seq = time_service.RtcEpochSeq();
+            current_.started_at_uptime_ms = static_cast<uint64_t>(started_at_us_ / 1000);
+            current_.started_at_rtc_ms = esp_rtc_get_time_us() / 1000;
+            current_.started_at_unix_ms = time_service.CurrentUnixTimeMs();
+            current_.time_synchronized = time_service.IsSynchronized();
+            state_ = State::kRecording;
+        }
+
+        audio_service.SetLocalRecordingPacketCallback(
+            [this](const uint8_t* data, size_t size) {
+                HandleOpusPacket(data, size);
+            }
+        );
+        AudreamPowerManager::GetInstance().SetRecordingActive(true);
+        audio_service.EnableLocalRecording(true);
+        started = true;
+    } while (false);
+
+    if (!started) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        writer_.Close();
+        current_ = {};
+        started_at_us_ = 0;
+        state_ = State::kClosed;
+        return false;
+    }
+
+    const auto metadata = CurrentMetadata();
+    ESP_LOGI(kTag, "Started local recording: %s", metadata.file_path.c_str());
     return true;
 }
 
 LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!recording_) {
-        return last_;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != State::kRecording) {
+            return last_;
+        }
+        state_ = State::kStopping;
     }
 
     audio_service.EnableLocalRecording(false);
+    if (!audio_service.WaitForLocalRecordingDrain(kStopDrainTimeoutMs)) {
+        ESP_LOGW(kTag, "Local recording stop continued before encoder queue fully drained");
+    }
     audio_service.SetLocalRecordingPacketCallback(nullptr);
+
+    std::lock_guard<std::mutex> lock(mutex_);
     writer_.Close();
 
     current_.duration_ms = static_cast<uint32_t>(
@@ -172,7 +206,7 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
         current_.started_at_unix_ms
     );
     last_ = current_;
-    recording_ = false;
+    state_ = State::kClosed;
     AudreamPowerManager::GetInstance().SetRecordingActive(false);
     AudreamPowerManager::GetInstance().NotifyUserActivity("recording_stopped", 120);
     ESP_LOGI(
@@ -188,7 +222,7 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
 
 void LocalRecordingService::HandleOpusPacket(const uint8_t* data, size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!recording_) {
+    if (state_ != State::kRecording && state_ != State::kStopping) {
         return;
     }
     if (!writer_.WritePacket(data, size)) {
@@ -198,7 +232,9 @@ void LocalRecordingService::HandleOpusPacket(const uint8_t* data, size_t size) {
 
 bool LocalRecordingService::IsRecording() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return recording_;
+    return state_ == State::kOpening ||
+        state_ == State::kRecording ||
+        state_ == State::kStopping;
 }
 
 LocalRecordingMetadata LocalRecordingService::CurrentMetadata() const {
