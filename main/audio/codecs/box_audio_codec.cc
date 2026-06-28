@@ -179,6 +179,15 @@ void BoxAudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_
     ESP_LOGI(TAG, "Duplex channels created");
 }
 
+void BoxAudioCodec::EnsureChannelEnabled(i2s_chan_handle_t handle) {
+    i2s_chan_info_t channel_info = {};
+    esp_err_t result = i2s_channel_get_info(handle, &channel_info);
+    if (result != ESP_OK || channel_info.is_enabled) {
+        return;
+    }
+    ESP_ERROR_CHECK(i2s_channel_enable(handle));
+}
+
 void BoxAudioCodec::SetOutputVolume(int volume) {
     ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
     AudioCodec::SetOutputVolume(volume);
@@ -200,6 +209,10 @@ void BoxAudioCodec::EnableInput(bool enable) {
         if (input_reference_) {
             fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
         }
+        // esp_codec_dev disables RX and its paired TX before reconfiguring them.
+        // Keep the driver state valid so repeated recording starts do not log ESP_ERR_INVALID_STATE.
+        EnsureChannelEnabled(rx_handle_);
+        EnsureChannelEnabled(tx_handle_);
         ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
         ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
     } else {

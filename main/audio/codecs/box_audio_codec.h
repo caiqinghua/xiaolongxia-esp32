@@ -3,6 +3,7 @@
 
 #include "audio_codec.h"
 
+#include <driver/i2s_common.h>
 #include <esp_codec_dev.h>
 #include <esp_codec_dev_defaults.h>
 #include <mutex>
@@ -22,6 +23,7 @@ private:
     std::mutex data_if_mutex_;
 
     void CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din);
+    void EnsureChannelEnabled(i2s_chan_handle_t handle);
 
     virtual int Read(int16_t* dest, int samples) override;
     virtual int Write(const int16_t* data, int samples) override;
