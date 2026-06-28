@@ -42,6 +42,7 @@ public:
     void StartInitializationTask();
     bool Mount();
     bool IsMounted() const;
+    void PrepareForDeepSleep();
     StorageStatus ProbeAndMountStatus();
     StorageStatus GetStatus();
     std::string RecordingsDirectory() const;

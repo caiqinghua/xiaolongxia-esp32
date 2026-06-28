@@ -64,6 +64,8 @@ constexpr uint32_t kProbeMaxAttempts = 3;
 constexpr time_t kMinimumReasonableRecordingMtime = 1704067200;
 constexpr uint64_t kEpochSortStrideMs = 1000000000000ULL;
 
+sdmmc_card_t* mounted_card = nullptr;
+
 struct RecordingScanEntry {
     StoredRecordingInfo info;
     uint64_t sort_key = 0;
@@ -508,6 +510,7 @@ bool SdCardStorage::Mount() {
     }
 
     mounted_ = true;
+    mounted_card = card;
     last_error_code_ = StorageStatusErrorCode::kNone;
     sdmmc_card_print_info(stdout, card);
     ESP_LOGI(kTag, "SD card mounted at %s", kMountPoint);
@@ -517,6 +520,29 @@ bool SdCardStorage::Mount() {
 bool SdCardStorage::IsMounted() const {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     return ready_;
+}
+
+void SdCardStorage::PrepareForDeepSleep() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (mounted_card == nullptr) {
+        return;
+    }
+    const esp_err_t unmount_result =
+        esp_vfs_fat_sdcard_unmount(kMountPoint, mounted_card);
+    if (unmount_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "Failed to unmount SD card before deep sleep: %s",
+            esp_err_to_name(unmount_result)
+        );
+    } else {
+        ESP_LOGI(kTag, "SD card unmounted before deep sleep");
+    }
+    mounted_card = nullptr;
+    mounted_ = false;
+    ready_ = false;
+    cached_status_ = {};
+    last_error_code_ = StorageStatusErrorCode::kNone;
 }
 
 StorageStatus SdCardStorage::GetStatus() {

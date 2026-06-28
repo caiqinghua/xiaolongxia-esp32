@@ -58,6 +58,16 @@ constexpr uint16_t kAudreamLogoForegroundColor = 0xFFFF;
 static_assert(kAudreamLogoWidth <= DISPLAY_WIDTH);
 static_assert(kAudreamLogoHeight <= DISPLAY_HEIGHT);
 
+void DrivePinLowForDeepSleep(gpio_num_t pin) {
+    if (pin == GPIO_NUM_NC) {
+        return;
+    }
+    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(pin, 0);
+    gpio_pullup_dis(pin);
+    gpio_pulldown_en(pin);
+}
+
 constexpr uint8_t kAudreamLogoGlyphs[kAudreamLogoGlyphCount][kAudreamLogoGlyphHeight] = {
     {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001},  // A
     {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110},  // U
@@ -98,6 +108,7 @@ public:
         WriteReg(0x62, 0x0A); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
         WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
     }
+
 };
 
 #define LCD_OPCODE_WRITE_CMD (0x02ULL)
@@ -192,6 +203,14 @@ public:
         }
         const esp_err_t display_on_result = SendCommand(0x29, nullptr, 0);
         return display_on_result == ESP_OK;
+    }
+
+    void PrepareForDeepSleep() {
+        SetImmediateBrightness(0);
+        SendCommand(0x28, nullptr, 0);
+        SendCommand(0x10, nullptr, 0);
+        esp_rom_delay_us(120000);
+        panel_awake_ = false;
     }
 
 protected:
@@ -673,6 +692,90 @@ private:
         backlight_->SetImmediateBrightness(0);
     }
 
+    void ConfigureDisplayPinsForDeepSleep() {
+        static constexpr gpio_num_t kDisplayPins[] = {
+            EXAMPLE_PIN_NUM_LCD_CS,
+            EXAMPLE_PIN_NUM_LCD_PCLK,
+            EXAMPLE_PIN_NUM_LCD_DATA0,
+            EXAMPLE_PIN_NUM_LCD_DATA1,
+            EXAMPLE_PIN_NUM_LCD_DATA2,
+            EXAMPLE_PIN_NUM_LCD_DATA3,
+            EXAMPLE_PIN_NUM_LCD_RST,
+        };
+        for (const gpio_num_t pin : kDisplayPins) {
+            DrivePinLowForDeepSleep(pin);
+        }
+    }
+
+    void ConfigureSdPinsForDeepSleep() {
+        static constexpr gpio_num_t kSdPins[] = {
+            AUDREAM_SD_CLK_GPIO,
+            AUDREAM_SD_MOSI_GPIO,
+            AUDREAM_SD_MISO_GPIO,
+            AUDREAM_SD_CS_GPIO,
+        };
+        for (const gpio_num_t pin : kSdPins) {
+            DrivePinLowForDeepSleep(pin);
+        }
+    }
+
+    void ConfigureAudioPinsForDeepSleep() {
+        static constexpr gpio_num_t kAudioPins[] = {
+            AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK,
+            AUDIO_I2S_GPIO_WS,
+            AUDIO_I2S_GPIO_DIN,
+            AUDIO_I2S_GPIO_DOUT,
+            AUDIO_CODEC_PA_PIN,
+        };
+        for (const gpio_num_t pin : kAudioPins) {
+            DrivePinLowForDeepSleep(pin);
+        }
+    }
+
+    void PrepareAudioForDeepSleep() {
+        auto* codec = GetAudioCodec();
+        if (codec == nullptr) {
+            return;
+        }
+        if (codec->output_enabled()) {
+            codec->SetOutputVolume(0);
+        }
+        codec->EnableInput(false);
+        codec->EnableOutput(false);
+    }
+
+    void PrepareBoardForDeepSleep() {
+        if (recording_feedback_screen_timer_ != nullptr) {
+            const esp_err_t stop_result = esp_timer_stop(recording_feedback_screen_timer_);
+            if (stop_result != ESP_OK && stop_result != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(
+                    TAG,
+                    "Failed to stop recording feedback screen timer before deep sleep: %s",
+                    esp_err_to_name(stop_result)
+                );
+            }
+        }
+        if (power_status_timer_ != nullptr) {
+            const esp_err_t stop_result = esp_timer_stop(power_status_timer_);
+            if (stop_result != ESP_OK && stop_result != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(
+                    TAG,
+                    "Failed to stop power status timer before deep sleep: %s",
+                    esp_err_to_name(stop_result)
+                );
+            }
+        }
+        if (backlight_ != nullptr) {
+            backlight_->PrepareForDeepSleep();
+        }
+        PrepareAudioForDeepSleep();
+        SdCardStorage::GetInstance().PrepareForDeepSleep();
+        ConfigureSdPinsForDeepSleep();
+        ConfigureDisplayPinsForDeepSleep();
+        ConfigureAudioPinsForDeepSleep();
+    }
+
     void InitializeTouch() {
         esp_lcd_touch_handle_t tp;
         esp_lcd_touch_config_t tp_cfg = {
@@ -979,11 +1082,12 @@ public:
             ESP_LOGE(TAG, "Failed to start Audream BLE control: %s", esp_err_to_name(result));
             return;
         }
-        AudreamPowerManager::GetInstance().SetBeforeDeepSleepCallback([]() {
+        AudreamPowerManager::GetInstance().SetBeforeDeepSleepCallback([this]() {
             auto& blufi = Blufi::GetInstance();
             blufi.SendDeviceWillSleepEvent();
             vTaskDelay(pdMS_TO_TICKS(200));
             blufi.deinit();
+            PrepareBoardForDeepSleep();
         });
     }
 
