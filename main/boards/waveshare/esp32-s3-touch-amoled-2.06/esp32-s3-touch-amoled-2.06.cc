@@ -68,6 +68,15 @@ void DrivePinLowForDeepSleep(gpio_num_t pin) {
     gpio_pulldown_en(pin);
 }
 
+void ReleasePinForDeepSleep(gpio_num_t pin) {
+    if (pin == GPIO_NUM_NC) {
+        return;
+    }
+    gpio_set_direction(pin, GPIO_MODE_INPUT);
+    gpio_pullup_dis(pin);
+    gpio_pulldown_dis(pin);
+}
+
 constexpr uint8_t kAudreamLogoGlyphs[kAudreamLogoGlyphCount][kAudreamLogoGlyphHeight] = {
     {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001},  // A
     {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110},  // U
@@ -107,6 +116,12 @@ public:
         WriteReg(0x61, 0x02); // set Main battery precharge current to 50mA
         WriteReg(0x62, 0x0A); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
         WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
+    }
+
+    void PrepareForDeepSleep() {
+        WriteReg(0x90, 0x00);
+        WriteReg(0x91, 0x00);
+        ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1/ALDO2/ALDO3/ALDO4 off");
     }
 
 };
@@ -733,6 +748,11 @@ private:
         }
     }
 
+    void ConfigureI2cPinsForDeepSleep() {
+        ReleasePinForDeepSleep(AUDIO_CODEC_I2C_SDA_PIN);
+        ReleasePinForDeepSleep(AUDIO_CODEC_I2C_SCL_PIN);
+    }
+
     void PrepareAudioForDeepSleep() {
         auto* codec = GetAudioCodec();
         if (codec == nullptr) {
@@ -774,6 +794,10 @@ private:
         ConfigureSdPinsForDeepSleep();
         ConfigureDisplayPinsForDeepSleep();
         ConfigureAudioPinsForDeepSleep();
+        if (pmic_ != nullptr) {
+            pmic_->PrepareForDeepSleep();
+        }
+        ConfigureI2cPinsForDeepSleep();
     }
 
     void InitializeTouch() {
