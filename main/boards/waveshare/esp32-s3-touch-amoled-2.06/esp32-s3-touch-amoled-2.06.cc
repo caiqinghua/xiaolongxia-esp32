@@ -119,9 +119,12 @@ public:
     }
 
     void PrepareForDeepSleep() {
-        WriteReg(0x90, 0x00);
+        // Keep ALDO1 on because A3V3 powers the codec and ADC devices that share
+        // this I2C bus with the PMIC. If ALDO1 is off, those unpowered devices can
+        // clamp SDA/SCL and prevent the next boot from re-enabling the rail.
+        WriteReg(0x90, 0x01);
         WriteReg(0x91, 0x00);
-        ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1/ALDO2/ALDO3/ALDO4 off");
+        ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1 on, ALDO2/ALDO3/ALDO4 off");
     }
 
 };
