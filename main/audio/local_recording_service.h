@@ -3,10 +3,18 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "audio/ogg_opus_writer.h"
 
 class AudioService;
+
+struct LocalRecordingHighlight {
+    std::string id;
+    std::string kind;
+    std::string source;
+    uint32_t timestamp_ms = 0;
+};
 
 struct LocalRecordingMetadata {
     std::string recording_id;
@@ -29,6 +37,7 @@ public:
 
     bool Start(AudioService& audio_service);
     LocalRecordingMetadata Stop(AudioService& audio_service);
+    bool AddMarkerHighlight(const std::string& source);
     void HandleOpusPacket(const uint8_t* data, size_t size);
     bool IsRecording() const;
     LocalRecordingMetadata CurrentMetadata() const;
@@ -48,6 +57,8 @@ private:
     OggOpusWriter writer_;
     LocalRecordingMetadata current_;
     LocalRecordingMetadata last_;
+    std::vector<LocalRecordingHighlight> current_highlights_;
+    std::vector<LocalRecordingHighlight> last_highlights_;
     int64_t started_at_us_ = 0;
     State state_ = State::kClosed;
 

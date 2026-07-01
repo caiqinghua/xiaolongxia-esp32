@@ -1,7 +1,9 @@
 #include "audio/local_recording_service.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <sstream>
 #include <string>
 #include <sys/stat.h>
 
@@ -86,6 +88,47 @@ uint32_t FileSizeBytes(const std::string& path) {
     return static_cast<uint32_t>(st.st_size);
 }
 
+std::string EscapeJsonString(const std::string& value) {
+    std::string output;
+    output.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+            case '\\':
+                output += "\\\\";
+                break;
+            case '"':
+                output += "\\\"";
+                break;
+            case '\n':
+                output += "\\n";
+                break;
+            case '\r':
+                output += "\\r";
+                break;
+            case '\t':
+                output += "\\t";
+                break;
+            default:
+                output.push_back(ch);
+                break;
+        }
+    }
+    return output;
+}
+
+std::string BuildHighlightID(const std::string& recording_id, uint32_t timestamp_ms, size_t sequence) {
+    char buffer[160] = {};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "%s-%lu-%u",
+        recording_id.c_str(),
+        static_cast<unsigned long>(timestamp_ms),
+        static_cast<unsigned>(sequence)
+    );
+    return std::string(buffer);
+}
+
 }  // namespace
 
 LocalRecordingService& LocalRecordingService::GetInstance() {
@@ -124,6 +167,7 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             current_ = metadata;
+            current_highlights_.clear();
             if (!writer_.Open(current_.file_path.c_str(), kSampleRate, kChannels, kFrameSamples)) {
                 ESP_LOGE(kTag, "Failed to open local recording writer: %s", current_.file_path.c_str());
                 current_ = {};
@@ -154,6 +198,7 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
         std::lock_guard<std::mutex> lock(mutex_);
         writer_.Close();
         current_ = {};
+        current_highlights_.clear();
         started_at_us_ = 0;
         state_ = State::kClosed;
         return false;
@@ -206,6 +251,7 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
         current_.started_at_unix_ms
     );
     last_ = current_;
+    last_highlights_ = current_highlights_;
     state_ = State::kClosed;
     AudreamPowerManager::GetInstance().SetRecordingActive(false);
     AudreamPowerManager::GetInstance().NotifyUserActivity("recording_stopped", 120);
@@ -217,7 +263,31 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
         static_cast<unsigned long>(last_.size_bytes)
     );
     current_ = {};
+    current_highlights_.clear();
     return last_;
+}
+
+bool LocalRecordingService::AddMarkerHighlight(const std::string& source) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ != State::kRecording || started_at_us_ <= 0 || current_.recording_id.empty()) {
+        return false;
+    }
+    const uint32_t timestamp_ms = static_cast<uint32_t>(
+        std::max<int64_t>(0, esp_timer_get_time() - started_at_us_) / 1000
+    );
+    LocalRecordingHighlight highlight;
+    highlight.timestamp_ms = timestamp_ms;
+    highlight.kind = "marker";
+    highlight.source = source;
+    highlight.id = BuildHighlightID(current_.recording_id, timestamp_ms, current_highlights_.size() + 1);
+    current_highlights_.push_back(highlight);
+    ESP_LOGI(
+        kTag,
+        "Added local recording highlight: id=%s timestamp=%lu ms",
+        current_.recording_id.c_str(),
+        static_cast<unsigned long>(timestamp_ms)
+    );
+    return true;
 }
 
 void LocalRecordingService::HandleOpusPacket(const uint8_t* data, size_t size) {
@@ -257,34 +327,49 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
         ESP_LOGE(kTag, "Failed to open recording metadata file: %s", metadata_path.c_str());
         return false;
     }
-    std::fprintf(
-        file,
-        "{"
-        "\"recording_id\":\"%s\","
-        "\"file_name\":\"%s\","
-        "\"rtc_epoch_seq\":%s,"
-        "\"duration_ms\":%lu,"
-        "\"size_bytes\":%lu,"
-        "\"started_at_unix_ms\":%s,"
-        "\"started_at_uptime_ms\":%s,"
-        "\"started_at_rtc_ms\":%s,"
-        "\"time_synchronized\":%s,"
-        "\"codec\":\"opus\","
-        "\"container\":\"ogg\","
-        "\"sample_rate\":16000,"
-        "\"channels\":1,"
-        "\"sync_state\":\"pending\""
-        "}\n",
-        metadata.recording_id.c_str(),
-        metadata.file_name.c_str(),
-        std::to_string(metadata.rtc_epoch_seq).c_str(),
-        static_cast<unsigned long>(metadata.duration_ms),
-        static_cast<unsigned long>(metadata.size_bytes),
-        std::to_string(metadata.started_at_unix_ms).c_str(),
-        std::to_string(metadata.started_at_uptime_ms).c_str(),
-        std::to_string(metadata.started_at_rtc_ms).c_str(),
-        metadata.time_synchronized ? "true" : "false"
-    );
+    std::vector<LocalRecordingHighlight> highlights;
+    if (metadata.recording_id == current_.recording_id) {
+        highlights = current_highlights_;
+    } else if (metadata.recording_id == last_.recording_id) {
+        highlights = last_highlights_;
+    }
+
+    std::ostringstream stream;
+    stream
+        << "{"
+        << "\"schema_version\":1,"
+        << "\"recording_id\":\"" << EscapeJsonString(metadata.recording_id) << "\","
+        << "\"file_name\":\"" << EscapeJsonString(metadata.file_name) << "\","
+        << "\"rtc_epoch_seq\":" << metadata.rtc_epoch_seq << ","
+        << "\"duration_ms\":" << metadata.duration_ms << ","
+        << "\"size_bytes\":" << metadata.size_bytes << ","
+        << "\"started_at_unix_ms\":" << metadata.started_at_unix_ms << ","
+        << "\"started_at_uptime_ms\":" << metadata.started_at_uptime_ms << ","
+        << "\"started_at_rtc_ms\":" << metadata.started_at_rtc_ms << ","
+        << "\"time_synchronized\":" << (metadata.time_synchronized ? "true" : "false") << ","
+        << "\"codec\":\"opus\","
+        << "\"container\":\"ogg\","
+        << "\"sample_rate\":16000,"
+        << "\"channels\":1,"
+        << "\"sync_state\":\"pending\","
+        << "\"highlights\":[";
+    for (size_t index = 0; index < highlights.size(); ++index) {
+        const auto& highlight = highlights[index];
+        if (index > 0) {
+            stream << ",";
+        }
+        stream
+            << "{"
+            << "\"id\":\"" << EscapeJsonString(highlight.id) << "\","
+            << "\"kind\":\"" << EscapeJsonString(highlight.kind) << "\","
+            << "\"source\":\"" << EscapeJsonString(highlight.source) << "\","
+            << "\"timestamp_ms\":" << highlight.timestamp_ms
+            << "}";
+    }
+    stream << "]}\n";
+
+    const std::string content = stream.str();
+    std::fwrite(content.data(), 1, content.size(), file);
     fclose(file);
     return true;
 }

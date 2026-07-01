@@ -851,6 +851,15 @@ private:
                 suppress_next_wake_long_press_ = false;
                 ESP_LOGI(TAG, "Cleared deep sleep wake long press suppression on button release");
             }
+            auto& recording = LocalRecordingService::GetInstance();
+            if (recording.IsRecording()) {
+                if (recording.AddMarkerHighlight("device_button")) {
+                    PulseRecordingFeedbackScreen();
+                    AudreamPowerManager::GetInstance().NotifyUserActivity("recording_highlight");
+                    ESP_LOGI(TAG, "Button added local recording highlight");
+                }
+                return;
+            }
             AudreamPowerManager::GetInstance().NotifyUserActivity("button_click");
         });
         boot_button_.OnLongPress([this]() {

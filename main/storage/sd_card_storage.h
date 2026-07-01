@@ -66,6 +66,13 @@ public:
         std::vector<uint8_t>& output,
         uint32_t& total_size
     );
+    bool ReadRecordingMetadata(
+        const std::string& recording_id,
+        uint32_t offset,
+        size_t max_length,
+        std::vector<uint8_t>& output,
+        uint32_t& total_size
+    );
     size_t BackfillUnsynchronizedRecordingTimes(
         uint64_t synced_unix_time_ms,
         uint64_t synced_rtc_time_ms,

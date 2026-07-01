@@ -30,6 +30,7 @@ private:
     TemporaryAPTransferService() = default;
 
     static esp_err_t DownloadHandler(httpd_req_t* request);
+    static esp_err_t MetadataHandler(httpd_req_t* request);
 
     mutable std::mutex mutex_;
     httpd_handle_t server_ = nullptr;

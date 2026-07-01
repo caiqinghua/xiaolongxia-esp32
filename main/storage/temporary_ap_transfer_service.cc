@@ -340,6 +340,17 @@ bool TemporaryAPTransferService::StartHttpServerLocked() {
         ESP_LOGE(kTag, "Failed to register download handler: %s", esp_err_to_name(ret));
         return false;
     }
+
+    httpd_uri_t metadata_uri = {};
+    metadata_uri.uri = "/metadata*";
+    metadata_uri.method = HTTP_GET;
+    metadata_uri.handler = &TemporaryAPTransferService::MetadataHandler;
+    metadata_uri.user_ctx = this;
+    ret = httpd_register_uri_handler(server_, &metadata_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(kTag, "Failed to register metadata handler: %s", esp_err_to_name(ret));
+        return false;
+    }
     return true;
 }
 
@@ -462,6 +473,93 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
         }
     }
     fclose(file);
+    if (result == ESP_OK) {
+        result = httpd_resp_send_chunk(request, nullptr, 0);
+    }
+    return result;
+}
+
+esp_err_t TemporaryAPTransferService::MetadataHandler(httpd_req_t* request) {
+    auto* service = static_cast<TemporaryAPTransferService*>(request->user_ctx);
+    char token[80] = {};
+    char recording_id[80] = {};
+    if (service == nullptr ||
+        !QueryValue(request, "token", token, sizeof(token)) ||
+        !QueryValue(request, "recording_id", recording_id, sizeof(recording_id))) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing token or recording_id");
+        return ESP_FAIL;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(service->mutex_);
+        if (!service->IsTokenValidLocked(token)) {
+            httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Invalid token");
+            return ESP_FAIL;
+        }
+        service->active_downloads_++;
+        if (!service->StartExpiryTimerLocked()) {
+            service->active_downloads_--;
+            httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to extend session");
+            return ESP_FAIL;
+        }
+    }
+
+    struct DownloadGuard {
+        TemporaryAPTransferService* service = nullptr;
+        ~DownloadGuard() {
+            if (service != nullptr) {
+                service->FinishDownload();
+            }
+        }
+    } download_guard{service};
+
+    uint32_t total_size = 0;
+    uint32_t offset = 0;
+    std::vector<uint8_t> chunk;
+    if (!SdCardStorage::GetInstance().ReadRecordingMetadata(
+            recording_id,
+            offset,
+            kHttpBufferSize,
+            chunk,
+            total_size
+        )) {
+        httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "Recording metadata not found");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    char content_length[16] = {};
+    std::snprintf(content_length, sizeof(content_length), "%lu", static_cast<unsigned long>(total_size));
+    httpd_resp_set_hdr(request, "Content-Length", content_length);
+
+    esp_err_t result = ESP_OK;
+    while (true) {
+        if (!chunk.empty()) {
+            result = httpd_resp_send_chunk(
+                request,
+                reinterpret_cast<const char*>(chunk.data()),
+                chunk.size()
+            );
+            if (result != ESP_OK) {
+                break;
+            }
+            offset += static_cast<uint32_t>(chunk.size());
+        }
+        if (offset >= total_size) {
+            break;
+        }
+        if (!SdCardStorage::GetInstance().ReadRecordingMetadata(
+                recording_id,
+                offset,
+                kHttpBufferSize,
+                chunk,
+                total_size
+            )) {
+            result = ESP_FAIL;
+            break;
+        }
+    }
     if (result == ESP_OK) {
         result = httpd_resp_send_chunk(request, nullptr, 0);
     }

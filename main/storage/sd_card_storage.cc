@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <fstream>
 #include <functional>
+#include <sstream>
 #include <sys/stat.h>
 #include <sys/utime.h>
 #include <sys/unistd.h>
@@ -208,6 +209,52 @@ bool JsonBoolValue(const std::string& content, const std::string& key) {
     return content.compare(cursor, 4, "true") == 0;
 }
 
+std::string ExtractJsonArray(const std::string& content, const std::string& key) {
+    const std::string marker = "\"" + key + "\":";
+    const size_t marker_start = content.find(marker);
+    if (marker_start == std::string::npos) {
+        return "[]";
+    }
+    size_t cursor = marker_start + marker.size();
+    while (cursor < content.size() && std::isspace(static_cast<unsigned char>(content[cursor]))) {
+        cursor++;
+    }
+    if (cursor >= content.size() || content[cursor] != '[') {
+        return "[]";
+    }
+    const size_t array_start = cursor;
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (; cursor < content.size(); ++cursor) {
+        const char ch = content[cursor];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (in_string && ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (ch == '[') {
+            depth++;
+        } else if (ch == ']') {
+            depth--;
+            if (depth == 0) {
+                return content.substr(array_start, cursor - array_start + 1);
+            }
+        }
+    }
+    return "[]";
+}
+
 bool WriteRecordingMetadata(
     const std::string& metadata_path,
     const std::string& recording_id,
@@ -218,41 +265,36 @@ bool WriteRecordingMetadata(
     uint64_t started_at_unix_ms,
     uint64_t started_at_uptime_ms,
     uint64_t started_at_rtc_ms,
-    bool time_synchronized
+    bool time_synchronized,
+    const std::string& highlights_json
 ) {
     FILE* file = fopen(metadata_path.c_str(), "w");
     if (file == nullptr) {
         ESP_LOGE(kTag, "Failed to open recording metadata file: %s", metadata_path.c_str());
         return false;
     }
-    std::fprintf(
-        file,
-        "{"
-        "\"recording_id\":\"%s\","
-        "\"file_name\":\"%s\","
-        "\"rtc_epoch_seq\":%s,"
-        "\"duration_ms\":%lu,"
-        "\"size_bytes\":%lu,"
-        "\"started_at_unix_ms\":%s,"
-        "\"started_at_uptime_ms\":%s,"
-        "\"started_at_rtc_ms\":%s,"
-        "\"time_synchronized\":%s,"
-        "\"codec\":\"opus\","
-        "\"container\":\"ogg\","
-        "\"sample_rate\":16000,"
-        "\"channels\":1,"
-        "\"sync_state\":\"pending\""
-        "}\n",
-        recording_id.c_str(),
-        file_name.c_str(),
-        std::to_string(rtc_epoch_seq).c_str(),
-        static_cast<unsigned long>(duration_ms),
-        static_cast<unsigned long>(size_bytes),
-        std::to_string(started_at_unix_ms).c_str(),
-        std::to_string(started_at_uptime_ms).c_str(),
-        std::to_string(started_at_rtc_ms).c_str(),
-        time_synchronized ? "true" : "false"
-    );
+    std::ostringstream stream;
+    stream
+        << "{"
+        << "\"schema_version\":1,"
+        << "\"recording_id\":\"" << recording_id << "\","
+        << "\"file_name\":\"" << file_name << "\","
+        << "\"rtc_epoch_seq\":" << rtc_epoch_seq << ","
+        << "\"duration_ms\":" << duration_ms << ","
+        << "\"size_bytes\":" << size_bytes << ","
+        << "\"started_at_unix_ms\":" << started_at_unix_ms << ","
+        << "\"started_at_uptime_ms\":" << started_at_uptime_ms << ","
+        << "\"started_at_rtc_ms\":" << started_at_rtc_ms << ","
+        << "\"time_synchronized\":" << (time_synchronized ? "true" : "false") << ","
+        << "\"codec\":\"opus\","
+        << "\"container\":\"ogg\","
+        << "\"sample_rate\":16000,"
+        << "\"channels\":1,"
+        << "\"sync_state\":\"pending\","
+        << "\"highlights\":" << (highlights_json.empty() ? "[]" : highlights_json)
+        << "}\n";
+    const std::string output = stream.str();
+    std::fwrite(output.data(), 1, output.size(), file);
     fclose(file);
     return true;
 }
@@ -931,6 +973,45 @@ bool SdCardStorage::ReadRecordingChunk(
     return bytes_read == length;
 }
 
+bool SdCardStorage::ReadRecordingMetadata(
+    const std::string& recording_id,
+    uint32_t offset,
+    size_t max_length,
+    std::vector<uint8_t>& output,
+    uint32_t& total_size
+) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    output.clear();
+    total_size = 0;
+    if (!IsSafeRecordingID(recording_id) || max_length == 0) {
+        return false;
+    }
+    if (!GetStatus().mounted) {
+        return false;
+    }
+
+    const std::string path = BuildRecordingPath(recording_id) + ".json";
+    total_size = FileSizeBytes(path);
+    if (total_size == 0 || offset > total_size) {
+        return false;
+    }
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        ESP_LOGE(kTag, "Failed to open recording metadata file: %s", path.c_str());
+        return false;
+    }
+    if (fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
+        fclose(file);
+        return false;
+    }
+    const size_t length = std::min<size_t>(max_length, total_size - offset);
+    output.resize(length);
+    const size_t bytes_read = fread(output.data(), 1, length, file);
+    fclose(file);
+    output.resize(bytes_read);
+    return bytes_read == length;
+}
+
 size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
     uint64_t synced_unix_time_ms,
     uint64_t synced_rtc_time_ms,
@@ -992,6 +1073,7 @@ size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
             ReadJsonUInt64(content, "duration_ms")
         );
         const uint32_t size_bytes = static_cast<uint32_t>(st.st_size);
+        const std::string highlights_json = ExtractJsonArray(content, "highlights");
 
         const bool metadata_written = WriteRecordingMetadata(
                 metadata_path,
@@ -1003,7 +1085,8 @@ size_t SdCardStorage::BackfillUnsynchronizedRecordingTimes(
                 started_at_unix_ms,
                 started_at_uptime_ms,
                 started_at_rtc_ms,
-                true
+                true,
+                highlights_json
             );
         if (metadata_written) {
             ApplyRecordingMtime(audio_path, metadata_path, started_at_unix_ms);

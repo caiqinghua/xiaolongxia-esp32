@@ -93,6 +93,7 @@ enum class Opcode : uint8_t {
     kCompleteTemporaryAPTransfer = 0x26,
     kRefreshStorageStatus = 0x27,
     kDeleteLocalRecording = 0x28,
+    kReadLocalRecordingMetadata = 0x29,
 };
 
 enum class Status : uint8_t {
@@ -780,6 +781,53 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 request_id,
                 static_cast<uint8_t>(Status::kSuccess),
                 {}
+            );
+        }
+
+        case Opcode::kReadLocalRecordingMetadata: {
+            ScopedBleFileTransfer transfer_blocker;
+            size_t cursor = kRequestHeaderLength;
+            std::string recording_id;
+            if (!ReadString(data, length, cursor, recording_id) ||
+                cursor + sizeof(uint32_t) + sizeof(uint16_t) != length) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            const uint32_t offset = ReadUInt32(&data[cursor]);
+            cursor += sizeof(uint32_t);
+            const uint16_t requested_length = ReadUInt16(&data[cursor]);
+            const size_t chunk_length = std::min<size_t>(requested_length, kMaxReadChunkBytes);
+            std::vector<uint8_t> chunk;
+            uint32_t total_size = 0;
+            if (!SdCardStorage::GetInstance().ReadRecordingMetadata(
+                    recording_id,
+                    offset,
+                    chunk_length,
+                    chunk,
+                    total_size
+                )) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kNotFound),
+                    {}
+                );
+            }
+            std::vector<uint8_t> payload;
+            AppendUInt32(payload, offset);
+            AppendUInt32(payload, total_size);
+            AppendUInt16(payload, static_cast<uint16_t>(chunk.size()));
+            payload.push_back(offset + chunk.size() >= total_size ? 1 : 0);
+            payload.insert(payload.end(), chunk.begin(), chunk.end());
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                payload
             );
         }
 
