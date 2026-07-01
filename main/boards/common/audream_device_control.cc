@@ -29,7 +29,7 @@ constexpr uint8_t kProtocolVersion = 1;
 constexpr size_t kRequestHeaderLength = 4;
 constexpr uint8_t kResponseOpcodeMask = 0x80;
 constexpr size_t kMaxReadChunkBytes = 96;
-constexpr size_t kMaxListRecordingsPayloadBytes = 180;
+constexpr size_t kMaxListRecordingsPayloadBytes = 220;
 
 constexpr int32_t kDefaultAutoPowerOffSeconds = -1;
 constexpr uint8_t kDefaultMicrophoneGainDb = 24;
@@ -565,6 +565,7 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             AppendUInt32(payload, metadata.duration_ms);
             AppendUInt32(payload, metadata.size_bytes);
             AppendUInt32(payload, metadata.packet_count);
+            AppendUInt64(payload, metadata.started_at_unix_ms);
             AppendString(payload, metadata.recording_id);
             AppendString(payload, metadata.file_name);
             return BuildPayloadResponse(
@@ -603,7 +604,8 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     1 + std::min<size_t>(recording.recording_id.size(), 255) +
                     1 + std::min<size_t>(recording.file_name.size(), 255) +
                     sizeof(uint32_t) +
-                    sizeof(uint32_t);
+                    sizeof(uint32_t) +
+                    sizeof(uint64_t);
                 if (payload.size() + entry_size > kMaxListRecordingsPayloadBytes) {
                     break;
                 }
@@ -614,6 +616,7 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 AppendString(payload, recording.file_name);
                 AppendUInt32(payload, recording.duration_ms);
                 AppendUInt32(payload, recording.size_bytes);
+                AppendUInt64(payload, recording.started_at_unix_ms);
                 appended_count++;
             }
             payload[0] = appended_count;
