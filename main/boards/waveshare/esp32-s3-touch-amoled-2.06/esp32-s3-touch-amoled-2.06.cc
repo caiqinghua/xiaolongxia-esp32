@@ -92,41 +92,75 @@ constexpr uint8_t kAudreamLogoGlyphs[kAudreamLogoGlyphCount][kAudreamLogoGlyphHe
 class Pmic : public Axp2101 {
 public:
     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
-        WriteReg(0x22, 0b110); // PWRON > OFFLEVEL as POWEROFF Source enable
-        WriteReg(0x27, 0x10);  // hold 4s to power off
-
-        // Disable All DCs but DC1
-        WriteReg(0x80, 0x01);
-        // Disable All LDOs
-        WriteReg(0x90, 0x00);
-        WriteReg(0x91, 0x00);
-
-        // Set DC1 to 3.3V
-        WriteReg(0x82, (3300 - 1500) / 100);
-
-        // Set ALDO1 to 3.3V
-        WriteReg(0x92, (3300 - 500) / 100);
-        WriteReg(0x93, (3300 - 500) / 100);
-
-        // Enable ALDO1 and ALDO2.
-        WriteReg(0x90, 0x03);
-
-        WriteReg(0x64, 0x02); // CV charger voltage setting to 4.1V
-
-        WriteReg(0x61, 0x02); // set Main battery precharge current to 50mA
-        WriteReg(0x62, 0x0A); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
-        WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
+        initialized_ = Configure();
     }
 
-    void PrepareForDeepSleep() {
+    bool initialized() const {
+        return initialized_;
+    }
+
+    bool PrepareForDeepSleep() {
         // Keep ALDO1 on because A3V3 powers the codec and ADC devices that share
         // this I2C bus with the PMIC. If ALDO1 is off, those unpowered devices can
         // clamp SDA/SCL and prevent the next boot from re-enabling the rail.
-        WriteReg(0x90, 0x01);
-        WriteReg(0x91, 0x00);
+        if (!WriteRegWithRetry(0x90, 0x01) || !WriteRegWithRetry(0x91, 0x00)) {
+            ESP_LOGE(TAG, "Failed to configure PMIC rails for deep sleep");
+            return false;
+        }
         ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1 on, ALDO2/ALDO3/ALDO4 off");
+        return true;
     }
 
+private:
+    static constexpr int kWriteAttempts = 3;
+    bool initialized_ = false;
+
+    bool Configure() {
+        static constexpr struct {
+            uint8_t reg;
+            uint8_t value;
+        } kConfiguration[] = {
+            {0x22, 0b110},
+            {0x27, 0x10},
+            {0x80, 0x01},
+            {0x90, 0x00},
+            {0x91, 0x00},
+            {0x82, (3300 - 1500) / 100},
+            {0x92, (3300 - 500) / 100},
+            {0x93, (3300 - 500) / 100},
+            {0x90, 0x03},
+            {0x64, 0x02},
+            {0x61, 0x02},
+            {0x62, 0x0A},
+            {0x63, 0x01},
+        };
+        for (const auto& entry : kConfiguration) {
+            if (!WriteRegWithRetry(entry.reg, entry.value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool WriteRegWithRetry(uint8_t reg, uint8_t value) {
+        esp_err_t result = ESP_FAIL;
+        for (int attempt = 1; attempt <= kWriteAttempts; ++attempt) {
+            result = TryWriteReg(reg, value);
+            if (result == ESP_OK) {
+                return true;
+            }
+            ESP_LOGW(
+                TAG,
+                "PMIC register write failed: reg=0x%02x attempt=%d/%d error=%s",
+                reg,
+                attempt,
+                kWriteAttempts,
+                esp_err_to_name(result)
+            );
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        return false;
+    }
 };
 
 #define LCD_OPCODE_WRITE_CMD (0x02ULL)
@@ -309,7 +343,13 @@ private:
 
     void InitializeAxp2101() {
         ESP_LOGI(TAG, "Init AXP2101");
-        pmic_ = new Pmic(i2c_bus_, 0x34);
+        auto* pmic = new Pmic(i2c_bus_, 0x34);
+        if (!pmic->initialized()) {
+            ESP_LOGE(TAG, "AXP2101 initialization failed; continuing without PMIC control");
+            delete pmic;
+            return;
+        }
+        pmic_ = pmic;
     }
 
     void UpdateUsbPowerState(bool force_log = false) {

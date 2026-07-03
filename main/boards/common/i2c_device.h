@@ -10,6 +10,7 @@ public:
 protected:
     i2c_master_dev_handle_t i2c_device_;
 
+    esp_err_t TryWriteReg(uint8_t reg, uint8_t value);
     void WriteReg(uint8_t reg, uint8_t value);
     uint8_t ReadReg(uint8_t reg);
     void ReadRegs(uint8_t reg, uint8_t* buffer, size_t length);

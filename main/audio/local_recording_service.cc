@@ -284,7 +284,7 @@ bool LocalRecordingService::AddMarkerHighlight(const std::string& source) {
     ESP_LOGI(
         kTag,
         "Added local recording highlight: id=%s timestamp=%lu ms",
-        current_.recording_id.c_str(),
+        highlight.id.c_str(),
         static_cast<unsigned long>(timestamp_ms)
     );
     return true;
