@@ -55,8 +55,67 @@ constexpr int kAudreamLogoWidth =
 constexpr int kAudreamLogoHeight = kAudreamLogoGlyphHeight * kAudreamLogoGlyphScale;
 constexpr uint16_t kAudreamLogoBackgroundColor = 0x0000;
 constexpr uint16_t kAudreamLogoForegroundColor = 0xFFFF;
+constexpr uint8_t kAxp2101I2cAddress = 0x34;
+constexpr uint8_t kAxp2101LdoOnOffReg0 = 0x90;
+constexpr uint8_t kAxp2101LdoOnOffReg1 = 0x91;
+constexpr uint8_t kAxp2101Aldo1VoltageReg = 0x92;
+constexpr uint8_t kAxp2101Aldo1EnableMask = 0x01;
+constexpr uint8_t kAxp2101Aldo1Aldo2EnableMask = 0x03;
+constexpr uint8_t kAxp2101Aldo1Voltage3300mv = (3300 - 500) / 100;
 static_assert(kAudreamLogoWidth <= DISPLAY_WIDTH);
 static_assert(kAudreamLogoHeight <= DISPLAY_HEIGHT);
+
+void RecoverI2cPinsBeforeMasterInit() {
+    gpio_config_t io_config = {};
+    io_config.pin_bit_mask = (1ULL << AUDIO_CODEC_I2C_SDA_PIN) | (1ULL << AUDIO_CODEC_I2C_SCL_PIN);
+    io_config.mode = GPIO_MODE_OUTPUT_OD;
+    io_config.pull_up_en = GPIO_PULLUP_ENABLE;
+    io_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_config.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&io_config);
+
+    gpio_set_level(AUDIO_CODEC_I2C_SDA_PIN, 1);
+    gpio_set_level(AUDIO_CODEC_I2C_SCL_PIN, 1);
+    esp_rom_delay_us(1000);
+
+    for (int i = 0; i < 16; ++i) {
+        gpio_set_level(AUDIO_CODEC_I2C_SCL_PIN, 0);
+        esp_rom_delay_us(5);
+        gpio_set_level(AUDIO_CODEC_I2C_SCL_PIN, 1);
+        esp_rom_delay_us(5);
+    }
+
+    gpio_set_level(AUDIO_CODEC_I2C_SDA_PIN, 0);
+    esp_rom_delay_us(5);
+    gpio_set_level(AUDIO_CODEC_I2C_SCL_PIN, 1);
+    esp_rom_delay_us(5);
+    gpio_set_level(AUDIO_CODEC_I2C_SDA_PIN, 1);
+    esp_rom_delay_us(1000);
+}
+
+esp_err_t RawI2cWriteReg(i2c_master_bus_handle_t i2c_bus, uint8_t addr, uint8_t reg, uint8_t value) {
+    i2c_device_config_t i2c_device_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = addr,
+        .scl_speed_hz = 400 * 1000,
+        .scl_wait_us = 0,
+        .flags = {
+            .disable_ack_check = 0,
+        },
+    };
+    i2c_master_dev_handle_t device = nullptr;
+    esp_err_t result = i2c_master_bus_add_device(i2c_bus, &i2c_device_cfg, &device);
+    if (result != ESP_OK) {
+        return result;
+    }
+    uint8_t buffer[2] = {reg, value};
+    result = i2c_master_transmit(device, buffer, sizeof(buffer), 100);
+    const esp_err_t remove_result = i2c_master_bus_rm_device(device);
+    if (result == ESP_OK && remove_result != ESP_OK) {
+        return remove_result;
+    }
+    return result;
+}
 
 void DrivePinLowForDeepSleep(gpio_num_t pin) {
     if (pin == GPIO_NUM_NC) {
@@ -100,14 +159,12 @@ public:
     }
 
     bool PrepareForDeepSleep() {
-        // Keep ALDO1 on because A3V3 powers the codec and ADC devices that share
-        // this I2C bus with the PMIC. If ALDO1 is off, those unpowered devices can
-        // clamp SDA/SCL and prevent the next boot from re-enabling the rail.
-        if (!WriteRegWithRetry(0x90, 0x01) || !WriteRegWithRetry(0x91, 0x00)) {
+        if (!WriteRegWithRetry(kAxp2101LdoOnOffReg1, 0x00) ||
+            !WriteRegWithRetry(kAxp2101LdoOnOffReg0, 0x00)) {
             ESP_LOGE(TAG, "Failed to configure PMIC rails for deep sleep");
             return false;
         }
-        ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1 on, ALDO2/ALDO3/ALDO4 off");
+        ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1/ALDO2/ALDO3/ALDO4 off");
         return true;
     }
 
@@ -123,12 +180,11 @@ private:
             {0x22, 0b110},
             {0x27, 0x10},
             {0x80, 0x01},
-            {0x90, 0x00},
-            {0x91, 0x00},
+            {kAxp2101LdoOnOffReg1, 0x00},
             {0x82, (3300 - 1500) / 100},
-            {0x92, (3300 - 500) / 100},
+            {kAxp2101Aldo1VoltageReg, kAxp2101Aldo1Voltage3300mv},
             {0x93, (3300 - 500) / 100},
-            {0x90, 0x03},
+            {kAxp2101LdoOnOffReg0, kAxp2101Aldo1Aldo2EnableMask},
             {0x64, 0x02},
             {0x61, 0x02},
             {0x62, 0x0A},
@@ -328,7 +384,7 @@ private:
     int64_t deep_sleep_wake_button_down_us_ = 0;
 
     void InitializeCodecI2c() {
-        // Initialize I2C peripheral
+        RecoverI2cPinsBeforeMasterInit();
         i2c_master_bus_config_t i2c_bus_cfg = {
             .i2c_port = I2C_NUM_0,
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
@@ -341,9 +397,44 @@ private:
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
 
+    bool RestoreAldo1BeforePmicInit() {
+        static constexpr int kRestoreAttempts = 5;
+        for (int attempt = 1; attempt <= kRestoreAttempts; ++attempt) {
+            esp_err_t result = RawI2cWriteReg(
+                i2c_bus_,
+                kAxp2101I2cAddress,
+                kAxp2101Aldo1VoltageReg,
+                kAxp2101Aldo1Voltage3300mv
+            );
+            if (result == ESP_OK) {
+                result = RawI2cWriteReg(
+                    i2c_bus_,
+                    kAxp2101I2cAddress,
+                    kAxp2101LdoOnOffReg0,
+                    kAxp2101Aldo1EnableMask
+                );
+            }
+            if (result == ESP_OK) {
+                ESP_LOGI(TAG, "ALDO1 restored before PMIC initialization");
+                vTaskDelay(pdMS_TO_TICKS(150));
+                return true;
+            }
+            ESP_LOGW(
+                TAG,
+                "Failed to restore ALDO1 before PMIC initialization: attempt=%d/%d error=%s",
+                attempt,
+                kRestoreAttempts,
+                esp_err_to_name(result)
+            );
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        ESP_LOGE(TAG, "ALDO1 restore failed before PMIC initialization");
+        return false;
+    }
+
     void InitializeAxp2101() {
         ESP_LOGI(TAG, "Init AXP2101");
-        auto* pmic = new Pmic(i2c_bus_, 0x34);
+        auto* pmic = new Pmic(i2c_bus_, kAxp2101I2cAddress);
         if (!pmic->initialized()) {
             ESP_LOGE(TAG, "AXP2101 initialization failed; continuing without PMIC control");
             delete pmic;
@@ -1132,6 +1223,7 @@ public:
     WaveshareEsp32s3TouchAMOLED2inch06() : boot_button_(BOOT_BUTTON_GPIO, false, kRecordingButtonHoldMs) {
         LogWakeContext();
         InitializeCodecI2c();
+        RestoreAldo1BeforePmicInit();
         InitializeAxp2101();
         InitializeRecordingPowerManagement();
         InitializeRecordingButton();
@@ -1192,6 +1284,9 @@ public:
     }
 
     virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
+        if (pmic_ == nullptr) {
+            return false;
+        }
         charging = pmic_->IsCharging();
         discharging = pmic_->IsDischarging();
 
