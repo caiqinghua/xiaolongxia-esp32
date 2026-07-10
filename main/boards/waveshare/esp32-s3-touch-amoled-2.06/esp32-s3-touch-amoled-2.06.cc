@@ -434,13 +434,44 @@ private:
 
     void InitializeAxp2101() {
         ESP_LOGI(TAG, "Init AXP2101");
+        TryInitializePmic();
+    }
+
+    bool TryInitializePmic() {
+        if (pmic_ != nullptr) {
+            return true;
+        }
         auto* pmic = new Pmic(i2c_bus_, kAxp2101I2cAddress);
         if (!pmic->initialized()) {
             ESP_LOGE(TAG, "AXP2101 initialization failed; continuing without PMIC control");
             delete pmic;
-            return;
+            return false;
         }
         pmic_ = pmic;
+        return true;
+    }
+
+    bool EnsurePmicReadyForDeepSleep() {
+        if (pmic_ != nullptr) {
+            return true;
+        }
+        ESP_LOGW(TAG, "PMIC is unavailable before deep sleep; retrying initialization");
+        static constexpr int kRetryAttempts = 3;
+        for (int attempt = 1; attempt <= kRetryAttempts; ++attempt) {
+            if (TryInitializePmic()) {
+                ESP_LOGI(TAG, "PMIC initialization recovered before deep sleep");
+                return true;
+            }
+            ESP_LOGW(
+                TAG,
+                "PMIC initialization retry before deep sleep failed: attempt=%d/%d",
+                attempt,
+                kRetryAttempts
+            );
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        ESP_LOGE(TAG, "PMIC unavailable before deep sleep; ALDO rails will not be changed");
+        return false;
     }
 
     void UpdateUsbPowerState(bool force_log = false) {
@@ -924,7 +955,7 @@ private:
         ConfigureSdPinsForDeepSleep();
         ConfigureDisplayPinsForDeepSleep();
         ConfigureAudioPinsForDeepSleep();
-        if (pmic_ != nullptr) {
+        if (EnsurePmicReadyForDeepSleep()) {
             pmic_->PrepareForDeepSleep();
         }
         ConfigureI2cPinsForDeepSleep();
