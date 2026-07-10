@@ -24,6 +24,7 @@ private:
 
     void CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din);
     void EnsureChannelEnabled(i2s_chan_handle_t handle);
+    void DisableChannelIfEnabled(i2s_chan_handle_t handle, const char* name);
 
     virtual int Read(int16_t* dest, int samples) override;
     virtual int Write(const int16_t* data, int samples) override;
@@ -37,6 +38,7 @@ public:
     virtual void SetOutputVolume(int volume) override;
     virtual void EnableInput(bool enable) override;
     virtual void EnableOutput(bool enable) override;
+    virtual void PrepareForDeepSleep() override;
 };
 
 #endif // _BOX_AUDIO_CODEC_H

@@ -801,11 +801,7 @@ private:
         if (codec == nullptr) {
             return;
         }
-        if (codec->output_enabled()) {
-            codec->SetOutputVolume(0);
-        }
-        codec->EnableInput(false);
-        codec->EnableOutput(false);
+        codec->PrepareForDeepSleep();
     }
 
     void PrepareBoardForDeepSleep() {
