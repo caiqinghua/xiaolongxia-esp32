@@ -26,6 +26,7 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include "settings.h"
 
@@ -476,6 +477,7 @@ private:
 
     i2c_master_bus_handle_t i2c_bus_;
     Pmic* pmic_ = nullptr;
+    SemaphoreHandle_t pmic_mutex_ = nullptr;
     CustomLcdDisplay* display_ = nullptr;
     CustomBacklight* backlight_ = nullptr;
     Button boot_button_;
@@ -498,6 +500,7 @@ private:
     bool pending_deep_sleep_recording_ = false;
     bool suppress_next_wake_long_press_ = false;
     bool deep_sleep_wake_ = false;
+    bool pmic_recovery_task_started_ = false;
     int64_t deep_sleep_wake_button_down_us_ = 0;
 
     void InitializeCodecI2c() {
@@ -518,44 +521,130 @@ private:
 
     void InitializeAxp2101() {
         ESP_LOGI(TAG, "Init AXP2101");
-        TryInitializePmic();
+        if (!TryInitializePmic()) {
+            SchedulePmicRecoveryTask("initialization");
+        }
     }
 
     bool TryInitializePmic() {
         if (pmic_ != nullptr) {
             return true;
         }
+        if (pmic_mutex_ != nullptr) {
+            xSemaphoreTake(pmic_mutex_, portMAX_DELAY);
+        }
+        if (pmic_ != nullptr) {
+            if (pmic_mutex_ != nullptr) {
+                xSemaphoreGive(pmic_mutex_);
+            }
+            return true;
+        }
         auto* pmic = new Pmic(i2c_bus_, kAxp2101I2cAddress);
         if (!pmic->initialized()) {
             ESP_LOGE(TAG, "AXP2101 initialization failed; continuing without PMIC control");
             delete pmic;
+            if (pmic_mutex_ != nullptr) {
+                xSemaphoreGive(pmic_mutex_);
+            }
             return false;
         }
         pmic_ = pmic;
+        if (pmic_mutex_ != nullptr) {
+            xSemaphoreGive(pmic_mutex_);
+        }
         return true;
     }
 
-    bool EnsurePmicReadyForDeepSleep() {
+    void SchedulePmicRecoveryTask(const char* reason) {
+        if (pmic_ != nullptr || pmic_recovery_task_started_) {
+            return;
+        }
+        pmic_recovery_task_started_ = true;
+        ESP_LOGW(TAG, "Scheduling PMIC recovery task after %s", reason);
+        const BaseType_t result = xTaskCreate(
+            [](void* arg) {
+                auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                if (board != nullptr) {
+                    board->RunPmicRecoveryTask();
+                }
+                vTaskDelete(nullptr);
+            },
+            "pmic_recovery",
+            4096,
+            this,
+            tskIDLE_PRIORITY + 1,
+            nullptr
+        );
+        if (result != pdPASS) {
+            pmic_recovery_task_started_ = false;
+            ESP_LOGE(TAG, "Failed to create PMIC recovery task");
+        }
+    }
+
+    void RunPmicRecoveryTask() {
+        static constexpr int kRetryAttempts = 90;
+        static constexpr TickType_t kRetryDelay = pdMS_TO_TICKS(1000);
+        for (int attempt = 1; attempt <= kRetryAttempts; ++attempt) {
+            if (pmic_ != nullptr) {
+                ESP_LOGI(TAG, "PMIC recovery task stopped because PMIC is already available");
+                return;
+            }
+            if (TryInitializePmic()) {
+                ESP_LOGI(
+                    TAG,
+                    "PMIC recovery task completed: attempt=%d/%d",
+                    attempt,
+                    kRetryAttempts
+                );
+                return;
+            }
+            if (attempt == 1 || attempt % 10 == 0) {
+                ESP_LOGW(
+                    TAG,
+                    "PMIC recovery task still waiting: attempt=%d/%d",
+                    attempt,
+                    kRetryAttempts
+                );
+            }
+            vTaskDelay(kRetryDelay);
+        }
+        pmic_recovery_task_started_ = false;
+        ESP_LOGE(TAG, "PMIC recovery task gave up after retries");
+    }
+
+    bool EnsurePmicReady(const char* reason, int retry_attempts, TickType_t retry_delay) {
         if (pmic_ != nullptr) {
             return true;
         }
-        ESP_LOGW(TAG, "PMIC is unavailable before deep sleep; retrying initialization");
-        static constexpr int kRetryAttempts = 3;
-        for (int attempt = 1; attempt <= kRetryAttempts; ++attempt) {
+        ESP_LOGW(TAG, "PMIC is unavailable before %s; retrying initialization", reason);
+        for (int attempt = 1; attempt <= retry_attempts; ++attempt) {
             if (TryInitializePmic()) {
-                ESP_LOGI(TAG, "PMIC initialization recovered before deep sleep");
+                ESP_LOGI(
+                    TAG,
+                    "PMIC initialization recovered before %s: attempt=%d/%d",
+                    reason,
+                    attempt,
+                    retry_attempts
+                );
                 return true;
             }
             ESP_LOGW(
                 TAG,
-                "PMIC initialization retry before deep sleep failed: attempt=%d/%d",
+                "PMIC initialization retry before %s failed: attempt=%d/%d",
+                reason,
                 attempt,
-                kRetryAttempts
+                retry_attempts
             );
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(retry_delay);
         }
-        ESP_LOGE(TAG, "PMIC unavailable before deep sleep; ALDO rails will not be changed");
+        ESP_LOGE(TAG, "PMIC unavailable before %s after retries", reason);
         return false;
+    }
+
+    bool EnsurePmicReadyForDeepSleep() {
+        static constexpr int kRetryAttempts = 3;
+        static constexpr TickType_t kRetryDelay = pdMS_TO_TICKS(100);
+        return EnsurePmicReady("deep sleep", kRetryAttempts, kRetryDelay);
     }
 
     void UpdateUsbPowerState(bool force_log = false) {
@@ -1339,6 +1428,10 @@ public:
         deep_sleep_wake_ = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0;
         LogWakeContext();
         InitializeCodecI2c();
+        pmic_mutex_ = xSemaphoreCreateMutex();
+        if (pmic_mutex_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create PMIC mutex");
+        }
         InitializeAxp2101();
         InitializeRecordingPowerManagement();
         InitializeRecordingButton();
@@ -1384,6 +1477,7 @@ public:
             AUDIO_CODEC_ES8311_ADDR, 
             AUDIO_CODEC_ES7210_ADDR, 
             AUDIO_INPUT_REFERENCE);
+        SchedulePmicRecoveryTask("audio codec initialization");
         return &audio_codec;
     }
 
