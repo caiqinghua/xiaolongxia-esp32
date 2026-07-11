@@ -6,11 +6,13 @@
 class I2cDevice {
 public:
     I2cDevice(i2c_master_bus_handle_t i2c_bus, uint8_t addr);
+    virtual ~I2cDevice();
 
 protected:
-    i2c_master_dev_handle_t i2c_device_;
+    i2c_master_dev_handle_t i2c_device_ = nullptr;
 
     esp_err_t TryWriteReg(uint8_t reg, uint8_t value);
+    esp_err_t TryReadReg(uint8_t reg, uint8_t* value);
     void WriteReg(uint8_t reg, uint8_t value);
     uint8_t ReadReg(uint8_t reg);
     void ReadRegs(uint8_t reg, uint8_t* buffer, size_t length);

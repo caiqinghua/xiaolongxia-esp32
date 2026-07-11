@@ -19,6 +19,17 @@ I2cDevice::I2cDevice(i2c_master_bus_handle_t i2c_bus, uint8_t addr) {
     assert(i2c_device_ != NULL);
 }
 
+I2cDevice::~I2cDevice() {
+    if (i2c_device_ == nullptr) {
+        return;
+    }
+    const esp_err_t result = i2c_master_bus_rm_device(i2c_device_);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to remove I2C device: %s", esp_err_to_name(result));
+    }
+    i2c_device_ = nullptr;
+}
+
 void I2cDevice::WriteReg(uint8_t reg, uint8_t value) {
     ESP_ERROR_CHECK(TryWriteReg(reg, value));
 }
@@ -28,9 +39,13 @@ esp_err_t I2cDevice::TryWriteReg(uint8_t reg, uint8_t value) {
     return i2c_master_transmit(i2c_device_, buffer, 2, 100);
 }
 
+esp_err_t I2cDevice::TryReadReg(uint8_t reg, uint8_t* value) {
+    return i2c_master_transmit_receive(i2c_device_, &reg, 1, value, 1, 100);
+}
+
 uint8_t I2cDevice::ReadReg(uint8_t reg) {
     uint8_t buffer[1];
-    ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, 1, 100));
+    ESP_ERROR_CHECK(TryReadReg(reg, buffer));
     return buffer[0];
 }
 

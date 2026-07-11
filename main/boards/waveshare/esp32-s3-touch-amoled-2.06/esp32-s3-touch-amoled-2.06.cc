@@ -34,6 +34,7 @@
 #include <lvgl.h>
 
 #include <algorithm>
+#include <cstdio>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch06"
 
@@ -57,9 +58,7 @@ constexpr uint16_t kAudreamLogoBackgroundColor = 0x0000;
 constexpr uint16_t kAudreamLogoForegroundColor = 0xFFFF;
 constexpr uint8_t kAxp2101I2cAddress = 0x34;
 constexpr uint8_t kAxp2101LdoOnOffReg0 = 0x90;
-constexpr uint8_t kAxp2101LdoOnOffReg1 = 0x91;
 constexpr uint8_t kAxp2101Aldo1VoltageReg = 0x92;
-constexpr uint8_t kAxp2101Aldo1EnableMask = 0x01;
 constexpr uint8_t kAxp2101Aldo1Aldo2EnableMask = 0x03;
 constexpr uint8_t kAxp2101Aldo1Voltage3300mv = (3300 - 500) / 100;
 static_assert(kAudreamLogoWidth <= DISPLAY_WIDTH);
@@ -91,30 +90,6 @@ void RecoverI2cPinsBeforeMasterInit() {
     esp_rom_delay_us(5);
     gpio_set_level(AUDIO_CODEC_I2C_SDA_PIN, 1);
     esp_rom_delay_us(1000);
-}
-
-esp_err_t RawI2cWriteReg(i2c_master_bus_handle_t i2c_bus, uint8_t addr, uint8_t reg, uint8_t value) {
-    i2c_device_config_t i2c_device_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = addr,
-        .scl_speed_hz = 400 * 1000,
-        .scl_wait_us = 0,
-        .flags = {
-            .disable_ack_check = 0,
-        },
-    };
-    i2c_master_dev_handle_t device = nullptr;
-    esp_err_t result = i2c_master_bus_add_device(i2c_bus, &i2c_device_cfg, &device);
-    if (result != ESP_OK) {
-        return result;
-    }
-    uint8_t buffer[2] = {reg, value};
-    result = i2c_master_transmit(device, buffer, sizeof(buffer), 100);
-    const esp_err_t remove_result = i2c_master_bus_rm_device(device);
-    if (result == ESP_OK && remove_result != ESP_OK) {
-        return remove_result;
-    }
-    return result;
 }
 
 void DrivePinLowForDeepSleep(gpio_num_t pin) {
@@ -151,7 +126,9 @@ constexpr uint8_t kAudreamLogoGlyphs[kAudreamLogoGlyphCount][kAudreamLogoGlyphHe
 class Pmic : public Axp2101 {
 public:
     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
+        Probe("before configuration");
         initialized_ = Configure();
+        Probe(initialized_ ? "after configuration" : "after failed configuration");
     }
 
     bool initialized() const {
@@ -159,18 +136,90 @@ public:
     }
 
     bool PrepareForDeepSleep() {
-        if (!WriteRegWithRetry(kAxp2101LdoOnOffReg1, 0x00) ||
-            !WriteRegWithRetry(kAxp2101LdoOnOffReg0, 0x00)) {
+        Probe("before deep sleep rail update");
+        if (!UpdateRegWithRetry(kAxp2101LdoOnOffReg0, kAxp2101Aldo1Aldo2EnableMask, 0x00)) {
             ESP_LOGE(TAG, "Failed to configure PMIC rails for deep sleep");
             return false;
         }
-        ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1/ALDO2/ALDO3/ALDO4 off");
+        Probe("after deep sleep rail update");
+        ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1/ALDO2 off");
+        return true;
+    }
+
+    bool ReadPowerSnapshot(int& level, bool& charging, bool& discharging) {
+        uint8_t status1 = 0;
+        uint8_t status2 = 0;
+        uint8_t battery = 0;
+        const esp_err_t status1_result = TryReadReg(0x00, &status1);
+        const esp_err_t status2_result = TryReadReg(0x01, &status2);
+        const esp_err_t battery_result = TryReadReg(0xA4, &battery);
+        if (status1_result != ESP_OK || status2_result != ESP_OK || battery_result != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "PMIC battery snapshot read failed: status1=%s status2=%s battery=%s",
+                esp_err_to_name(status1_result),
+                esp_err_to_name(status2_result),
+                esp_err_to_name(battery_result)
+            );
+            return false;
+        }
+        const int battery_direction = (status2 & 0b01100000) >> 5;
+        charging = battery_direction == 1;
+        discharging = battery_direction == 2;
+        level = battery;
+        ESP_LOGI(
+            TAG,
+            "PMIC battery snapshot: level=%d status1=0x%02x status2=0x%02x charging=%d discharging=%d",
+            level,
+            status1,
+            status2,
+            charging ? 1 : 0,
+            discharging ? 1 : 0
+        );
         return true;
     }
 
 private:
     static constexpr int kWriteAttempts = 3;
     bool initialized_ = false;
+
+    void Probe(const char* stage) {
+        static constexpr uint8_t kProbeRegs[] = {
+            0x00,
+            0x01,
+            0x22,
+            kAxp2101LdoOnOffReg0,
+            kAxp2101Aldo1VoltageReg,
+            0xA4,
+        };
+        char summary[160] = {};
+        size_t offset = 0;
+        for (const uint8_t reg : kProbeRegs) {
+            uint8_t value = 0;
+            const esp_err_t result = TryReadReg(reg, &value);
+            if (result == ESP_OK) {
+                offset += snprintf(
+                    summary + offset,
+                    sizeof(summary) - offset,
+                    " reg0x%02x=0x%02x",
+                    reg,
+                    value
+                );
+            } else {
+                offset += snprintf(
+                    summary + offset,
+                    sizeof(summary) - offset,
+                    " reg0x%02x=%s",
+                    reg,
+                    esp_err_to_name(result)
+                );
+            }
+            if (offset >= sizeof(summary)) {
+                break;
+            }
+        }
+        ESP_LOGI(TAG, "PMIC probe %s:%s", stage, summary);
+    }
 
     bool Configure() {
         static constexpr struct {
@@ -180,7 +229,6 @@ private:
             {0x22, 0b110},
             {0x27, 0x10},
             {0x80, 0x01},
-            {kAxp2101LdoOnOffReg1, 0x00},
             {0x82, (3300 - 1500) / 100},
             {kAxp2101Aldo1VoltageReg, kAxp2101Aldo1Voltage3300mv},
             {0x93, (3300 - 500) / 100},
@@ -203,11 +251,79 @@ private:
         for (int attempt = 1; attempt <= kWriteAttempts; ++attempt) {
             result = TryWriteReg(reg, value);
             if (result == ESP_OK) {
+                uint8_t readback = 0;
+                const esp_err_t readback_result = TryReadReg(reg, &readback);
+                if (readback_result == ESP_OK) {
+                    ESP_LOGI(
+                        TAG,
+                        "PMIC register write ok: reg=0x%02x value=0x%02x readback=0x%02x attempt=%d/%d",
+                        reg,
+                        value,
+                        readback,
+                        attempt,
+                        kWriteAttempts
+                    );
+                } else {
+                    ESP_LOGW(
+                        TAG,
+                        "PMIC register write ok but readback failed: reg=0x%02x value=0x%02x attempt=%d/%d error=%s",
+                        reg,
+                        value,
+                        attempt,
+                        kWriteAttempts,
+                        esp_err_to_name(readback_result)
+                    );
+                }
                 return true;
             }
             ESP_LOGW(
                 TAG,
                 "PMIC register write failed: reg=0x%02x attempt=%d/%d error=%s",
+                reg,
+                attempt,
+                kWriteAttempts,
+                esp_err_to_name(result)
+            );
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        return false;
+    }
+
+    bool UpdateRegWithRetry(uint8_t reg, uint8_t clear_mask, uint8_t set_mask) {
+        esp_err_t result = ESP_FAIL;
+        for (int attempt = 1; attempt <= kWriteAttempts; ++attempt) {
+            uint8_t value = 0;
+            result = TryReadReg(reg, &value);
+            if (result == ESP_OK) {
+                const uint8_t updated = (value & ~clear_mask) | set_mask;
+                result = TryWriteReg(reg, updated);
+                if (result == ESP_OK) {
+                    ESP_LOGI(
+                        TAG,
+                        "PMIC register update ok: reg=0x%02x old=0x%02x new=0x%02x clear=0x%02x set=0x%02x attempt=%d/%d",
+                        reg,
+                        value,
+                        updated,
+                        clear_mask,
+                        set_mask,
+                        attempt,
+                        kWriteAttempts
+                    );
+                    return true;
+                }
+            } else {
+                ESP_LOGW(
+                    TAG,
+                    "PMIC register update read failed: reg=0x%02x attempt=%d/%d error=%s",
+                    reg,
+                    attempt,
+                    kWriteAttempts,
+                    esp_err_to_name(result)
+                );
+            }
+            ESP_LOGW(
+                TAG,
+                "PMIC register update failed: reg=0x%02x attempt=%d/%d error=%s",
                 reg,
                 attempt,
                 kWriteAttempts,
@@ -381,10 +497,13 @@ private:
     uint16_t* recording_feedback_logo_tile_buffer_ = nullptr;
     bool pending_deep_sleep_recording_ = false;
     bool suppress_next_wake_long_press_ = false;
+    bool deep_sleep_wake_ = false;
     int64_t deep_sleep_wake_button_down_us_ = 0;
 
     void InitializeCodecI2c() {
-        RecoverI2cPinsBeforeMasterInit();
+        if (deep_sleep_wake_) {
+            RecoverI2cPinsBeforeMasterInit();
+        }
         i2c_master_bus_config_t i2c_bus_cfg = {
             .i2c_port = I2C_NUM_0,
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
@@ -395,41 +514,6 @@ private:
             },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
-    }
-
-    bool RestoreAldo1BeforePmicInit() {
-        static constexpr int kRestoreAttempts = 5;
-        for (int attempt = 1; attempt <= kRestoreAttempts; ++attempt) {
-            esp_err_t result = RawI2cWriteReg(
-                i2c_bus_,
-                kAxp2101I2cAddress,
-                kAxp2101Aldo1VoltageReg,
-                kAxp2101Aldo1Voltage3300mv
-            );
-            if (result == ESP_OK) {
-                result = RawI2cWriteReg(
-                    i2c_bus_,
-                    kAxp2101I2cAddress,
-                    kAxp2101LdoOnOffReg0,
-                    kAxp2101Aldo1EnableMask
-                );
-            }
-            if (result == ESP_OK) {
-                ESP_LOGI(TAG, "ALDO1 restored before PMIC initialization");
-                vTaskDelay(pdMS_TO_TICKS(150));
-                return true;
-            }
-            ESP_LOGW(
-                TAG,
-                "Failed to restore ALDO1 before PMIC initialization: attempt=%d/%d error=%s",
-                attempt,
-                kRestoreAttempts,
-                esp_err_to_name(result)
-            );
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        ESP_LOGE(TAG, "ALDO1 restore failed before PMIC initialization");
-        return false;
     }
 
     void InitializeAxp2101() {
@@ -1252,9 +1336,9 @@ private:
 
 public:
     WaveshareEsp32s3TouchAMOLED2inch06() : boot_button_(BOOT_BUTTON_GPIO, false, kRecordingButtonHoldMs) {
+        deep_sleep_wake_ = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0;
         LogWakeContext();
         InitializeCodecI2c();
-        RestoreAldo1BeforePmicInit();
         InitializeAxp2101();
         InitializeRecordingPowerManagement();
         InitializeRecordingButton();
@@ -1316,13 +1400,13 @@ public:
 
     virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
         if (pmic_ == nullptr) {
-            return false;
+            ESP_LOGW(TAG, "Battery level requested while PMIC is unavailable; retrying PMIC initialization");
+            if (!TryInitializePmic()) {
+                ESP_LOGW(TAG, "Battery level unavailable because PMIC initialization retry failed");
+                return false;
+            }
         }
-        charging = pmic_->IsCharging();
-        discharging = pmic_->IsDischarging();
-
-        level = pmic_->GetBatteryLevel();
-        return true;
+        return pmic_->ReadPowerSnapshot(level, charging, discharging);
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
