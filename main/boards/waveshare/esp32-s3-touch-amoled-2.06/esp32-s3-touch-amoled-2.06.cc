@@ -522,7 +522,7 @@ private:
     void InitializeAxp2101() {
         ESP_LOGI(TAG, "Init AXP2101");
         if (!TryInitializePmic()) {
-            SchedulePmicRecoveryTask("initialization");
+            ESP_LOGW(TAG, "PMIC recovery will be retried after audio codec initialization");
         }
     }
 
