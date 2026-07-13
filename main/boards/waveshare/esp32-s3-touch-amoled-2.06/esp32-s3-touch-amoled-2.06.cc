@@ -60,7 +60,7 @@ constexpr uint16_t kAudreamLogoForegroundColor = 0xFFFF;
 constexpr uint8_t kAxp2101I2cAddress = 0x34;
 constexpr uint8_t kAxp2101LdoOnOffReg0 = 0x90;
 constexpr uint8_t kAxp2101Aldo1VoltageReg = 0x92;
-constexpr uint8_t kAxp2101Aldo1Aldo2EnableMask = 0x03;
+constexpr uint8_t kAxp2101Aldo1Aldo2Aldo3Aldo4EnableMask = 0x0F;
 constexpr uint8_t kAxp2101Aldo1Voltage3300mv = (3300 - 500) / 100;
 static_assert(kAudreamLogoWidth <= DISPLAY_WIDTH);
 static_assert(kAudreamLogoHeight <= DISPLAY_HEIGHT);
@@ -138,12 +138,12 @@ public:
 
     bool PrepareForDeepSleep() {
         Probe("before deep sleep rail update");
-        if (!UpdateRegWithRetry(kAxp2101LdoOnOffReg0, kAxp2101Aldo1Aldo2EnableMask, 0x00)) {
+        if (!UpdateRegWithRetry(kAxp2101LdoOnOffReg0, kAxp2101Aldo1Aldo2Aldo3Aldo4EnableMask, 0x00)) {
             ESP_LOGE(TAG, "Failed to configure PMIC rails for deep sleep");
             return false;
         }
         Probe("after deep sleep rail update");
-        ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1/ALDO2 off");
+        ESP_LOGI(TAG, "PMIC deep sleep rails configured: ALDO1/ALDO2/ALDO3/ALDO4 off");
         return true;
     }
 
@@ -233,7 +233,7 @@ private:
             {0x82, (3300 - 1500) / 100},
             {kAxp2101Aldo1VoltageReg, kAxp2101Aldo1Voltage3300mv},
             {0x93, (3300 - 500) / 100},
-            {kAxp2101LdoOnOffReg0, kAxp2101Aldo1Aldo2EnableMask},
+            {kAxp2101LdoOnOffReg0, kAxp2101Aldo1Aldo2Aldo3Aldo4EnableMask},
             {0x64, 0x02},
             {0x61, 0x02},
             {0x62, 0x0A},
