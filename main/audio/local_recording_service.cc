@@ -218,6 +218,7 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
         state_ = State::kStopping;
     }
 
+    AudreamPowerManager::GetInstance().SetRecordingCaptureActive(false);
     audio_service.EnableLocalRecording(false);
     if (!audio_service.WaitForLocalRecordingDrain(kStopDrainTimeoutMs)) {
         ESP_LOGW(kTag, "Local recording stop continued before encoder queue fully drained");

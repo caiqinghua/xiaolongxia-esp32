@@ -22,6 +22,7 @@ public:
     void NotifyUserActivity(const char* reason, uint32_t active_timeout_seconds = 45);
     void NotifyMaintenanceActivity(const char* reason);
     void SetRecordingActive(bool active);
+    void SetRecordingCaptureActive(bool active);
     void SetBleFileTransferActive(bool active);
     void SetTemporaryAPTransferActive(bool active);
     void SetStorageBusy(bool busy);
@@ -40,10 +41,13 @@ private:
     int64_t active_timeout_us_ = 45LL * 1000000LL;
     int64_t idle_started_us_ = 0;
     bool recording_active_ = false;
+    bool recording_capture_active_ = false;
     bool ble_file_transfer_active_ = false;
     bool temporary_ap_transfer_active_ = false;
     bool storage_busy_ = false;
     bool usb_powered_ = false;
+    int current_cpu_max_mhz_ = 0;
+    int current_cpu_min_mhz_ = 0;
     std::function<void()> before_deep_sleep_callback_;
 
     static void TaskEntry(void* arg);
@@ -53,4 +57,5 @@ private:
     void EnterActiveLocked(const char* reason, int64_t now_us);
     void EnterIdleLocked(int64_t now_us);
     void EnterDeepSleep();
+    void UpdateCpuProfileLocked(const char* reason);
 };

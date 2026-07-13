@@ -7,6 +7,9 @@
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#if CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -15,6 +18,10 @@ namespace {
 constexpr char kTag[] = "AudreamPower";
 constexpr int64_t kIdleToDeepSleepUs = 180LL * 1000000LL;
 constexpr int64_t kTickDelayMs = 1000;
+constexpr int kDefaultCpuMaxMhz = 240;
+constexpr int kDefaultCpuMinMhz = 40;
+constexpr int kRecordingCpuMaxMhz = 80;
+constexpr int kRecordingCpuMinMhz = 40;
 
 const char* StateName(AudreamPowerState state) {
     switch (state) {
@@ -91,6 +98,8 @@ void AudreamPowerManager::SetRecordingActive(bool active) {
         return;
     }
     recording_active_ = active;
+    recording_capture_active_ = active;
+    UpdateCpuProfileLocked(active ? "recording_started" : "recording_stopped");
     if (active) {
         const int64_t now_us = esp_timer_get_time();
         last_user_activity_us_ = now_us;
@@ -100,12 +109,63 @@ void AudreamPowerManager::SetRecordingActive(bool active) {
     ESP_LOGI(kTag, "Recording blocker: %s", active ? "active" : "inactive");
 }
 
+void AudreamPowerManager::SetRecordingCaptureActive(bool active) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (recording_capture_active_ == active) {
+        return;
+    }
+    recording_capture_active_ = active;
+    UpdateCpuProfileLocked(active ? "recording_capture_started" : "recording_capture_stopped");
+}
+
+void AudreamPowerManager::UpdateCpuProfileLocked(const char* reason) {
+#if CONFIG_PM_ENABLE
+    const bool use_recording_profile = recording_capture_active_ &&
+        !ble_file_transfer_active_ &&
+        !temporary_ap_transfer_active_ &&
+        !storage_busy_;
+    const int target_max_mhz = use_recording_profile ? kRecordingCpuMaxMhz : kDefaultCpuMaxMhz;
+    const int target_min_mhz = use_recording_profile ? kRecordingCpuMinMhz : kDefaultCpuMinMhz;
+    if (current_cpu_max_mhz_ == target_max_mhz && current_cpu_min_mhz_ == target_min_mhz) {
+        return;
+    }
+    const esp_pm_config_t config = {
+        .max_freq_mhz = target_max_mhz,
+        .min_freq_mhz = target_min_mhz,
+        .light_sleep_enable = true,
+    };
+    const esp_err_t result = esp_pm_configure(&config);
+    if (result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "Failed to apply CPU power profile after %s: %s",
+            reason == nullptr ? "state_change" : reason,
+            esp_err_to_name(result)
+        );
+        return;
+    }
+    current_cpu_max_mhz_ = target_max_mhz;
+    current_cpu_min_mhz_ = target_min_mhz;
+    ESP_LOGI(
+        kTag,
+        "CPU power profile: %s max=%dMHz min=%dMHz reason=%s",
+        use_recording_profile ? "recording" : "default",
+        static_cast<int>(config.max_freq_mhz),
+        static_cast<int>(config.min_freq_mhz),
+        reason == nullptr ? "state_change" : reason
+    );
+#else
+    (void)reason;
+#endif
+}
+
 void AudreamPowerManager::SetBleFileTransferActive(bool active) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (ble_file_transfer_active_ == active) {
         return;
     }
     ble_file_transfer_active_ = active;
+    UpdateCpuProfileLocked(active ? "ble_file_transfer_started" : "ble_file_transfer_stopped");
     if (active) {
         const int64_t now_us = esp_timer_get_time();
         last_user_activity_us_ = now_us;
@@ -121,6 +181,7 @@ void AudreamPowerManager::SetTemporaryAPTransferActive(bool active) {
         return;
     }
     temporary_ap_transfer_active_ = active;
+    UpdateCpuProfileLocked(active ? "temporary_ap_transfer_started" : "temporary_ap_transfer_stopped");
     if (active) {
         const int64_t now_us = esp_timer_get_time();
         last_user_activity_us_ = now_us;
@@ -136,6 +197,7 @@ void AudreamPowerManager::SetStorageBusy(bool busy) {
         return;
     }
     storage_busy_ = busy;
+    UpdateCpuProfileLocked(busy ? "storage_started" : "storage_stopped");
     ESP_LOGD(kTag, "Storage blocker: %s", busy ? "active" : "inactive");
 }
 
