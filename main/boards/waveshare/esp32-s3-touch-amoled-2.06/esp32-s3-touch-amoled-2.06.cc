@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch06"
 
@@ -46,24 +47,24 @@ constexpr int64_t kDeepSleepWakeRecordHoldUs = static_cast<int64_t>(kRecordingBu
 constexpr uint64_t kRecordingFeedbackScreenOnUs = 3000ULL * 1000ULL;
 constexpr uint64_t kRecordingHoldRetryUs = 200ULL * 1000ULL;
 constexpr size_t kRecordingFeedbackDrawRows = 4;
-constexpr int kAudreamLogoGlyphWidth = 5;
-constexpr int kAudreamLogoGlyphHeight = 7;
-constexpr int kAudreamLogoGlyphScale = 8;
-constexpr int kAudreamLogoGlyphSpacing = kAudreamLogoGlyphScale;
-constexpr int kAudreamLogoGlyphCount = 7;
-constexpr int kAudreamLogoWidth =
-    kAudreamLogoGlyphCount * kAudreamLogoGlyphWidth * kAudreamLogoGlyphScale +
-    (kAudreamLogoGlyphCount - 1) * kAudreamLogoGlyphSpacing;
-constexpr int kAudreamLogoHeight = kAudreamLogoGlyphHeight * kAudreamLogoGlyphScale;
-constexpr uint16_t kAudreamLogoBackgroundColor = 0x0000;
-constexpr uint16_t kAudreamLogoForegroundColor = 0xFFFF;
+constexpr int kFeedbackGlyphWidth = 5;
+constexpr int kFeedbackGlyphHeight = 7;
+constexpr int kFeedbackGlyphScale = 8;
+constexpr int kFeedbackGlyphSpacing = kFeedbackGlyphScale;
+constexpr int kFeedbackMaxGlyphCount = 7;
+constexpr int kFeedbackMaxTextWidth =
+    kFeedbackMaxGlyphCount * kFeedbackGlyphWidth * kFeedbackGlyphScale +
+    (kFeedbackMaxGlyphCount - 1) * kFeedbackGlyphSpacing;
+constexpr int kFeedbackTextHeight = kFeedbackGlyphHeight * kFeedbackGlyphScale;
+constexpr uint16_t kFeedbackBackgroundColor = 0x0000;
+constexpr uint16_t kFeedbackForegroundColor = 0xFFFF;
 constexpr uint8_t kAxp2101I2cAddress = 0x34;
 constexpr uint8_t kAxp2101LdoOnOffReg0 = 0x90;
 constexpr uint8_t kAxp2101Aldo1VoltageReg = 0x92;
 constexpr uint8_t kAxp2101Aldo1Aldo2Aldo3Aldo4EnableMask = 0x0F;
 constexpr uint8_t kAxp2101Aldo1Voltage3300mv = (3300 - 500) / 100;
-static_assert(kAudreamLogoWidth <= DISPLAY_WIDTH);
-static_assert(kAudreamLogoHeight <= DISPLAY_HEIGHT);
+static_assert(kFeedbackMaxTextWidth <= DISPLAY_WIDTH);
+static_assert(kFeedbackTextHeight <= DISPLAY_HEIGHT);
 
 void RecoverI2cPinsBeforeMasterInit() {
     gpio_config_t io_config = {};
@@ -112,15 +113,33 @@ void ReleasePinForDeepSleep(gpio_num_t pin) {
     gpio_pulldown_dis(pin);
 }
 
-constexpr uint8_t kAudreamLogoGlyphs[kAudreamLogoGlyphCount][kAudreamLogoGlyphHeight] = {
-    {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001},  // A
-    {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110},  // U
-    {0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110},  // D
-    {0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001},  // R
-    {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111},  // E
-    {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001},  // A
-    {0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001},  // M
-};
+using FeedbackGlyph = uint8_t[kFeedbackGlyphHeight];
+
+const FeedbackGlyph* GetFeedbackGlyph(char character) {
+    static constexpr FeedbackGlyph kGlyphA = {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001};
+    static constexpr FeedbackGlyph kGlyphD = {0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110};
+    static constexpr FeedbackGlyph kGlyphE = {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111};
+    static constexpr FeedbackGlyph kGlyphM = {0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001};
+    static constexpr FeedbackGlyph kGlyphO = {0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110};
+    static constexpr FeedbackGlyph kGlyphP = {0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000};
+    static constexpr FeedbackGlyph kGlyphR = {0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001};
+    static constexpr FeedbackGlyph kGlyphS = {0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110};
+    static constexpr FeedbackGlyph kGlyphT = {0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100};
+    static constexpr FeedbackGlyph kGlyphU = {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110};
+    switch (character) {
+        case 'A': return &kGlyphA;
+        case 'D': return &kGlyphD;
+        case 'E': return &kGlyphE;
+        case 'M': return &kGlyphM;
+        case 'O': return &kGlyphO;
+        case 'P': return &kGlyphP;
+        case 'R': return &kGlyphR;
+        case 'S': return &kGlyphS;
+        case 'T': return &kGlyphT;
+        case 'U': return &kGlyphU;
+        default: return nullptr;
+    }
+}
 
 }  // namespace
 
@@ -502,6 +521,7 @@ private:
     esp_lcd_panel_handle_t recording_feedback_panel_ = nullptr;
     uint16_t* recording_feedback_draw_buffer_ = nullptr;
     uint16_t* recording_feedback_logo_tile_buffer_ = nullptr;
+    const char* recording_feedback_text_ = "AUDREAM";
     bool pending_deep_sleep_recording_ = false;
     bool suppress_next_wake_long_press_ = false;
     bool deep_sleep_wake_ = false;
@@ -817,7 +837,7 @@ private:
         std::fill_n(
             recording_feedback_draw_buffer_,
             pixel_count,
-            kAudreamLogoBackgroundColor
+            kFeedbackBackgroundColor
         );
 
         for (int y = 0; y < DISPLAY_HEIGHT; y += kRecordingFeedbackDrawRows) {
@@ -845,7 +865,7 @@ private:
         }
 
         constexpr size_t logo_tile_pixel_count =
-            kAudreamLogoGlyphScale * kAudreamLogoGlyphScale;
+            kFeedbackGlyphScale * kFeedbackGlyphScale;
         if (recording_feedback_logo_tile_buffer_ == nullptr) {
             recording_feedback_logo_tile_buffer_ = static_cast<uint16_t*>(heap_caps_malloc(
                 logo_tile_pixel_count * sizeof(uint16_t),
@@ -863,30 +883,45 @@ private:
         std::fill_n(
             recording_feedback_logo_tile_buffer_,
             logo_tile_pixel_count,
-            kAudreamLogoForegroundColor
+            kFeedbackForegroundColor
         );
 
-        const int logo_x = ((DISPLAY_WIDTH - kAudreamLogoWidth) / 2) & ~1;
-        const int logo_y = ((DISPLAY_HEIGHT - kAudreamLogoHeight) / 2) & ~1;
+        const char* text = recording_feedback_text_;
+        if (text == nullptr || text[0] == '\0') {
+            text = "AUDREAM";
+        }
+        const int glyph_count = std::min(
+            static_cast<int>(std::strlen(text)),
+            kFeedbackMaxGlyphCount
+        );
+        const int text_width =
+            glyph_count * kFeedbackGlyphWidth * kFeedbackGlyphScale +
+            std::max(0, glyph_count - 1) * kFeedbackGlyphSpacing;
+        const int logo_x = ((DISPLAY_WIDTH - text_width) / 2) & ~1;
+        const int logo_y = ((DISPLAY_HEIGHT - kFeedbackTextHeight) / 2) & ~1;
         const int glyph_advance =
-            kAudreamLogoGlyphWidth * kAudreamLogoGlyphScale + kAudreamLogoGlyphSpacing;
-        for (int glyph = 0; glyph < kAudreamLogoGlyphCount; ++glyph) {
-            for (int row = 0; row < kAudreamLogoGlyphHeight; ++row) {
-                const uint8_t row_bits = kAudreamLogoGlyphs[glyph][row];
-                for (int column = 0; column < kAudreamLogoGlyphWidth; ++column) {
-                    const uint8_t mask = 1U << (kAudreamLogoGlyphWidth - column - 1);
+            kFeedbackGlyphWidth * kFeedbackGlyphScale + kFeedbackGlyphSpacing;
+        for (int glyph = 0; glyph < glyph_count; ++glyph) {
+            const FeedbackGlyph* glyph_data = GetFeedbackGlyph(text[glyph]);
+            if (glyph_data == nullptr) {
+                continue;
+            }
+            for (int row = 0; row < kFeedbackGlyphHeight; ++row) {
+                const uint8_t row_bits = (*glyph_data)[row];
+                for (int column = 0; column < kFeedbackGlyphWidth; ++column) {
+                    const uint8_t mask = 1U << (kFeedbackGlyphWidth - column - 1);
                     if ((row_bits & mask) == 0) {
                         continue;
                     }
                     const int x = logo_x + glyph * glyph_advance +
-                        column * kAudreamLogoGlyphScale;
-                    const int y = logo_y + row * kAudreamLogoGlyphScale;
+                        column * kFeedbackGlyphScale;
+                    const int y = logo_y + row * kFeedbackGlyphScale;
                     const esp_err_t draw_result = esp_lcd_panel_draw_bitmap(
                         recording_feedback_panel_,
                         x,
                         y,
-                        x + kAudreamLogoGlyphScale,
-                        y + kAudreamLogoGlyphScale,
+                        x + kFeedbackGlyphScale,
+                        y + kFeedbackGlyphScale,
                         recording_feedback_logo_tile_buffer_
                     );
                     if (draw_result != ESP_OK) {
@@ -990,7 +1025,10 @@ private:
         }
     }
 
-    void PulseRecordingFeedbackScreen() {
+    void PulseRecordingFeedbackScreen(const char* text = nullptr) {
+        if (text != nullptr && text[0] != '\0') {
+            recording_feedback_text_ = text;
+        }
         if (!recording_feedback_display_initialized_) {
             recording_feedback_pulse_pending_ = true;
             InitializeRecordingFeedbackDisplay();
@@ -1002,6 +1040,10 @@ private:
         }
         if (!backlight_->WakeForRecordingFeedback()) {
             ESP_LOGE(TAG, "Recording feedback screen pulse stopped because panel wake failed");
+            return;
+        }
+        if (!DrawRecordingFeedbackFrame()) {
+            ESP_LOGE(TAG, "Recording feedback screen pulse stopped because drawing failed");
             return;
         }
         recording_feedback_pulse_pending_ = false;
@@ -1318,7 +1360,7 @@ private:
         if (recording.IsRecording()) {
             recording_hold_start_pending_ = false;
             const auto metadata = recording.Stop(audio_service);
-            PulseRecordingFeedbackScreen();
+            PulseRecordingFeedbackScreen("STOP");
             if (metadata.valid) {
                 ESP_LOGI(
                     TAG,
@@ -1377,7 +1419,7 @@ private:
         if (recording.Start(audio_service)) {
             recording_hold_start_pending_ = false;
             const auto metadata = recording.CurrentMetadata();
-            PulseRecordingFeedbackScreen();
+            PulseRecordingFeedbackScreen("START");
             ESP_LOGI(
                 TAG,
                 "%s started local recording: id=%s",
@@ -1442,6 +1484,7 @@ public:
         InitializeRecordingPowerManagement();
         InitializeRecordingButton();
         DetectDeepSleepRecordingIntent();
+        PulseRecordingFeedbackScreen("AUDREAM");
         ESP_LOGI(TAG, "Touch and WiFi application features are disabled");
         auto& storage = SdCardStorage::GetInstance();
         storage.SetInitializationCompleteCallback([this](const StorageStatus& status) {
