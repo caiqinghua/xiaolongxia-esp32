@@ -147,6 +147,11 @@ public:
         return true;
     }
 
+    void PowerOffForIdleSleep() {
+        ESP_LOGI(TAG, "PMIC software power-off requested for idle sleep");
+        PowerOff();
+    }
+
     bool ReadPowerSnapshot(int& level, bool& charging, bool& discharging) {
         uint8_t status1 = 0;
         uint8_t status2 = 0;
@@ -1129,7 +1134,8 @@ private:
         ConfigureDisplayPinsForDeepSleep();
         ConfigureAudioPinsForDeepSleep();
         if (EnsurePmicReadyForDeepSleep()) {
-            pmic_->PrepareForDeepSleep();
+            pmic_->PowerOffForIdleSleep();
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
         ConfigureI2cPinsForDeepSleep();
     }
