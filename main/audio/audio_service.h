@@ -198,6 +198,7 @@ private:
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();
+    std::vector<int16_t> DownmixInputToMono(std::vector<int16_t>&& data) const;
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     bool CanProcessEncodeTask() const;
     bool HasLocalRecordingEncodeWorkLocked() const;

@@ -8,13 +8,14 @@
 
 BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
-    gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7210_addr, bool input_reference) {
-    duplex_ = true; // 是否双工
-    input_reference_ = input_reference; // 是否使用参考输入，实现回声消除
-    input_channels_ = input_reference_ ? 2 : 1; // 输入通道数
+    gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7210_addr, bool input_reference, uint8_t input_mic_mask) {
+    duplex_ = true;
+    input_reference_ = input_reference;
+    input_channels_ = input_reference_ ? 2 : 1;
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
     input_gain_ = 30;
+    input_mic_mask_ = input_mic_mask == 0 ? ES7210_SEL_MIC1 | ES7210_SEL_MIC2 : input_mic_mask;
 
     CreateDuplexChannels(mclk, bclk, ws, dout, din);
 
@@ -27,7 +28,7 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
     data_if_ = audio_codec_new_i2s_data(&i2s_cfg);
     assert(data_if_ != NULL);
 
-    // Output
+    // Output path
     audio_codec_i2c_cfg_t i2c_cfg = {
         .port = (i2c_port_t)1,
         .addr = es8311_addr,
@@ -58,14 +59,14 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
     output_dev_ = esp_codec_dev_new(&dev_cfg);
     assert(output_dev_ != NULL);
 
-    // Input
+    // Input path
     i2c_cfg.addr = es7210_addr;
     in_ctrl_if_ = audio_codec_new_i2c_ctrl(&i2c_cfg);
     assert(in_ctrl_if_ != NULL);
 
     es7210_codec_cfg_t es7210_cfg = {};
     es7210_cfg.ctrl_if = in_ctrl_if_;
-    es7210_cfg.mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4;
+    es7210_cfg.mic_selected = input_mic_mask_;
     in_codec_if_ = es7210_codec_new(&es7210_cfg);
     assert(in_codec_if_ != NULL);
 
@@ -222,7 +223,7 @@ void BoxAudioCodec::EnableInput(bool enable) {
             .bits_per_sample = 16,
             .channel = 4,
             .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
-            .sample_rate = (uint32_t)output_sample_rate_,
+            .sample_rate = (uint32_t)input_sample_rate_,
             .mclk_multiple = 0,
         };
         if (input_reference_) {

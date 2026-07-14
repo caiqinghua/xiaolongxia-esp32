@@ -20,6 +20,7 @@ private:
 
     esp_codec_dev_handle_t output_dev_ = nullptr;
     esp_codec_dev_handle_t input_dev_ = nullptr;
+    uint8_t input_mic_mask_ = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4;
     std::mutex data_if_mutex_;
 
     void CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din);
@@ -32,7 +33,8 @@ private:
 public:
     BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
         gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
-        gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7210_addr, bool input_reference);
+        gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7210_addr, bool input_reference,
+        uint8_t input_mic_mask = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4);
     virtual ~BoxAudioCodec();
 
     virtual void SetOutputVolume(int volume) override;

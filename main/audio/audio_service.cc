@@ -1,6 +1,8 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <algorithm>
 #include <cstring>
+#include <limits>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -342,13 +344,7 @@ void AudioService::AudioInputTask() {
             std::vector<int16_t> data;
             int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
             if (ReadAudioData(data, 16000, samples)) {
-                if (codec_->input_channels() == 2) {
-                    auto mono_data = std::vector<int16_t>(data.size() / 2);
-                    for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
-                        mono_data[i] = data[j];
-                    }
-                    data = std::move(mono_data);
-                }
+                data = DownmixInputToMono(std::move(data));
                 PushTaskToEncodeQueue(kAudioTaskTypeEncodeToLocalRecording, std::move(data));
                 {
                     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
@@ -374,14 +370,7 @@ void AudioService::AudioInputTask() {
             std::vector<int16_t> data;
             int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
             if (ReadAudioData(data, 16000, samples)) {
-                // If input channels is 2, we need to fetch the left channel data
-                if (codec_->input_channels() == 2) {
-                    auto mono_data = std::vector<int16_t>(data.size() / 2);
-                    for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
-                        mono_data[i] = data[j];
-                    }
-                    data = std::move(mono_data);
-                }
+                data = DownmixInputToMono(std::move(data));
                 PushTaskToEncodeQueue(kAudioTaskTypeEncodeToTestingQueue, std::move(data));
                 continue;
             }
@@ -407,6 +396,31 @@ void AudioService::AudioInputTask() {
     }
 
     ESP_LOGW(TAG, "Audio input task stopped");
+}
+
+std::vector<int16_t> AudioService::DownmixInputToMono(std::vector<int16_t>&& data) const {
+    const int channels = codec_ == nullptr ? 1 : codec_->input_channels();
+    if (channels <= 1 || data.empty()) {
+        return std::move(data);
+    }
+
+    const size_t frame_count = data.size() / channels;
+    std::vector<int16_t> mono_data(frame_count);
+    for (size_t frame = 0; frame < frame_count; ++frame) {
+        int32_t sum = 0;
+        const size_t base = frame * channels;
+        for (int channel = 0; channel < channels; ++channel) {
+            sum += data[base + channel];
+        }
+        int32_t sample = sum / channels;
+        sample = std::clamp(
+            sample,
+            static_cast<int32_t>(std::numeric_limits<int16_t>::min()),
+            static_cast<int32_t>(std::numeric_limits<int16_t>::max())
+        );
+        mono_data[frame] = static_cast<int16_t>(sample);
+    }
+    return mono_data;
 }
 
 void AudioService::AudioOutputTask() {
