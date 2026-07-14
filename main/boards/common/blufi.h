@@ -2,7 +2,9 @@
 
 #include <aes/esp_aes.h>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 #include "esp_blufi_api.h"
 #include "esp_err.h"
@@ -42,6 +44,17 @@ public:
     esp_err_t deinit();
 
     esp_err_t SendDeviceWillSleepEvent();
+    esp_err_t SendRecordingStartedEvent(
+        const std::string& recording_id,
+        const std::string& file_name,
+        uint64_t started_at_unix_ms
+    );
+    esp_err_t SendRecordingStoppedEvent(
+        const std::string& recording_id,
+        const std::string& file_name,
+        uint32_t duration_ms,
+        uint32_t size_bytes
+    );
 
     // Delete copy constructor and assignment operator for singleton
     Blufi(const Blufi &) = delete;

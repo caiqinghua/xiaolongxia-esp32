@@ -1372,6 +1372,12 @@ private:
             } else {
                 ESP_LOGW(TAG, "Button stopped local recording without valid metadata");
             }
+            Blufi::GetInstance().SendRecordingStoppedEvent(
+                metadata.recording_id,
+                metadata.file_name,
+                metadata.duration_ms,
+                metadata.size_bytes
+            );
             return;
         }
 
@@ -1425,6 +1431,11 @@ private:
                 "%s started local recording: id=%s",
                 RecordingHoldStartSourceName(),
                 metadata.recording_id.c_str()
+            );
+            Blufi::GetInstance().SendRecordingStartedEvent(
+                metadata.recording_id,
+                metadata.file_name,
+                metadata.started_at_unix_ms
             );
         } else {
             ScheduleRecordingHoldStartRetry();

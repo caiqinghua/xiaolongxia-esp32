@@ -179,6 +179,35 @@ uint16_t ReadAudreamCustomRequestId(const uint8_t* data, size_t length) {
         (static_cast<uint16_t>(data[3]) << 8);
 }
 
+void AppendUInt32LittleEndian(std::vector<uint8_t>& output, uint32_t value) {
+    output.push_back(static_cast<uint8_t>(value & 0xFF));
+    output.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+}
+
+void AppendUInt64LittleEndian(std::vector<uint8_t>& output, uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) {
+        output.push_back(static_cast<uint8_t>((value >> shift) & 0xFF));
+    }
+}
+
+void AppendLengthPrefixedString(std::vector<uint8_t>& output, const std::string& value) {
+    const size_t clamped_size = std::min<size_t>(value.size(), 255);
+    output.push_back(static_cast<uint8_t>(clamped_size));
+    output.insert(output.end(), value.begin(), value.begin() + clamped_size);
+}
+
+esp_err_t SendAudreamDeviceEvent(uint8_t event, const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> event_payload;
+    event_payload.reserve(3 + payload.size());
+    event_payload.push_back(0x01);
+    event_payload.push_back(0xF0);
+    event_payload.push_back(event);
+    event_payload.insert(event_payload.end(), payload.begin(), payload.end());
+    return esp_blufi_send_custom_data(event_payload.data(), event_payload.size());
+}
+
 QueueHandle_t g_audream_custom_queue = nullptr;
 TaskHandle_t g_audream_custom_task = nullptr;
 
@@ -327,15 +356,51 @@ Blufi::~Blufi() {
 }
 
 esp_err_t Blufi::SendDeviceWillSleepEvent() {
-    uint8_t payload[] = {0x01, 0xF0, 0x01};
-    const esp_err_t result = esp_blufi_send_custom_data(
-        payload,
-        sizeof(payload)
-    );
+    const esp_err_t result = SendAudreamDeviceEvent(0x01, {});
     if (result != ESP_OK) {
         ESP_LOGW(BLUFI_TAG, "Failed to send device will sleep event: %s", esp_err_to_name(result));
     } else {
         ESP_LOGI(BLUFI_TAG, "Sent device will sleep event");
+    }
+    return result;
+}
+
+esp_err_t Blufi::SendRecordingStartedEvent(
+    const std::string& recording_id,
+    const std::string& file_name,
+    uint64_t started_at_unix_ms
+) {
+    std::vector<uint8_t> payload;
+    payload.reserve(2 + recording_id.size() + file_name.size() + 8);
+    AppendLengthPrefixedString(payload, recording_id);
+    AppendLengthPrefixedString(payload, file_name);
+    AppendUInt64LittleEndian(payload, started_at_unix_ms);
+    const esp_err_t result = SendAudreamDeviceEvent(0x02, payload);
+    if (result != ESP_OK) {
+        ESP_LOGW(BLUFI_TAG, "Failed to send recording started event: %s", esp_err_to_name(result));
+    } else {
+        ESP_LOGI(BLUFI_TAG, "Sent recording started event");
+    }
+    return result;
+}
+
+esp_err_t Blufi::SendRecordingStoppedEvent(
+    const std::string& recording_id,
+    const std::string& file_name,
+    uint32_t duration_ms,
+    uint32_t size_bytes
+) {
+    std::vector<uint8_t> payload;
+    payload.reserve(2 + recording_id.size() + file_name.size() + 8);
+    AppendLengthPrefixedString(payload, recording_id);
+    AppendLengthPrefixedString(payload, file_name);
+    AppendUInt32LittleEndian(payload, duration_ms);
+    AppendUInt32LittleEndian(payload, size_bytes);
+    const esp_err_t result = SendAudreamDeviceEvent(0x03, payload);
+    if (result != ESP_OK) {
+        ESP_LOGW(BLUFI_TAG, "Failed to send recording stopped event: %s", esp_err_to_name(result));
+    } else {
+        ESP_LOGI(BLUFI_TAG, "Sent recording stopped event");
     }
     return result;
 }
