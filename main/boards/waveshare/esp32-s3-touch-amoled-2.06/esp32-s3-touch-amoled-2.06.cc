@@ -10,6 +10,7 @@
 #include "axp2101.h"
 #include "i2c_device.h"
 #include "audio/local_recording_service.h"
+#include "audream_device_control.h"
 #include "storage/sd_card_storage.h"
 #include "system/boot_diagnostics.h"
 #include "system/audream_power_manager.h"
@@ -1550,6 +1551,19 @@ private:
         }
     }
 
+    void HandleRecordingStatusAcknowledged() {
+        Application::GetInstance().Schedule([this]() {
+            if (pending_recording_stop_event_valid_) {
+                return;
+            }
+            if (!LocalRecordingService::GetInstance().IsRecording()) {
+                return;
+            }
+            ESP_LOGI(TAG, "Recording status acknowledged; closing BLE window");
+            CloseRecordingBleWindow();
+        });
+    }
+
     void StartRecordingBleReporting(const LocalRecordingMetadata& metadata) {
         EnsureRecordingBleTimers();
         pending_recording_stop_event_valid_ = false;
@@ -1713,6 +1727,9 @@ public:
         }
         InitializeAxp2101();
         InitializeRecordingPowerManagement();
+        AudreamDeviceControl::GetInstance().SetRecordingStatusAcknowledgedCallback([this]() {
+            HandleRecordingStatusAcknowledged();
+        });
         InitializeRecordingButton();
         DetectDeepSleepRecordingIntent();
         PulseRecordingFeedbackScreen("AUDREAM");

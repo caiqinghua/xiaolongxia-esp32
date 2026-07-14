@@ -2,12 +2,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 class AudreamDeviceControl {
 public:
     static AudreamDeviceControl& GetInstance();
 
+    void SetRecordingStatusAcknowledgedCallback(std::function<void()> callback);
     std::vector<uint8_t> HandleRequest(const uint8_t* data, size_t length);
 
     AudreamDeviceControl(const AudreamDeviceControl&) = delete;
@@ -15,6 +17,7 @@ public:
 
 private:
     AudreamDeviceControl() = default;
+    std::function<void()> recording_status_acknowledged_callback_;
 
     struct DeviceState {
         int32_t auto_power_off_seconds;

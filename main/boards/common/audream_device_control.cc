@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <utility>
 
 #include "audio/audio_codec.h"
 #include "audio/local_recording_service.h"
@@ -94,6 +95,7 @@ enum class Opcode : uint8_t {
     kRefreshStorageStatus = 0x27,
     kDeleteLocalRecording = 0x28,
     kReadLocalRecordingMetadata = 0x29,
+    kRecordingStatusAck = 0x2A,
 };
 
 enum class Status : uint8_t {
@@ -244,6 +246,10 @@ bool IsValidAutoPowerOff(int32_t seconds) {
 AudreamDeviceControl& AudreamDeviceControl::GetInstance() {
     static AudreamDeviceControl instance;
     return instance;
+}
+
+void AudreamDeviceControl::SetRecordingStatusAcknowledgedCallback(std::function<void()> callback) {
+    recording_status_acknowledged_callback_ = std::move(callback);
 }
 
 AudreamDeviceControl::DeviceState AudreamDeviceControl::LoadState() const {
@@ -830,6 +836,26 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 payload
             );
         }
+
+        case Opcode::kRecordingStatusAck:
+            if (length != kRequestHeaderLength) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            ESP_LOGI(kTag, "Recording status acknowledgement received");
+            if (recording_status_acknowledged_callback_) {
+                recording_status_acknowledged_callback_();
+            }
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                {}
+            );
 
         case Opcode::kResetSettings:
             ResetSettings();
