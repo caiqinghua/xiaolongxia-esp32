@@ -46,6 +46,10 @@ constexpr uint16_t kRecordingButtonHoldMs = 1500;
 constexpr int64_t kDeepSleepWakeRecordHoldUs = static_cast<int64_t>(kRecordingButtonHoldMs) * 1000LL;
 constexpr uint64_t kRecordingFeedbackScreenOnUs = 3000ULL * 1000ULL;
 constexpr uint64_t kRecordingHoldRetryUs = 200ULL * 1000ULL;
+constexpr uint64_t kRecordingBleStartGraceUs = 2ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kRecordingBleReportIntervalUs = 5ULL * 60ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kRecordingBleReportWindowUs = 30ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kRecordingBleStatusRetryUs = 5ULL * 1000ULL * 1000ULL;
 constexpr size_t kRecordingFeedbackDrawRows = 4;
 constexpr int kFeedbackGlyphWidth = 5;
 constexpr int kFeedbackGlyphHeight = 7;
@@ -509,6 +513,11 @@ private:
     esp_timer_handle_t deep_sleep_record_hold_timer_ = nullptr;
     esp_timer_handle_t recording_feedback_screen_timer_ = nullptr;
     esp_timer_handle_t recording_hold_retry_timer_ = nullptr;
+    esp_timer_handle_t recording_ble_report_timer_ = nullptr;
+    esp_timer_handle_t recording_ble_close_timer_ = nullptr;
+    esp_timer_handle_t recording_ble_status_retry_timer_ = nullptr;
+    LocalRecordingMetadata pending_recording_stop_event_;
+    bool pending_recording_stop_event_valid_ = false;
     bool power_source_initialized_ = false;
     bool usb_powered_ = false;
     bool recording_button_pressed_ = false;
@@ -1354,6 +1363,226 @@ private:
         BeginRecordingHoldStart(RecordingHoldStartSource::kDeepSleepWake);
     }
 
+    void StopTimerIfActive(esp_timer_handle_t timer, const char* name) {
+        if (timer == nullptr) {
+            return;
+        }
+        const esp_err_t result = esp_timer_stop(timer);
+        if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to stop %s timer: %s", name, esp_err_to_name(result));
+        }
+    }
+
+    void EnsureRecordingBleTimers() {
+        if (recording_ble_report_timer_ == nullptr) {
+            const esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) {
+                    auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                    if (board == nullptr) {
+                        return;
+                    }
+                    Application::GetInstance().Schedule([board]() {
+                        board->OpenRecordingBleReportWindow();
+                    });
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "audream_ble_report",
+                .skip_unhandled_events = true,
+            };
+            const esp_err_t result = esp_timer_create(&timer_args, &recording_ble_report_timer_);
+            if (result != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to create recording BLE report timer: %s", esp_err_to_name(result));
+            }
+        }
+        if (recording_ble_close_timer_ == nullptr) {
+            const esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) {
+                    auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                    if (board == nullptr) {
+                        return;
+                    }
+                    Application::GetInstance().Schedule([board]() {
+                        board->CloseRecordingBleWindow();
+                    });
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "audream_ble_close",
+                .skip_unhandled_events = true,
+            };
+            const esp_err_t result = esp_timer_create(&timer_args, &recording_ble_close_timer_);
+            if (result != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to create recording BLE close timer: %s", esp_err_to_name(result));
+            }
+        }
+        if (recording_ble_status_retry_timer_ == nullptr) {
+            const esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) {
+                    auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                    if (board == nullptr) {
+                        return;
+                    }
+                    Application::GetInstance().Schedule([board]() {
+                        board->SendRecordingBleEventRetry();
+                    });
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "audream_ble_status",
+                .skip_unhandled_events = true,
+            };
+            const esp_err_t result = esp_timer_create(&timer_args, &recording_ble_status_retry_timer_);
+            if (result != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to create recording BLE status timer: %s", esp_err_to_name(result));
+            }
+        }
+    }
+
+    bool EnsureRecordingBleRunning(const char* reason) {
+        auto& blufi = Blufi::GetInstance();
+        if (blufi.IsActive()) {
+            return true;
+        }
+        const esp_err_t result = blufi.init(false);
+        if (result != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "Failed to start BLE for %s: %s",
+                reason == nullptr ? "recording_event" : reason,
+                esp_err_to_name(result)
+            );
+            return false;
+        }
+        ESP_LOGI(TAG, "BLE started for %s", reason == nullptr ? "recording_event" : reason);
+        return true;
+    }
+
+    void ScheduleRecordingBleClose(uint64_t delay_us) {
+        EnsureRecordingBleTimers();
+        if (recording_ble_close_timer_ == nullptr) {
+            return;
+        }
+        StopTimerIfActive(recording_ble_close_timer_, "recording_ble_close");
+        const esp_err_t result = esp_timer_start_once(recording_ble_close_timer_, delay_us);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to schedule BLE close timer: %s", esp_err_to_name(result));
+        }
+    }
+
+    void StartRecordingBleStatusRetries() {
+        EnsureRecordingBleTimers();
+        if (recording_ble_status_retry_timer_ == nullptr) {
+            return;
+        }
+        StopTimerIfActive(recording_ble_status_retry_timer_, "recording_ble_status");
+        const esp_err_t result = esp_timer_start_periodic(
+            recording_ble_status_retry_timer_,
+            kRecordingBleStatusRetryUs
+        );
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to schedule BLE status retry timer: %s", esp_err_to_name(result));
+        }
+    }
+
+    uint32_t CurrentRecordingDurationMs(const LocalRecordingMetadata& metadata) const {
+        if (metadata.started_at_uptime_ms == 0) {
+            return 0;
+        }
+        const uint64_t now_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000);
+        if (now_ms <= metadata.started_at_uptime_ms) {
+            return 0;
+        }
+        const uint64_t duration_ms = now_ms - metadata.started_at_uptime_ms;
+        return duration_ms > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(duration_ms);
+    }
+
+    void SendRecordingBleEventRetry() {
+        auto& blufi = Blufi::GetInstance();
+        if (pending_recording_stop_event_valid_) {
+            blufi.SendRecordingStoppedEvent(
+                pending_recording_stop_event_.recording_id,
+                pending_recording_stop_event_.file_name,
+                pending_recording_stop_event_.duration_ms,
+                pending_recording_stop_event_.size_bytes
+            );
+            return;
+        }
+
+        auto& recording = LocalRecordingService::GetInstance();
+        if (!recording.IsRecording()) {
+            return;
+        }
+        const auto metadata = recording.CurrentMetadata();
+        if (metadata.recording_id.empty()) {
+            return;
+        }
+        blufi.SendRecordingStatusEvent(
+            metadata.recording_id,
+            metadata.file_name,
+            CurrentRecordingDurationMs(metadata)
+        );
+    }
+
+    void OpenRecordingBleReportWindow() {
+        if (!LocalRecordingService::GetInstance().IsRecording()) {
+            return;
+        }
+        pending_recording_stop_event_valid_ = false;
+        EnsureRecordingBleRunning("recording_status");
+        SendRecordingBleEventRetry();
+        StartRecordingBleStatusRetries();
+        ScheduleRecordingBleClose(kRecordingBleReportWindowUs);
+    }
+
+    void CloseRecordingBleWindow() {
+        StopTimerIfActive(recording_ble_status_retry_timer_, "recording_ble_status");
+        pending_recording_stop_event_valid_ = false;
+        auto& blufi = Blufi::GetInstance();
+        if (!blufi.IsActive()) {
+            return;
+        }
+        const esp_err_t result = blufi.deinit();
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to stop recording BLE window: %s", esp_err_to_name(result));
+        } else {
+            ESP_LOGI(TAG, "Recording BLE window closed");
+        }
+    }
+
+    void StartRecordingBleReporting(const LocalRecordingMetadata& metadata) {
+        EnsureRecordingBleTimers();
+        pending_recording_stop_event_valid_ = false;
+        EnsureRecordingBleRunning("recording_started");
+        Blufi::GetInstance().SendRecordingStartedEvent(
+            metadata.recording_id,
+            metadata.file_name,
+            metadata.started_at_unix_ms
+        );
+        StopTimerIfActive(recording_ble_report_timer_, "recording_ble_report");
+        if (recording_ble_report_timer_ != nullptr) {
+            const esp_err_t result = esp_timer_start_periodic(
+                recording_ble_report_timer_,
+                kRecordingBleReportIntervalUs
+            );
+            if (result != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to schedule BLE report timer: %s", esp_err_to_name(result));
+            }
+        }
+        ScheduleRecordingBleClose(kRecordingBleStartGraceUs);
+    }
+
+    void StopRecordingBleReporting(const LocalRecordingMetadata& metadata) {
+        EnsureRecordingBleTimers();
+        StopTimerIfActive(recording_ble_report_timer_, "recording_ble_report");
+        pending_recording_stop_event_ = metadata;
+        pending_recording_stop_event_valid_ = true;
+        EnsureRecordingBleRunning("recording_stopped");
+        SendRecordingBleEventRetry();
+        StartRecordingBleStatusRetries();
+        ScheduleRecordingBleClose(kRecordingBleReportWindowUs);
+    }
+
     void HandleRecordingLongPressTrigger() {
         auto& recording = LocalRecordingService::GetInstance();
         auto& audio_service = Application::GetInstance().GetAudioService();
@@ -1372,12 +1601,7 @@ private:
             } else {
                 ESP_LOGW(TAG, "Button stopped local recording without valid metadata");
             }
-            Blufi::GetInstance().SendRecordingStoppedEvent(
-                metadata.recording_id,
-                metadata.file_name,
-                metadata.duration_ms,
-                metadata.size_bytes
-            );
+            StopRecordingBleReporting(metadata);
             return;
         }
 
@@ -1432,11 +1656,7 @@ private:
                 RecordingHoldStartSourceName(),
                 metadata.recording_id.c_str()
             );
-            Blufi::GetInstance().SendRecordingStartedEvent(
-                metadata.recording_id,
-                metadata.file_name,
-                metadata.started_at_unix_ms
-            );
+            StartRecordingBleReporting(metadata);
         } else {
             ScheduleRecordingHoldStartRetry();
         }

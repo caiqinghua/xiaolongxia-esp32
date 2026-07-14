@@ -466,6 +466,29 @@ esp_err_t Blufi::deinit() {
     return ret;
 }
 
+bool Blufi::IsActive() const {
+    return inited_ && !m_deinited;
+}
+
+esp_err_t Blufi::SendRecordingStatusEvent(
+    const std::string& recording_id,
+    const std::string& file_name,
+    uint32_t duration_ms
+) {
+    std::vector<uint8_t> payload;
+    payload.reserve(2 + recording_id.size() + file_name.size() + 4);
+    AppendLengthPrefixedString(payload, recording_id);
+    AppendLengthPrefixedString(payload, file_name);
+    AppendUInt32LittleEndian(payload, duration_ms);
+    const esp_err_t result = SendAudreamDeviceEvent(0x04, payload);
+    if (result != ESP_OK) {
+        ESP_LOGD(BLUFI_TAG, "Recording status event not sent: %s", esp_err_to_name(result));
+    } else {
+        ESP_LOGI(BLUFI_TAG, "Sent recording status event");
+    }
+    return result;
+}
+
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
 esp_err_t Blufi::_host_init() {
     esp_err_t ret = esp_bluedroid_init();

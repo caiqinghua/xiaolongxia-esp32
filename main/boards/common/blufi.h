@@ -42,6 +42,7 @@ public:
      * @return ESP_OK on success, otherwise an error code.
      */
     esp_err_t deinit();
+    bool IsActive() const;
 
     esp_err_t SendDeviceWillSleepEvent();
     esp_err_t SendRecordingStartedEvent(
@@ -54,6 +55,11 @@ public:
         const std::string& file_name,
         uint32_t duration_ms,
         uint32_t size_bytes
+    );
+    esp_err_t SendRecordingStatusEvent(
+        const std::string& recording_id,
+        const std::string& file_name,
+        uint32_t duration_ms
     );
 
     // Delete copy constructor and assignment operator for singleton
