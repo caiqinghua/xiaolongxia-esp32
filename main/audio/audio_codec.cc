@@ -66,6 +66,10 @@ void AudioCodec::EnableOutput(bool enable) {
     ESP_LOGI(TAG, "Set output enable to %s", enable ? "true" : "false");
 }
 
+void AudioCodec::PrepareForLocalRecording() {
+    EnableOutput(false);
+}
+
 void AudioCodec::PrepareForDeepSleep() {
     EnableInput(false);
     EnableOutput(false);

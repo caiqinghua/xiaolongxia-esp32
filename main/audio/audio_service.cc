@@ -791,6 +791,7 @@ void AudioService::EnableAudioTesting(bool enable) {
 void AudioService::EnableLocalRecording(bool enable) {
     ESP_LOGI(TAG, "%s local recording", enable ? "Enabling" : "Disabling");
     if (enable) {
+        codec_->PrepareForLocalRecording();
         xEventGroupSetBits(event_group_, AS_EVENT_LOCAL_RECORDING_RUNNING);
     } else {
         xEventGroupClearBits(event_group_, AS_EVENT_LOCAL_RECORDING_RUNNING);

@@ -3,6 +3,7 @@
 
 #include "audio_codec.h"
 
+#include <driver/gpio.h>
 #include <driver/i2s_common.h>
 #include <esp_codec_dev.h>
 #include <esp_codec_dev_defaults.h>
@@ -20,12 +21,14 @@ private:
 
     esp_codec_dev_handle_t output_dev_ = nullptr;
     esp_codec_dev_handle_t input_dev_ = nullptr;
+    gpio_num_t pa_pin_ = GPIO_NUM_NC;
     uint8_t input_mic_mask_ = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4;
     std::mutex data_if_mutex_;
 
     void CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din);
     void EnsureChannelEnabled(i2s_chan_handle_t handle);
     void DisableChannelIfEnabled(i2s_chan_handle_t handle, const char* name);
+    void ForcePowerAmplifierOff();
 
     virtual int Read(int16_t* dest, int samples) override;
     virtual int Write(const int16_t* data, int samples) override;
@@ -40,6 +43,7 @@ public:
     virtual void SetOutputVolume(int volume) override;
     virtual void EnableInput(bool enable) override;
     virtual void EnableOutput(bool enable) override;
+    virtual void PrepareForLocalRecording() override;
     virtual void PrepareForDeepSleep() override;
 };
 

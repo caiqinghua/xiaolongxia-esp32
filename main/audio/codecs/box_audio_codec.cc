@@ -1,6 +1,7 @@
 #include "box_audio_codec.h"
 
 #include <esp_log.h>
+#include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
 
@@ -15,6 +16,7 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
     input_gain_ = 30;
+    pa_pin_ = pa_pin;
     input_mic_mask_ = input_mic_mask == 0 ? ES7210_SEL_MIC1 | ES7210_SEL_MIC2 : input_mic_mask;
 
     CreateDuplexChannels(mclk, bclk, ws, dout, din);
@@ -58,6 +60,7 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
     };
     output_dev_ = esp_codec_dev_new(&dev_cfg);
     assert(output_dev_ != NULL);
+    ForcePowerAmplifierOff();
 
     // Input path
     i2c_cfg.addr = es7210_addr;
@@ -208,6 +211,20 @@ void BoxAudioCodec::DisableChannelIfEnabled(i2s_chan_handle_t handle, const char
     }
 }
 
+void BoxAudioCodec::ForcePowerAmplifierOff() {
+    if (pa_pin_ == GPIO_NUM_NC) {
+        return;
+    }
+    gpio_config_t io_config = {};
+    io_config.pin_bit_mask = 1ULL << pa_pin_;
+    io_config.mode = GPIO_MODE_OUTPUT;
+    io_config.pull_up_en = GPIO_PULLUP_DISABLE;
+    io_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_config.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&io_config);
+    gpio_set_level(pa_pin_, 0);
+}
+
 void BoxAudioCodec::SetOutputVolume(int volume) {
     ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
     AudioCodec::SetOutputVolume(volume);
@@ -229,11 +246,15 @@ void BoxAudioCodec::EnableInput(bool enable) {
         if (input_reference_) {
             fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
         }
-        // esp_codec_dev disables RX and its paired TX before reconfiguring them.
-        // Keep the driver state valid so repeated recording starts do not log ESP_ERR_INVALID_STATE.
         EnsureChannelEnabled(rx_handle_);
-        EnsureChannelEnabled(tx_handle_);
-        ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
+        esp_err_t result = esp_codec_dev_open(input_dev_, &fs);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Input codec open failed without TX channel; retrying with TX enabled: %s", esp_err_to_name(result));
+            esp_codec_dev_close(input_dev_);
+            EnsureChannelEnabled(tx_handle_);
+            result = esp_codec_dev_open(input_dev_, &fs);
+        }
+        ESP_ERROR_CHECK(result);
         ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
     } else {
         ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
@@ -261,6 +282,19 @@ void BoxAudioCodec::EnableOutput(bool enable) {
         ESP_ERROR_CHECK(esp_codec_dev_close(output_dev_));
     }
     AudioCodec::EnableOutput(enable);
+}
+
+void BoxAudioCodec::PrepareForLocalRecording() {
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    esp_err_t result = esp_codec_dev_close(output_dev_);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to close output codec before local recording: %s", esp_err_to_name(result));
+    }
+    if (output_enabled_) {
+        AudioCodec::EnableOutput(false);
+    }
+    ForcePowerAmplifierOff();
+    DisableChannelIfEnabled(tx_handle_, "TX");
 }
 
 void BoxAudioCodec::PrepareForDeepSleep() {
