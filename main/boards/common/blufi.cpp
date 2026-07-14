@@ -482,9 +482,13 @@ esp_err_t Blufi::SendRecordingStatusEvent(
     AppendUInt32LittleEndian(payload, duration_ms);
     const esp_err_t result = SendAudreamDeviceEvent(0x04, payload);
     if (result != ESP_OK) {
-        ESP_LOGD(BLUFI_TAG, "Recording status event not sent: %s", esp_err_to_name(result));
+        ESP_LOGI(BLUFI_TAG, "Recording status event not sent: %s", esp_err_to_name(result));
     } else {
-        ESP_LOGI(BLUFI_TAG, "Sent recording status event");
+        ESP_LOGI(
+            BLUFI_TAG,
+            "Sent recording status event duration_ms=%lu",
+            static_cast<unsigned long>(duration_ms)
+        );
     }
     return result;
 }
