@@ -41,10 +41,6 @@ constexpr uint8_t kAxp2101ChargeLedControlReg = 0x69;
 constexpr uint8_t kAxp2101ChargeLedOff = 0x00;
 constexpr uint8_t kAxp2101AdcChannelEnableReg = 0x30;
 constexpr uint8_t kAxp2101AdcChannelsOff = 0x00;
-constexpr uint8_t kBmi270PowerControlReg = 0x7D;
-constexpr uint8_t kBmi270PowerControlSuspend = 0x00;
-constexpr uint8_t kBmm150PowerControlReg = 0x4B;
-constexpr uint8_t kBmm150PowerControlSuspend = 0x00;
 constexpr uint8_t kFt6336PowerModeReg = 0xA5;
 constexpr uint8_t kFt6336PowerModeHibernate = 0x03;
 
@@ -65,59 +61,6 @@ void ReleasePinForDeepSleep(gpio_num_t pin) {
     gpio_set_direction(pin, GPIO_MODE_INPUT);
     gpio_pullup_dis(pin);
     gpio_pulldown_dis(pin);
-}
-
-bool TryWriteOneShotI2cReg(
-    i2c_master_bus_handle_t i2c_bus,
-    uint8_t addr,
-    uint8_t reg,
-    uint8_t value,
-    const char* device_name
-) {
-    const esp_err_t probe_result = i2c_master_probe(i2c_bus, addr, pdMS_TO_TICKS(20));
-    if (probe_result != ESP_OK) {
-        ESP_LOGD(TAG, "%s not found at 0x%02x before deep sleep: %s", device_name, addr, esp_err_to_name(probe_result));
-        return false;
-    }
-
-    i2c_device_config_t device_config = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = addr,
-        .scl_speed_hz = 400 * 1000,
-        .scl_wait_us = 0,
-        .flags = {
-            .disable_ack_check = 0,
-        },
-    };
-
-    i2c_master_dev_handle_t device = nullptr;
-    esp_err_t result = i2c_master_bus_add_device(i2c_bus, &device_config, &device);
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to add %s I2C device at 0x%02x: %s", device_name, addr, esp_err_to_name(result));
-        return false;
-    }
-
-    uint8_t buffer[2] = {reg, value};
-    result = i2c_master_transmit(device, buffer, sizeof(buffer), 100);
-    if (result == ESP_OK) {
-        ESP_LOGI(TAG, "%s deep sleep register write ok: addr=0x%02x reg=0x%02x value=0x%02x", device_name, addr, reg, value);
-    } else {
-        ESP_LOGW(
-            TAG,
-            "%s deep sleep register write failed: addr=0x%02x reg=0x%02x value=0x%02x error=%s",
-            device_name,
-            addr,
-            reg,
-            value,
-            esp_err_to_name(result)
-        );
-    }
-
-    const esp_err_t remove_result = i2c_master_bus_rm_device(device);
-    if (remove_result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to remove %s I2C device at 0x%02x: %s", device_name, addr, esp_err_to_name(remove_result));
-    }
-    return result == ESP_OK;
 }
 
 }  // namespace
@@ -747,33 +690,6 @@ private:
         codec->PrepareForDeepSleep();
     }
 
-    void PrepareMotionSensorsForDeepSleep() {
-        static constexpr uint8_t kBmi270Addresses[] = {0x68, 0x69};
-        static constexpr uint8_t kBmm150Addresses[] = {0x10, 0x11, 0x12, 0x13};
-
-        bool bmi270_suspended = false;
-        for (const uint8_t addr : kBmi270Addresses) {
-            if (TryWriteOneShotI2cReg(i2c_bus_, addr, kBmi270PowerControlReg, kBmi270PowerControlSuspend, "BMI270")) {
-                bmi270_suspended = true;
-                break;
-            }
-        }
-        if (!bmi270_suspended) {
-            ESP_LOGW(TAG, "BMI270 suspend command was not acknowledged before deep sleep");
-        }
-
-        bool bmm150_suspended = false;
-        for (const uint8_t addr : kBmm150Addresses) {
-            if (TryWriteOneShotI2cReg(i2c_bus_, addr, kBmm150PowerControlReg, kBmm150PowerControlSuspend, "BMM150")) {
-                bmm150_suspended = true;
-                break;
-            }
-        }
-        if (!bmm150_suspended) {
-            ESP_LOGW(TAG, "BMM150 suspend command was not acknowledged before deep sleep");
-        }
-    }
-
     void ConfigureDisplayPinsForDeepSleep() {
         static constexpr gpio_num_t kDisplayPins[] = {
             GPIO_NUM_3,
@@ -836,7 +752,6 @@ private:
         if (ft6336_ != nullptr) {
             ft6336_->PrepareForDeepSleep();
         }
-        PrepareMotionSensorsForDeepSleep();
         if (aw9523_ != nullptr) {
             aw9523_->PrepareForDeepSleep();
         }
