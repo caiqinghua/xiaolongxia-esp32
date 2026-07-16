@@ -47,6 +47,7 @@ constexpr uint16_t kRecordingButtonHoldMs = 1500;
 constexpr int64_t kDeepSleepWakeRecordHoldUs = static_cast<int64_t>(kRecordingButtonHoldMs) * 1000LL;
 constexpr uint64_t kRecordingFeedbackScreenOnUs = 3000ULL * 1000ULL;
 constexpr uint64_t kRecordingHoldRetryUs = 200ULL * 1000ULL;
+constexpr bool kRecordingBlePeriodicStatusReportsEnabled = false;
 constexpr uint64_t kRecordingBleStartGraceUs = 2ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kRecordingBleReportIntervalUs = 5ULL * 60ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kRecordingBleReportWindowUs = 30ULL * 1000ULL * 1000ULL;
@@ -1580,7 +1581,7 @@ private:
             metadata.started_at_unix_ms
         );
         StopTimerIfActive(recording_ble_report_timer_, "recording_ble_report");
-        if (recording_ble_report_timer_ != nullptr) {
+        if (kRecordingBlePeriodicStatusReportsEnabled && recording_ble_report_timer_ != nullptr) {
             const esp_err_t result = esp_timer_start_periodic(
                 recording_ble_report_timer_,
                 kRecordingBleReportIntervalUs
@@ -1588,6 +1589,8 @@ private:
             if (result != ESP_OK) {
                 ESP_LOGW(TAG, "Failed to schedule BLE report timer: %s", esp_err_to_name(result));
             }
+        } else if (!kRecordingBlePeriodicStatusReportsEnabled) {
+            ESP_LOGI(TAG, "Recording BLE periodic status reports are disabled");
         }
         ScheduleRecordingBleClose(kRecordingBleStartGraceUs);
     }
