@@ -407,10 +407,8 @@ esp_err_t Blufi::SendRecordingStoppedEvent(
 
 esp_err_t Blufi::init(bool enable_wifi_provisioning) {
     esp_err_t ret = ESP_FAIL;
-    inited_ = true;
     control_only_mode_ = !enable_wifi_provisioning;
     m_provisioned = false;
-    m_deinited = false;
 
     if (enable_wifi_provisioning) {
         auto& wifi_manager = WifiManager::GetInstance();
@@ -430,6 +428,9 @@ esp_err_t Blufi::init(bool enable_wifi_provisioning) {
     ret = _controller_init();
     if (ret) {
         ESP_LOGE(BLUFI_TAG, "BLUFI controller init failed: %s", esp_err_to_name(ret));
+        _controller_deinit();
+        inited_ = false;
+        m_deinited = true;
         return ret;
     }
 #endif
@@ -437,9 +438,16 @@ esp_err_t Blufi::init(bool enable_wifi_provisioning) {
     ret = _host_and_cb_init();
     if (ret) {
         ESP_LOGE(BLUFI_TAG, "BLUFI host and cb init failed: %s", esp_err_to_name(ret));
+#if CONFIG_BT_CONTROLLER_ENABLED || !CONFIG_BT_NIMBLE_ENABLED
+        _controller_deinit();
+#endif
+        inited_ = false;
+        m_deinited = true;
         return ret;
     }
 
+    inited_ = true;
+    m_deinited = false;
     ESP_LOGI(BLUFI_TAG, "BLUFI VERSION %04x", esp_blufi_get_version());
     return ESP_OK;
 }

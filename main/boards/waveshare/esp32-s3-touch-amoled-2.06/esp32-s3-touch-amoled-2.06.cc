@@ -1501,6 +1501,9 @@ private:
     void SendRecordingBleEventRetry() {
         auto& blufi = Blufi::GetInstance();
         if (pending_recording_stop_event_valid_) {
+            if (!blufi.IsActive() && !EnsureRecordingBleRunning("recording_stopped_retry")) {
+                return;
+            }
             blufi.SendRecordingStoppedEvent(
                 pending_recording_stop_event_.recording_id,
                 pending_recording_stop_event_.file_name,
@@ -1516,6 +1519,9 @@ private:
         }
         const auto metadata = recording.CurrentMetadata();
         if (metadata.recording_id.empty()) {
+            return;
+        }
+        if (!blufi.IsActive() && !EnsureRecordingBleRunning("recording_status_retry")) {
             return;
         }
         blufi.SendRecordingStatusEvent(
