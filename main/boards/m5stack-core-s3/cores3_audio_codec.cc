@@ -2,6 +2,7 @@
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
+#include <driver/i2s_common.h>
 #include <driver/i2s_tdm.h>
 
 #define TAG "CoreS3AudioCodec"
@@ -182,6 +183,25 @@ void CoreS3AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gp
     ESP_LOGI(TAG, "Duplex channels created");
 }
 
+void CoreS3AudioCodec::DisableChannelIfEnabled(i2s_chan_handle_t handle, const char* name) {
+    if (handle == nullptr) {
+        return;
+    }
+    i2s_chan_info_t channel_info = {};
+    esp_err_t result = i2s_channel_get_info(handle, &channel_info);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to query %s channel before deep sleep: %s", name, esp_err_to_name(result));
+        return;
+    }
+    if (!channel_info.is_enabled) {
+        return;
+    }
+    result = i2s_channel_disable(handle);
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Failed to disable %s channel before deep sleep: %s", name, esp_err_to_name(result));
+    }
+}
+
 void CoreS3AudioCodec::SetOutputVolume(int volume) {
     ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
     AudioCodec::SetOutputVolume(volume);
@@ -229,6 +249,26 @@ void CoreS3AudioCodec::EnableOutput(bool enable) {
         ESP_ERROR_CHECK(esp_codec_dev_close(output_dev_));
     }
     AudioCodec::EnableOutput(enable);
+}
+
+void CoreS3AudioCodec::PrepareForDeepSleep() {
+    esp_err_t result = esp_codec_dev_close(input_dev_);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to close input codec before deep sleep: %s", esp_err_to_name(result));
+    }
+    if (input_enabled_) {
+        AudioCodec::EnableInput(false);
+    }
+    result = esp_codec_dev_close(output_dev_);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to close output codec before deep sleep: %s", esp_err_to_name(result));
+    }
+    if (output_enabled_) {
+        AudioCodec::EnableOutput(false);
+    }
+    DisableChannelIfEnabled(rx_handle_, "RX");
+    DisableChannelIfEnabled(tx_handle_, "TX");
+    ESP_LOGI(TAG, "Audio codec prepared for deep sleep");
 }
 
 int CoreS3AudioCodec::Read(int16_t* dest, int samples) {
