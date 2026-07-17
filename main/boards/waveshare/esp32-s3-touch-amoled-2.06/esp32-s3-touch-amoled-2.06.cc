@@ -1546,7 +1546,11 @@ private:
 
     void CloseRecordingBleWindow() {
         StopTimerIfActive(recording_ble_status_retry_timer_, "recording_ble_status");
-        pending_recording_stop_event_valid_ = false;
+        if (pending_recording_stop_event_valid_) {
+            pending_recording_stop_event_valid_ = false;
+            ESP_LOGI(TAG, "Recording stopped event retry window ended; keeping BLE active");
+            return;
+        }
         auto& blufi = Blufi::GetInstance();
         if (!blufi.IsActive()) {
             return;
@@ -1562,6 +1566,10 @@ private:
     void HandleRecordingStatusAcknowledged() {
         Application::GetInstance().Schedule([this]() {
             if (pending_recording_stop_event_valid_) {
+                StopTimerIfActive(recording_ble_status_retry_timer_, "recording_ble_status");
+                StopTimerIfActive(recording_ble_close_timer_, "recording_ble_close");
+                pending_recording_stop_event_valid_ = false;
+                ESP_LOGI(TAG, "Recording stopped event acknowledged; keeping BLE active");
                 return;
             }
             if (!LocalRecordingService::GetInstance().IsRecording()) {
@@ -1599,6 +1607,7 @@ private:
     void StopRecordingBleReporting(const LocalRecordingMetadata& metadata) {
         EnsureRecordingBleTimers();
         StopTimerIfActive(recording_ble_report_timer_, "recording_ble_report");
+        StopTimerIfActive(recording_ble_close_timer_, "recording_ble_close");
         pending_recording_stop_event_ = metadata;
         pending_recording_stop_event_valid_ = true;
         EnsureRecordingBleRunning("recording_stopped");
