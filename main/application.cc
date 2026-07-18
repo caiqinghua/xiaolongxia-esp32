@@ -2,8 +2,10 @@
 #include "board.h"
 #include "display.h"
 #include "lcd_display.h"
+#if CONFIG_IDF_TARGET_ESP32S3
 #include "camera_display.h"
 #include "esp_camera.h"
+#endif
 #include "esp_lvgl_port.h"
 #include "system_info.h"
 #include "audio_codec.h"
@@ -176,8 +178,8 @@ void Application::Initialize() {
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
 
-    // 启动相机预览（默认在主界面显示）
-    // 只有带摄像头的板子才启动摄像头预览
+#if CONFIG_IDF_TARGET_ESP32S3
+    // Start camera preview only on boards that provide a camera.
     if (board.GetCamera() != nullptr) {
         ESP_LOGI(TAG, "Starting camera preview on main screen");
         auto lcd_display = dynamic_cast<LcdDisplay*>(display);
@@ -202,6 +204,7 @@ void Application::Initialize() {
     } else {
         ESP_LOGI(TAG, "Board does not have camera, skipping camera preview");
     }
+#endif
 }
 
 void Application::Run() {
@@ -756,7 +759,7 @@ void Application::HandleToggleChatEvent() {
         ESP_LOGI(TAG, "ToggleChat: stopping listening and closing text result");
         protocol_->CloseAudioChannel();
 
-        // 关闭文本结果并恢复相机预览
+        // Close text results and restore camera preview.
         CloseTextResultAndRestorePreview();
     }
 }
@@ -825,7 +828,7 @@ void Application::HandleStopListeningEvent() {
         }
         SetDeviceState(kDeviceStateIdle);
 
-        // 关闭文本结果并恢复相机预览
+        // Close text results and restore camera preview.
         ESP_LOGI(TAG, "Calling CloseTextResultAndRestorePreview");
         CloseTextResultAndRestorePreview();
     } else {
@@ -1191,16 +1194,19 @@ void Application::ToggleCameraMode() {
 }
 
 bool Application::PauseCameraPreview() {
+#if CONFIG_IDF_TARGET_ESP32S3
     if (camera_display_ != nullptr && camera_display_->IsRunning()) {
         ESP_LOGI(TAG, "Pausing camera preview for photo capture");
         camera_display_->Stop();
         camera_preview_paused_ = true;
         return true;
     }
+#endif
     return false;
 }
 
 void Application::ResumeCameraPreview() {
+#if CONFIG_IDF_TARGET_ESP32S3
     if (camera_preview_paused_ && camera_display_ != nullptr) {
         ESP_LOGI(TAG, "Resuming camera preview after photo capture");
         if (camera_display_->Start()) {
@@ -1210,6 +1216,7 @@ void Application::ResumeCameraPreview() {
         }
         camera_preview_paused_ = false;
     }
+#endif
 }
 
 void Application::CloseTextResultAndRestorePreview() {
@@ -1217,16 +1224,19 @@ void Application::CloseTextResultAndRestorePreview() {
     auto lcd_display = dynamic_cast<LcdDisplay*>(display);
 
     ESP_LOGI(TAG, "CloseTextResultAndRestorePreview called");
+#if CONFIG_IDF_TARGET_ESP32S3
     ESP_LOGI(TAG, "camera_display_: %p, IsRunning: %d", camera_display_,
              camera_display_ != nullptr ? camera_display_->IsRunning() : -1);
+#endif
 
-    // 关闭文本结果控件
+    // Close the text result widget.
     if (lcd_display != nullptr) {
         lcd_display->CloseTextResult();
         ESP_LOGI(TAG, "Text result closed");
     }
 
-    // 恢复相机预览
+#if CONFIG_IDF_TARGET_ESP32S3
+    // Restore camera preview.
     if (camera_display_ != nullptr) {
         if (!camera_display_->IsRunning()) {
             ESP_LOGI(TAG, "Starting camera preview...");
@@ -1242,20 +1252,22 @@ void Application::CloseTextResultAndRestorePreview() {
     } else {
         ESP_LOGE(TAG, "camera_display_ is nullptr, cannot restore preview");
     }
+#endif
 }
 
 void Application::HandleToggleCameraEvent() {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
 
-    // 检查板子是否有摄像头
+#if CONFIG_IDF_TARGET_ESP32S3
+    // Check whether the board has a camera.
     if (board.GetCamera() == nullptr) {
         ESP_LOGW(TAG, "Board does not have camera");
         display->ShowNotification("该板子不支持相机");
         return;
     }
 
-    // 检查 esp_camera 是否已初始化
+    // Check whether esp_camera has been initialized.
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor == nullptr) {
         ESP_LOGW(TAG, "Camera not initialized");
@@ -1264,19 +1276,19 @@ void Application::HandleToggleCameraEvent() {
     }
 
     if (!camera_mode_enabled_) {
-        // 启动相机模式
+        // Start camera mode.
         ESP_LOGI(TAG, "Starting camera mode");
 
         if (camera_display_ == nullptr) {
             camera_display_ = new CameraDisplay();
 
-            // 获取preview_image_来显示相机预览
+            // Use preview_image_ to display the camera preview.
             auto lcd_display = dynamic_cast<LcdDisplay*>(display);
             if (lcd_display != nullptr && lvgl_port_lock(0)) {
                 lv_obj_t* preview_img = lcd_display->GetPreviewImage();
 
                 if (preview_img != nullptr) {
-                    // preview_image_已经默认全屏显示，直接设置给相机显示
+                    // preview_image_ is already full-screen by default.
                     camera_display_->SetCameraImage(preview_img);
                     ESP_LOGI(TAG, "Using preview_image for camera display: 320x480");
                 }
@@ -1296,7 +1308,7 @@ void Application::HandleToggleCameraEvent() {
             display->ShowNotification("相机启动失败");
         }
     } else {
-        // 停止相机模式
+        // Stop camera mode.
         ESP_LOGI(TAG, "Stopping camera mode");
 
         if (camera_display_ != nullptr) {
@@ -1308,4 +1320,8 @@ void Application::HandleToggleCameraEvent() {
         camera_mode_enabled_ = false;
         display->ShowNotification("相机已关闭");
     }
+#else
+    ESP_LOGW(TAG, "Camera is not supported on this target");
+    display->ShowNotification("Camera is not supported");
+#endif
 }

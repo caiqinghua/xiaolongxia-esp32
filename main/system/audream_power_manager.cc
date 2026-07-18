@@ -7,6 +7,7 @@
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "soc/soc_caps.h"
 #if CONFIG_PM_ENABLE
 #include "esp_pm.h"
 #endif
@@ -18,7 +19,11 @@ namespace {
 constexpr char kTag[] = "AudreamPower";
 constexpr int64_t kIdleToDeepSleepUs = 180LL * 1000000LL;
 constexpr int64_t kTickDelayMs = 1000;
+#if CONFIG_IDF_TARGET_ESP32C6
+constexpr int kDefaultCpuMaxMhz = 160;
+#else
 constexpr int kDefaultCpuMaxMhz = 240;
+#endif
 constexpr int kDefaultCpuMinMhz = 40;
 constexpr int kRecordingCpuMaxMhz = 80;
 constexpr int kRecordingCpuMinMhz = 40;
@@ -328,7 +333,16 @@ void AudreamPowerManager::EnterDeepSleep() {
             idle_started_us_ = esp_timer_get_time();
             return;
         }
+#if SOC_PM_SUPPORT_EXT0_WAKEUP
         const esp_err_t wake_result = esp_sleep_enable_ext0_wakeup(wake_gpio_, 0);
+#elif SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
+        const esp_err_t wake_result = esp_deep_sleep_enable_gpio_wakeup(
+            1ULL << static_cast<uint32_t>(wake_gpio_),
+            ESP_GPIO_WAKEUP_GPIO_LOW
+        );
+#else
+        const esp_err_t wake_result = ESP_ERR_NOT_SUPPORTED;
+#endif
         if (wake_result != ESP_OK) {
             ESP_LOGE(
                 kTag,

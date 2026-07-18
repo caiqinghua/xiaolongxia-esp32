@@ -18,7 +18,6 @@ set(SOURCES "audio/audio_codec.cc"
             "display/display.cc"
             "display/lcd_display.cc"
             "display/oled_display.cc"
-            "display/camera_display.cc"
             "display/lvgl_display/lvgl_display.cc"
             "display/emote_display.cc"
             "display/lvgl_display/emoji_collection.cc"
@@ -325,6 +324,12 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_C6_TOUCH_AMOLED_2_06)
     set(BUILTIN_TEXT_FONT font_puhui_basic_30_4)
     set(BUILTIN_ICON_FONT font_awesome_30_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+    set(AUDREAM_SD_CS_GPIO GPIO_NUM_23)
+    set(AUDREAM_SD_MOSI_GPIO GPIO_NUM_18)
+    set(AUDREAM_SD_MISO_GPIO GPIO_NUM_20)
+    set(AUDREAM_SD_CLK_GPIO GPIO_NUM_19)
+    set(AUDREAM_SD_SPI_HOST SPI2_HOST)
+    set(AUDREAM_SD_USE_SDMMC 0)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_4B)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-touch-lcd-4b")
@@ -904,7 +909,9 @@ endif()
 
 # Include Esp32Camera if target is ESP32S3
 if(CONFIG_IDF_TARGET_ESP32S3)
-    list(APPEND SOURCES "boards/common/esp32_camera.cc")
+    list(APPEND SOURCES "boards/common/esp32_camera.cc"
+                        "display/camera_display.cc"
+                        )
 endif()
 
 idf_component_register(SRCS ${SOURCES}

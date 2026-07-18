@@ -5,7 +5,11 @@
         {
             "name": "esp32-c6-touch-amoled-2.06",
             "sdkconfig_append": [
-                "CONFIG_USE_ESP_WAKE_WORD=y"
+                "CONFIG_USE_ESP_WAKE_WORD=n",
+                "CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING=y",
+                "CONFIG_USE_WECHAT_MESSAGE_STYLE=n",
+                "CONFIG_PM_ENABLE=y",
+                "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y"
             ]
         }
     ]

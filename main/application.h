@@ -169,11 +169,12 @@ private:
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
-    // 相机显示
+#if CONFIG_IDF_TARGET_ESP32S3
+    // Camera display state.
     class CameraDisplay* camera_display_ = nullptr;
     bool camera_mode_enabled_ = false;
-    bool camera_preview_paused_ = false;  // 记录预览是否被暂停
-
+    bool camera_preview_paused_ = false;
+#endif
 
     // Event handlers
     void HandleStateChangedEvent();

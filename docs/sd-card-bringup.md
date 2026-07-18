@@ -14,6 +14,84 @@
 - SD 卡初始化应在设备启动流程中主动执行，iOS 只读取缓存状态或主动 refresh/remount，不应由 iOS 首次命令触发真实初始化。
 - FATFS 需要启用 Long File Name，否则 `/sdcard/audream/recordings` 这类长目录名会创建失败。
 
+## Waveshare ESP32-C6 Touch AMOLED 2.06 原理图结论
+
+### 1. Arduino 示例没有 SD 卡引脚定义
+
+本地 Waveshare C6 2.06 Arduino 包路径：
+
+```text
+/Users/lin/ai/voicerecord/ispeak/firmware/ESP32-C6-Touch-AMOLED-2.06/examples/Arduino-v3.3.0
+```
+
+板级 `Mylibrary/pin_config.h` 只定义了 LCD 和 I2C/touch 相关引脚：
+
+- LCD: `LCD_SDIO0=1`, `LCD_SDIO1=2`, `LCD_SDIO2=3`, `LCD_SDIO3=4`, `LCD_SCLK=0`, `LCD_CS=5`, `LCD_RESET=11`
+- I2C/touch: `IIC_SDA=8`, `IIC_SCL=7`, `TP_INT=15`, `TP_RESET=10`
+
+顶层 Arduino examples 没有板级 `SD_*`、`TF_*`、`SDMMC` 或 `SDSPI` 定义。搜索到的 SD 内容主要来自 Arduino_GFX、LVGL、SensorLib 的通用示例，不能作为这块板子的 pin map 依据。
+
+### 2. 原理图里的 ESP32-C6 SDIO 引脚组
+
+参考文件：
+
+```text
+/Users/lin/ai/voicerecord/ispeak/firmware/ESP32-C6-Touch-AMOLED-2.06/Schematic/ESP32-C6-Touch-AMOLED-2.06-Schematic-V1.0.pdf
+```
+
+PDF 由 Altium Designer 导出，共 3 页。通过 macOS Quick Look 渲染第一页，并解压 PDF content stream 后重建文字坐标，确认 ESP32-C6 芯片侧 SDIO 引脚组如下：
+
+- `SDIO_CMD`: GPIO18
+- `SDIO_CLK`: GPIO19
+- `SDIO_DATA0`: GPIO20
+- `SDIO_DATA1`: GPIO21
+- `SDIO_DATA2`: GPIO22
+- `SDIO_DATA3`: GPIO23
+
+这组信号是 ESP32-C6 芯片的 SDIO 复用引脚。当前本地样机没有焊接 SD/TF 卡座，因此无法插入实际 SD 卡验证挂载成功，但原理图读取结果本身是有效的。
+
+### 3. C6 固件接入方式
+
+当前 `SdCardStorage` 的 SDMMC 分支使用 `SDMMC_HOST_DEFAULT()`。ESP32-C6 目标下这条路径不可用，之前把 C6 强行配置成 `AUDREAM_SD_USE_SDMMC=1` 会导致编译失败。
+
+因此 C6 2.06 在当前固件中按 SDSPI mode 接入同一组 SDIO 线：
+
+- `AUDREAM_SD_MOSI_GPIO=GPIO_NUM_18`，对应 SDIO CMD
+- `AUDREAM_SD_CLK_GPIO=GPIO_NUM_19`，对应 SDIO CLK
+- `AUDREAM_SD_MISO_GPIO=GPIO_NUM_20`，对应 SDIO DATA0
+- `AUDREAM_SD_CS_GPIO=GPIO_NUM_23`，对应 SDIO DATA3，在 SPI mode 下作为 CS
+- `AUDREAM_SD_SPI_HOST=SPI2_HOST`
+- `AUDREAM_SD_USE_SDMMC=0`
+
+代码位置：
+
+- `main/CMakeLists.txt`
+- `main/storage/sd_card_storage.cc`
+
+### 4. 未焊卡座样机的预期日志
+
+在没有焊接 SD/TF 卡座、或没有实际插卡的 C6 2.06 样机上，启动后会看到 SDSPI mount timeout：
+
+```text
+AudreamStorage: Mounting SD card in SDSPI mode on host=1 with pins cs=23 mosi=18 miso=20 clk=19
+spi_bus_initialize(...): SPI bus already initialized.
+AudreamStorage: SD SPI bus was already initialized
+AudreamStorage: Calling esp_vfs_fat_sdspi_mount at /sdcard
+vfs_fat_sdmmc: sdmmc_card_init failed (0x107).
+AudreamStorage: Failed to mount SD card: ESP_ERR_TIMEOUT (263).
+```
+
+这里的 `ESP_ERR_TIMEOUT` 不说明 pin map 一定错误；在当前实物没有 SD/TF 卡座的情况下，这是无法和卡通信的预期结果。`SPI bus already initialized` 表示 SPI host 已被系统或其他初始化路径占用过，当前 storage 代码会把 `ESP_ERR_INVALID_STATE` 当作可继续状态处理。
+
+### 5. 后续硬件验证建议
+
+要验证 C6 2.06 SD 存储链路，需要满足以下条件：
+
+- 样机焊接 SD/TF 卡座，或用飞线把卡座连接到上述 SDIO 引脚组。
+- 卡以 FAT32 格式化。
+- 首次验证优先使用小容量或已确认可被 ESP-IDF 识别的卡。
+- 启动日志应从 `sdmmc_card_init failed (0x107)` 变为打印 card info，并完成 `/sdcard` mount。
+
 ## 调试过程
 
 ### 1. 最初按 SDSPI 方向接入
