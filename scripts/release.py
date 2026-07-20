@@ -3,6 +3,7 @@ import os
 import json
 import zipfile
 import argparse
+import shlex
 from pathlib import Path
 from typing import Optional
 
@@ -39,7 +40,7 @@ def get_project_version() -> Optional[str]:
 
 
 def merge_bin() -> None:
-    if os.system("idf.py merge-bin") != 0:
+    if os.system(f"{_idf_py()} merge-bin") != 0:
         print("merge-bin failed", file=sys.stderr)
         sys.exit(1)
 
@@ -63,6 +64,16 @@ def _get_manufacturer(cfg: dict) -> Optional[str]:
     if isinstance(m, str) and m.strip():
         return m.strip()
     return None
+
+
+def _idf_py() -> str:
+    """Return an idf.py command that works even when idf.py is a shell function."""
+    idf_path = os.environ.get("IDF_PATH")
+    if idf_path:
+        idf_script = Path(idf_path) / "tools" / "idf.py"
+        if idf_script.exists():
+            return f"{shlex.quote(sys.executable)} {shlex.quote(str(idf_script))}"
+    return "idf.py"
 
 ################################################################################
 # board / variant related functions
@@ -274,7 +285,8 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
         os.environ.pop("IDF_TARGET", None)
 
         # Call set-target
-        if os.system(f"idf.py set-target {target}") != 0:
+        idf_cmd = _idf_py()
+        if os.system(f"{idf_cmd} set-target {shlex.quote(target)}") != 0:
             print("set-target failed", file=sys.stderr)
             sys.exit(1)
 
@@ -285,7 +297,10 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
             for append in sdkconfig_append:
                 f.write(f"{append}\n")
         # Build with macro BOARD_NAME defined to name
-        if os.system(f"idf.py -DBOARD_NAME={name} -DBOARD_TYPE={board_type} build") != 0:
+        if os.system(
+            f"{idf_cmd} -DBOARD_NAME={shlex.quote(name)} "
+            f"-DBOARD_TYPE={shlex.quote(board_type)} build"
+        ) != 0:
             print("build failed")
             sys.exit(1)
 

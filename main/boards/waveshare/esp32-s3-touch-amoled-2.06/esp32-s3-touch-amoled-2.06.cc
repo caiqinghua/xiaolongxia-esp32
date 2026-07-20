@@ -133,6 +133,17 @@ const FeedbackGlyph* GetFeedbackGlyph(char character) {
     static constexpr FeedbackGlyph kGlyphS = {0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110};
     static constexpr FeedbackGlyph kGlyphT = {0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100};
     static constexpr FeedbackGlyph kGlyphU = {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110};
+    static constexpr FeedbackGlyph kGlyph0 = {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110};
+    static constexpr FeedbackGlyph kGlyph1 = {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110};
+    static constexpr FeedbackGlyph kGlyph2 = {0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111};
+    static constexpr FeedbackGlyph kGlyph3 = {0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110};
+    static constexpr FeedbackGlyph kGlyph4 = {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010};
+    static constexpr FeedbackGlyph kGlyph5 = {0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110};
+    static constexpr FeedbackGlyph kGlyph6 = {0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110};
+    static constexpr FeedbackGlyph kGlyph7 = {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000};
+    static constexpr FeedbackGlyph kGlyph8 = {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110};
+    static constexpr FeedbackGlyph kGlyph9 = {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110};
+    static constexpr FeedbackGlyph kGlyphPercent = {0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011};
     switch (character) {
         case 'A': return &kGlyphA;
         case 'D': return &kGlyphD;
@@ -144,6 +155,17 @@ const FeedbackGlyph* GetFeedbackGlyph(char character) {
         case 'S': return &kGlyphS;
         case 'T': return &kGlyphT;
         case 'U': return &kGlyphU;
+        case '0': return &kGlyph0;
+        case '1': return &kGlyph1;
+        case '2': return &kGlyph2;
+        case '3': return &kGlyph3;
+        case '4': return &kGlyph4;
+        case '5': return &kGlyph5;
+        case '6': return &kGlyph6;
+        case '7': return &kGlyph7;
+        case '8': return &kGlyph8;
+        case '9': return &kGlyph9;
+        case '%': return &kGlyphPercent;
         default: return nullptr;
     }
 }
@@ -534,6 +556,7 @@ private:
     uint16_t* recording_feedback_draw_buffer_ = nullptr;
     uint16_t* recording_feedback_logo_tile_buffer_ = nullptr;
     const char* recording_feedback_text_ = "AUDREAM";
+    char boot_battery_feedback_text_[8] = {};
     bool pending_deep_sleep_recording_ = false;
     bool suppress_next_wake_long_press_ = false;
     bool deep_sleep_wake_ = false;
@@ -1102,6 +1125,19 @@ private:
             return;
         }
         backlight_->SetImmediateBrightness(0);
+    }
+
+    void PulseBootBatteryScreen() {
+        int level = 0;
+        bool charging = false;
+        bool discharging = false;
+        if (!GetBatteryLevel(level, charging, discharging)) {
+            PulseRecordingFeedbackScreen("AUDREAM");
+            return;
+        }
+        level = std::clamp(level, 0, 100);
+        std::snprintf(boot_battery_feedback_text_, sizeof(boot_battery_feedback_text_), "%d%%", level);
+        PulseRecordingFeedbackScreen(boot_battery_feedback_text_);
     }
 
     void ConfigureDisplayPinsForDeepSleep() {
@@ -1751,7 +1787,7 @@ public:
         });
         InitializeRecordingButton();
         DetectDeepSleepRecordingIntent();
-        PulseRecordingFeedbackScreen("AUDREAM");
+        PulseBootBatteryScreen();
         ESP_LOGI(TAG, "Touch and WiFi application features are disabled");
         auto& storage = SdCardStorage::GetInstance();
         storage.SetInitializationCompleteCallback([this](const StorageStatus& status) {
