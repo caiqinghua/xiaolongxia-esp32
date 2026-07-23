@@ -52,7 +52,8 @@ constexpr uint16_t kCapabilityRecordingStorage = 1 << 10;
 constexpr uint16_t kCapabilityRecordingFileTransfer = 1 << 11;
 constexpr uint16_t kCapabilityTemporaryAPTransfer = 1 << 12;
 constexpr uint16_t kCapabilityTimeSync = 1 << 13;
-constexpr uint16_t kCapabilities =
+constexpr uint16_t kCapabilityRecordingPauseResume = 1 << 14;
+constexpr uint16_t kBaseCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityMicrophoneGain |
     kCapabilityCallGain |
@@ -96,6 +97,8 @@ enum class Opcode : uint8_t {
     kDeleteLocalRecording = 0x28,
     kReadLocalRecordingMetadata = 0x29,
     kRecordingStatusAck = 0x2A,
+    kPauseLocalRecording = 0x2B,
+    kResumeLocalRecording = 0x2C,
 };
 
 enum class Status : uint8_t {
@@ -252,6 +255,22 @@ void AudreamDeviceControl::SetRecordingStatusAcknowledgedCallback(std::function<
     recording_status_acknowledged_callback_ = std::move(callback);
 }
 
+void AudreamDeviceControl::SetRecordingPauseCallbacks(
+    std::function<bool()> pause_callback,
+    std::function<bool()> resume_callback
+) {
+    recording_pause_callback_ = std::move(pause_callback);
+    recording_resume_callback_ = std::move(resume_callback);
+}
+
+uint16_t AudreamDeviceControl::Capabilities() const {
+    const bool supports_pause_resume =
+        recording_pause_callback_ != nullptr &&
+        recording_resume_callback_ != nullptr;
+    return kBaseCapabilities |
+        (supports_pause_resume ? kCapabilityRecordingPauseResume : 0);
+}
+
 AudreamDeviceControl::DeviceState AudreamDeviceControl::LoadState() const {
     Settings settings(kSettingsNamespace);
     int battery_level = kDefaultBatteryLevelPercent;
@@ -328,7 +347,7 @@ std::vector<uint8_t> AudreamDeviceControl::BuildResponse(
     response.push_back(opcode | kResponseOpcodeMask);
     AppendUInt16(response, request_id);
     response.push_back(status);
-    AppendUInt16(response, kCapabilities);
+    AppendUInt16(response, Capabilities());
     AppendUInt16(
         response,
         kSimulatedCapabilities |
@@ -582,6 +601,69 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     ? static_cast<uint8_t>(Status::kSuccess)
                     : static_cast<uint8_t>(Status::kIoError),
                 payload
+            );
+        }
+
+        case Opcode::kPauseLocalRecording:
+        case Opcode::kResumeLocalRecording: {
+            if (length != kRequestHeaderLength) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            const bool is_pause = opcode == Opcode::kPauseLocalRecording;
+            const auto& callback = is_pause
+                ? recording_pause_callback_
+                : recording_resume_callback_;
+            if (!callback) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kUnsupportedOpcode),
+                    {}
+                );
+            }
+            auto& recording = LocalRecordingService::GetInstance();
+            if (!recording.IsRecording()) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kNotRecording),
+                    {}
+                );
+            }
+            if (
+                (is_pause && recording.IsPaused()) ||
+                (!is_pause && !recording.IsPaused())
+            ) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kSuccess),
+                    {}
+                );
+            }
+            if (!callback()) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kIoError),
+                    {}
+                );
+            }
+            ESP_LOGI(
+                kTag,
+                "Local recording %s command completed",
+                is_pause ? "pause" : "resume"
+            );
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                {}
             );
         }
 

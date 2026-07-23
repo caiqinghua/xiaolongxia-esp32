@@ -10,6 +10,10 @@ public:
     static AudreamDeviceControl& GetInstance();
 
     void SetRecordingStatusAcknowledgedCallback(std::function<void()> callback);
+    void SetRecordingPauseCallbacks(
+        std::function<bool()> pause_callback,
+        std::function<bool()> resume_callback
+    );
     std::vector<uint8_t> HandleRequest(const uint8_t* data, size_t length);
 
     AudreamDeviceControl(const AudreamDeviceControl&) = delete;
@@ -18,6 +22,8 @@ public:
 private:
     AudreamDeviceControl() = default;
     std::function<void()> recording_status_acknowledged_callback_;
+    std::function<bool()> recording_pause_callback_;
+    std::function<bool()> recording_resume_callback_;
 
     struct DeviceState {
         int32_t auto_power_off_seconds;
@@ -33,6 +39,7 @@ private:
     };
 
     DeviceState LoadState() const;
+    uint16_t Capabilities() const;
     void ApplyMicrophoneGain(uint8_t gain_db) const;
     void ResetSettings() const;
     std::vector<uint8_t> BuildResponse(

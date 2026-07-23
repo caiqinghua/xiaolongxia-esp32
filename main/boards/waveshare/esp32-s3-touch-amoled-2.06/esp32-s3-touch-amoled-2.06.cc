@@ -1525,15 +1525,10 @@ private:
     }
 
     uint32_t CurrentRecordingDurationMs(const LocalRecordingMetadata& metadata) const {
-        if (metadata.started_at_uptime_ms == 0) {
+        if (metadata.recording_id.empty()) {
             return 0;
         }
-        const uint64_t now_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000);
-        if (now_ms <= metadata.started_at_uptime_ms) {
-            return 0;
-        }
-        const uint64_t duration_ms = now_ms - metadata.started_at_uptime_ms;
-        return duration_ms > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(duration_ms);
+        return LocalRecordingService::GetInstance().CurrentDurationMs();
     }
 
     void SendRecordingBleEventRetry() {
@@ -1785,6 +1780,26 @@ public:
         AudreamDeviceControl::GetInstance().SetRecordingStatusAcknowledgedCallback([this]() {
             HandleRecordingStatusAcknowledged();
         });
+        AudreamDeviceControl::GetInstance().SetRecordingPauseCallbacks(
+            [this]() {
+                const bool paused = LocalRecordingService::GetInstance().Pause(
+                    Application::GetInstance().GetAudioService()
+                );
+                if (paused) {
+                    PulseRecordingFeedbackScreen("PAUSE");
+                }
+                return paused;
+            },
+            [this]() {
+                const bool resumed = LocalRecordingService::GetInstance().Resume(
+                    Application::GetInstance().GetAudioService()
+                );
+                if (resumed) {
+                    PulseRecordingFeedbackScreen("RESUME");
+                }
+                return resumed;
+            }
+        );
         InitializeRecordingButton();
         DetectDeepSleepRecordingIntent();
         PulseBootBatteryScreen();

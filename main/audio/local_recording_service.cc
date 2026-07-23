@@ -181,6 +181,8 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
             current_.started_at_rtc_ms = esp_rtc_get_time_us() / 1000;
             current_.started_at_unix_ms = time_service.CurrentUnixTimeMs();
             current_.time_synchronized = time_service.IsSynchronized();
+            paused_at_us_ = 0;
+            accumulated_paused_us_ = 0;
             state_ = State::kRecording;
         }
 
@@ -200,6 +202,8 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
         current_ = {};
         current_highlights_.clear();
         started_at_us_ = 0;
+        paused_at_us_ = 0;
+        accumulated_paused_us_ = 0;
         state_ = State::kClosed;
         return false;
     }
@@ -209,28 +213,103 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
     return true;
 }
 
-LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) {
+bool LocalRecordingService::Pause(AudioService& audio_service) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ != State::kRecording) {
-            return last_;
+        if (state_ == State::kPaused) {
+            return true;
         }
-        state_ = State::kStopping;
+        if (state_ != State::kRecording) {
+            ESP_LOGW(kTag, "Local recording pause ignored because recording is not active");
+            return false;
+        }
+        state_ = State::kPausing;
     }
 
     AudreamPowerManager::GetInstance().SetRecordingCaptureActive(false);
     audio_service.EnableLocalRecording(false);
     if (!audio_service.WaitForLocalRecordingDrain(kStopDrainTimeoutMs)) {
-        ESP_LOGW(kTag, "Local recording stop continued before encoder queue fully drained");
+        ESP_LOGW(kTag, "Local recording pause continued before encoder queue fully drained");
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ != State::kPausing) {
+        return false;
+    }
+    paused_at_us_ = esp_timer_get_time();
+    state_ = State::kPaused;
+    ESP_LOGI(
+        kTag,
+        "Paused local recording: id=%s duration=%lu ms",
+        current_.recording_id.c_str(),
+        static_cast<unsigned long>(CurrentDurationMsLocked(paused_at_us_))
+    );
+    return true;
+}
+
+bool LocalRecordingService::Resume(AudioService& audio_service) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == State::kRecording) {
+            return true;
+        }
+        if (state_ != State::kPaused || paused_at_us_ <= 0) {
+            ESP_LOGW(kTag, "Local recording resume ignored because recording is not paused");
+            return false;
+        }
+        accumulated_paused_us_ += std::max<int64_t>(0, esp_timer_get_time() - paused_at_us_);
+        paused_at_us_ = 0;
+        state_ = State::kResuming;
+    }
+
+    AudreamPowerManager::GetInstance().SetRecordingCaptureActive(true);
+    audio_service.EnableLocalRecording(true);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ != State::kResuming) {
+        return false;
+    }
+    state_ = State::kRecording;
+    ESP_LOGI(
+        kTag,
+        "Resumed local recording: id=%s duration=%lu ms",
+        current_.recording_id.c_str(),
+        static_cast<unsigned long>(CurrentDurationMsLocked(esp_timer_get_time()))
+    );
+    return true;
+}
+
+LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) {
+    bool capture_was_active = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != State::kRecording && state_ != State::kPaused) {
+            return last_;
+        }
+        capture_was_active = state_ == State::kRecording;
+        if (state_ == State::kPaused && paused_at_us_ > 0) {
+            accumulated_paused_us_ += std::max<int64_t>(
+                0,
+                esp_timer_get_time() - paused_at_us_
+            );
+            paused_at_us_ = 0;
+        }
+        state_ = State::kStopping;
+    }
+
+    if (capture_was_active) {
+        AudreamPowerManager::GetInstance().SetRecordingCaptureActive(false);
+        audio_service.EnableLocalRecording(false);
+        if (!audio_service.WaitForLocalRecordingDrain(kStopDrainTimeoutMs)) {
+            ESP_LOGW(kTag, "Local recording stop continued before encoder queue fully drained");
+        }
     }
     audio_service.SetLocalRecordingPacketCallback(nullptr);
 
     std::lock_guard<std::mutex> lock(mutex_);
     writer_.Close();
 
-    current_.duration_ms = static_cast<uint32_t>(
-        (esp_timer_get_time() - started_at_us_) / 1000
-    );
+    current_.duration_ms = CurrentDurationMsLocked(esp_timer_get_time());
     current_.size_bytes = FileSizeBytes(current_.file_path);
     current_.packet_count = writer_.PacketCount();
     current_.valid = current_.size_bytes > 0 && current_.packet_count > 0;
@@ -265,6 +344,9 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
     );
     current_ = {};
     current_highlights_.clear();
+    started_at_us_ = 0;
+    paused_at_us_ = 0;
+    accumulated_paused_us_ = 0;
     return last_;
 }
 
@@ -273,9 +355,7 @@ bool LocalRecordingService::AddMarkerHighlight(const std::string& source) {
     if (state_ != State::kRecording || started_at_us_ <= 0 || current_.recording_id.empty()) {
         return false;
     }
-    const uint32_t timestamp_ms = static_cast<uint32_t>(
-        std::max<int64_t>(0, esp_timer_get_time() - started_at_us_) / 1000
-    );
+    const uint32_t timestamp_ms = CurrentDurationMsLocked(esp_timer_get_time());
     LocalRecordingHighlight highlight;
     highlight.timestamp_ms = timestamp_ms;
     highlight.kind = "marker";
@@ -293,7 +373,12 @@ bool LocalRecordingService::AddMarkerHighlight(const std::string& source) {
 
 void LocalRecordingService::HandleOpusPacket(const uint8_t* data, size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ != State::kRecording && state_ != State::kStopping) {
+    if (
+        state_ != State::kRecording &&
+        state_ != State::kPausing &&
+        state_ != State::kResuming &&
+        state_ != State::kStopping
+    ) {
         return;
     }
     if (!writer_.WritePacket(data, size)) {
@@ -305,7 +390,20 @@ bool LocalRecordingService::IsRecording() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return state_ == State::kOpening ||
         state_ == State::kRecording ||
+        state_ == State::kPausing ||
+        state_ == State::kPaused ||
+        state_ == State::kResuming ||
         state_ == State::kStopping;
+}
+
+bool LocalRecordingService::IsPaused() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return state_ == State::kPaused;
+}
+
+uint32_t LocalRecordingService::CurrentDurationMs() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return CurrentDurationMsLocked(esp_timer_get_time());
 }
 
 LocalRecordingMetadata LocalRecordingService::CurrentMetadata() const {
@@ -316,6 +414,21 @@ LocalRecordingMetadata LocalRecordingService::CurrentMetadata() const {
 LocalRecordingMetadata LocalRecordingService::LastMetadata() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return last_;
+}
+
+uint32_t LocalRecordingService::CurrentDurationMsLocked(int64_t now_us) const {
+    if (started_at_us_ <= 0 || now_us <= started_at_us_) {
+        return 0;
+    }
+    int64_t paused_us = accumulated_paused_us_;
+    if (paused_at_us_ > 0 && now_us > paused_at_us_) {
+        paused_us += now_us - paused_at_us_;
+    }
+    const int64_t active_us = std::max<int64_t>(
+        0,
+        now_us - started_at_us_ - paused_us
+    );
+    return static_cast<uint32_t>(active_us / 1000);
 }
 
 bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& metadata) const {
