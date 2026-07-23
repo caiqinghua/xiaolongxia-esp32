@@ -15,6 +15,7 @@
 #include "storage/sd_card_storage.h"
 #include "storage/temporary_ap_transfer_service.h"
 #include "system/audream_power_manager.h"
+#include "system/battery_telemetry_service.h"
 #include "system/device_time_service.h"
 
 namespace {
@@ -53,6 +54,7 @@ constexpr uint16_t kCapabilityRecordingFileTransfer = 1 << 11;
 constexpr uint16_t kCapabilityTemporaryAPTransfer = 1 << 12;
 constexpr uint16_t kCapabilityTimeSync = 1 << 13;
 constexpr uint16_t kCapabilityRecordingPauseResume = 1 << 14;
+constexpr uint16_t kCapabilityBatteryTelemetry = 1 << 15;
 constexpr uint16_t kBaseCapabilities =
     kCapabilityAutoPowerOff |
     kCapabilityMicrophoneGain |
@@ -99,6 +101,9 @@ enum class Opcode : uint8_t {
     kRecordingStatusAck = 0x2A,
     kPauseLocalRecording = 0x2B,
     kResumeLocalRecording = 0x2C,
+    kGetBatteryTelemetryInfo = 0x2D,
+    kReadBatteryTelemetry = 0x2E,
+    kClearBatteryTelemetry = 0x2F,
 };
 
 enum class Status : uint8_t {
@@ -120,6 +125,8 @@ bool IsMaintenanceOpcode(Opcode opcode) {
         case Opcode::kSyncTime:
         case Opcode::kGetStorageStatus:
         case Opcode::kListLocalRecordings:
+        case Opcode::kGetBatteryTelemetryInfo:
+        case Opcode::kReadBatteryTelemetry:
             return true;
         default:
             return false;
@@ -268,7 +275,10 @@ uint16_t AudreamDeviceControl::Capabilities() const {
         recording_pause_callback_ != nullptr &&
         recording_resume_callback_ != nullptr;
     return kBaseCapabilities |
-        (supports_pause_resume ? kCapabilityRecordingPauseResume : 0);
+        (supports_pause_resume ? kCapabilityRecordingPauseResume : 0) |
+        (BatteryTelemetryService::GetInstance().IsEnabled()
+            ? kCapabilityBatteryTelemetry
+            : 0);
 }
 
 AudreamDeviceControl::DeviceState AudreamDeviceControl::LoadState() const {
@@ -564,6 +574,9 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     {}
                 );
             }
+            BatteryTelemetryService::GetInstance().RecordEvent(
+                BatteryTelemetryEvent::kRecordingStarted
+            );
             const auto metadata = recording.CurrentMetadata();
             std::vector<uint8_t> payload;
             AppendString(payload, metadata.recording_id);
@@ -587,6 +600,9 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 );
             }
             const auto metadata = recording.Stop(Application::GetInstance().GetAudioService());
+            BatteryTelemetryService::GetInstance().RecordEvent(
+                BatteryTelemetryEvent::kRecordingStopped
+            );
             std::vector<uint8_t> payload;
             AppendUInt32(payload, metadata.duration_ms);
             AppendUInt32(payload, metadata.size_bytes);
@@ -793,6 +809,9 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     {}
                 );
             }
+            BatteryTelemetryService::GetInstance().RecordEvent(
+                BatteryTelemetryEvent::kTransferStarted
+            );
             std::vector<uint8_t> payload;
             AppendString(payload, session.ssid);
             AppendString(payload, session.password);
@@ -827,6 +846,9 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     {}
                 );
             }
+            BatteryTelemetryService::GetInstance().RecordEvent(
+                BatteryTelemetryEvent::kTransferStopped
+            );
             return BuildPayloadResponse(
                 opcode_value,
                 request_id,
@@ -834,6 +856,91 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 {}
             );
         }
+
+        case Opcode::kGetBatteryTelemetryInfo: {
+            if (length != kRequestHeaderLength) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            const auto info = BatteryTelemetryService::GetInstance().GetInfo();
+            std::vector<uint8_t> payload;
+            payload.reserve(38);
+            payload.push_back(BatteryTelemetryService::kRecordVersion);
+            payload.push_back(
+                static_cast<uint8_t>(BatteryTelemetryService::kEncodedRecordSize)
+            );
+            AppendUInt32(payload, info.record_count);
+            AppendUInt64(payload, info.oldest_cursor.rtc_epoch_sequence);
+            AppendUInt64(payload, info.oldest_cursor.rtc_time_us);
+            AppendUInt64(payload, info.newest_cursor.rtc_epoch_sequence);
+            AppendUInt64(payload, info.newest_cursor.rtc_time_us);
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                payload
+            );
+        }
+
+        case Opcode::kReadBatteryTelemetry: {
+            if (length != kRequestHeaderLength + sizeof(uint64_t) * 2 + 1) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            const BatteryTelemetryCursor after_cursor = {
+                .rtc_epoch_sequence = ReadUInt64(&data[kRequestHeaderLength]),
+                .rtc_time_us = ReadUInt64(
+                    &data[kRequestHeaderLength + sizeof(uint64_t)]
+                ),
+            };
+            const uint8_t max_count = std::clamp<uint8_t>(
+                data[kRequestHeaderLength + sizeof(uint64_t) * 2],
+                1,
+                4
+            );
+            const auto records = BatteryTelemetryService::GetInstance().ReadAfter(
+                after_cursor,
+                max_count
+            );
+            std::vector<uint8_t> payload;
+            payload.reserve(1 + records.size() * BatteryTelemetryService::kEncodedRecordSize);
+            payload.push_back(static_cast<uint8_t>(records.size()));
+            for (const auto& record : records) {
+                BatteryTelemetryService::AppendEncodedRecord(payload, record);
+            }
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                static_cast<uint8_t>(Status::kSuccess),
+                payload
+            );
+        }
+
+        case Opcode::kClearBatteryTelemetry:
+            if (length != kRequestHeaderLength) {
+                return BuildPayloadResponse(
+                    opcode_value,
+                    request_id,
+                    static_cast<uint8_t>(Status::kInvalidRequest),
+                    {}
+                );
+            }
+            return BuildPayloadResponse(
+                opcode_value,
+                request_id,
+                BatteryTelemetryService::GetInstance().Clear()
+                    ? static_cast<uint8_t>(Status::kSuccess)
+                    : static_cast<uint8_t>(Status::kIoError),
+                {}
+            );
 
         case Opcode::kDeleteLocalRecording: {
             size_t cursor = kRequestHeaderLength;

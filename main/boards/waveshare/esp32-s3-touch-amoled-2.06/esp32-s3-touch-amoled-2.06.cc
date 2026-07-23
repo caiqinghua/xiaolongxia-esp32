@@ -12,7 +12,9 @@
 #include "audio/local_recording_service.h"
 #include "audream_device_control.h"
 #include "storage/sd_card_storage.h"
+#include "storage/temporary_ap_transfer_service.h"
 #include "system/boot_diagnostics.h"
+#include "system/battery_telemetry_service.h"
 #include "system/audream_power_manager.h"
 #include "blufi.h"
 
@@ -70,6 +72,10 @@ constexpr uint8_t kAxp2101LdoOnOffReg0 = 0x90;
 constexpr uint8_t kAxp2101Aldo1VoltageReg = 0x92;
 constexpr uint8_t kAxp2101Aldo1Aldo2Aldo3Aldo4EnableMask = 0x0F;
 constexpr uint8_t kAxp2101Aldo1Voltage3300mv = (3300 - 500) / 100;
+constexpr uint8_t kAxp2101AdcChannelEnableReg = 0x30;
+constexpr uint8_t kAxp2101BatteryDetectionReg = 0x68;
+constexpr uint8_t kAxp2101BatteryVoltageHighReg = 0x34;
+constexpr uint8_t kAxp2101BatteryVoltageLowReg = 0x35;
 static_assert(kFeedbackMaxTextWidth <= DISPLAY_WIDTH);
 static_assert(kFeedbackTextHeight <= DISPLAY_HEIGHT);
 
@@ -233,6 +239,61 @@ public:
         return true;
     }
 
+    bool ReadBatteryTelemetrySnapshot(BatteryTelemetrySnapshot& snapshot) {
+        uint8_t status1 = 0;
+        uint8_t status2 = 0;
+        uint8_t battery = 0;
+        uint8_t voltage_high = 0;
+        uint8_t voltage_low = 0;
+        const esp_err_t status1_result = TryReadReg(0x00, &status1);
+        const esp_err_t status2_result = TryReadReg(0x01, &status2);
+        const esp_err_t battery_result = TryReadReg(0xA4, &battery);
+        const esp_err_t voltage_high_result = TryReadReg(
+            kAxp2101BatteryVoltageHighReg,
+            &voltage_high
+        );
+        const esp_err_t voltage_low_result = TryReadReg(
+            kAxp2101BatteryVoltageLowReg,
+            &voltage_low
+        );
+        if (
+            status1_result != ESP_OK ||
+            status2_result != ESP_OK ||
+            battery_result != ESP_OK ||
+            voltage_high_result != ESP_OK ||
+            voltage_low_result != ESP_OK
+        ) {
+            ESP_LOGW(
+                TAG,
+                "PMIC telemetry read failed: status1=%s status2=%s battery=%s voltage_high=%s voltage_low=%s",
+                esp_err_to_name(status1_result),
+                esp_err_to_name(status2_result),
+                esp_err_to_name(battery_result),
+                esp_err_to_name(voltage_high_result),
+                esp_err_to_name(voltage_low_result)
+            );
+            return false;
+        }
+
+        const int battery_direction = (status2 & 0b01100000) >> 5;
+        snapshot.battery_percent = battery;
+        snapshot.battery_voltage_mv =
+            (static_cast<uint16_t>(voltage_high & 0x1F) << 8) |
+            voltage_low;
+        snapshot.status1 = status1;
+        snapshot.status2 = status2;
+        snapshot.flags = 0;
+        if (battery_direction == 1) {
+            snapshot.flags |= kBatteryTelemetryCharging;
+        } else if (battery_direction == 2) {
+            snapshot.flags |= kBatteryTelemetryDischarging;
+        }
+        if ((status1 & 0x20) != 0) {
+            snapshot.flags |= kBatteryTelemetryUsbPowered;
+        }
+        return true;
+    }
+
 private:
     static constexpr int kWriteAttempts = 3;
     bool initialized_ = false;
@@ -296,6 +357,10 @@ private:
             if (!WriteRegWithRetry(entry.reg, entry.value)) {
                 return false;
             }
+        }
+        if (!UpdateRegWithRetry(kAxp2101AdcChannelEnableReg, 0x00, 0x01) ||
+            !UpdateRegWithRetry(kAxp2101BatteryDetectionReg, 0x00, 0x01)) {
+            return false;
         }
         return true;
     }
@@ -711,6 +776,8 @@ private:
         if (pmic_ == nullptr) {
             return;
         }
+        const bool was_initialized = power_source_initialized_;
+        const bool was_usb_powered = usb_powered_;
         const uint8_t status1 = pmic_->GetStatus1();
         const uint8_t status2 = pmic_->GetStatus2();
         const bool usb_powered = pmic_->IsVbusIn();
@@ -729,6 +796,49 @@ private:
                 pmic_->IsDischarging() ? 1 : 0
             );
         }
+        if (was_initialized && was_usb_powered != usb_powered) {
+            BatteryTelemetryService::GetInstance().RecordEvent(
+                usb_powered
+                    ? BatteryTelemetryEvent::kUsbConnected
+                    : BatteryTelemetryEvent::kUsbDisconnected
+            );
+        }
+    }
+
+    bool ReadBatteryTelemetrySnapshot(BatteryTelemetrySnapshot& snapshot) {
+        if (pmic_ == nullptr && !TryInitializePmic()) {
+            return false;
+        }
+        if (pmic_mutex_ != nullptr) {
+            xSemaphoreTake(pmic_mutex_, portMAX_DELAY);
+        }
+        const bool success = pmic_ != nullptr && pmic_->ReadBatteryTelemetrySnapshot(snapshot);
+        if (pmic_mutex_ != nullptr) {
+            xSemaphoreGive(pmic_mutex_);
+        }
+        if (!success) {
+            return false;
+        }
+
+        auto& recording = LocalRecordingService::GetInstance();
+        if (recording.IsRecording()) {
+            snapshot.flags |= kBatteryTelemetryRecording;
+        }
+        if (recording.IsPaused()) {
+            snapshot.flags |= kBatteryTelemetryRecordingPaused;
+        }
+        if (TemporaryAPTransferService::GetInstance().IsActive()) {
+            snapshot.flags |= kBatteryTelemetryTransferActive;
+        }
+        return true;
+    }
+
+    void InitializeBatteryTelemetry() {
+        BatteryTelemetryService::GetInstance().Start(
+            [this](BatteryTelemetrySnapshot& snapshot) {
+                return ReadBatteryTelemetrySnapshot(snapshot);
+            }
+        );
     }
 
     void InitializeRecordingPowerManagement() {
@@ -1195,6 +1305,11 @@ private:
     }
 
     void PrepareBoardForDeepSleep() {
+        auto& battery_telemetry = BatteryTelemetryService::GetInstance();
+        if (!battery_telemetry.FlushBeforeSleep()) {
+            ESP_LOGW(TAG, "Battery telemetry could not be flushed before deep sleep");
+        }
+        battery_telemetry.Stop();
         if (recording_feedback_screen_timer_ != nullptr) {
             const esp_err_t stop_result = esp_timer_stop(recording_feedback_screen_timer_);
             if (stop_result != ESP_OK && stop_result != ESP_ERR_INVALID_STATE) {
@@ -1653,6 +1768,9 @@ private:
         if (recording.IsRecording()) {
             recording_hold_start_pending_ = false;
             const auto metadata = recording.Stop(audio_service);
+            BatteryTelemetryService::GetInstance().RecordEvent(
+                BatteryTelemetryEvent::kRecordingStopped
+            );
             PulseRecordingFeedbackScreen("STOP");
             if (metadata.valid) {
                 ESP_LOGI(
@@ -1712,6 +1830,9 @@ private:
         auto& audio_service = Application::GetInstance().GetAudioService();
         if (recording.Start(audio_service)) {
             recording_hold_start_pending_ = false;
+            BatteryTelemetryService::GetInstance().RecordEvent(
+                BatteryTelemetryEvent::kRecordingStarted
+            );
             const auto metadata = recording.CurrentMetadata();
             PulseRecordingFeedbackScreen("START");
             ESP_LOGI(
@@ -1777,6 +1898,7 @@ public:
         }
         InitializeAxp2101();
         InitializeRecordingPowerManagement();
+        InitializeBatteryTelemetry();
         AudreamDeviceControl::GetInstance().SetRecordingStatusAcknowledgedCallback([this]() {
             HandleRecordingStatusAcknowledged();
         });
@@ -1786,6 +1908,9 @@ public:
                     Application::GetInstance().GetAudioService()
                 );
                 if (paused) {
+                    BatteryTelemetryService::GetInstance().RecordEvent(
+                        BatteryTelemetryEvent::kRecordingPaused
+                    );
                     PulseRecordingFeedbackScreen("PAUSE");
                 }
                 return paused;
@@ -1795,6 +1920,9 @@ public:
                     Application::GetInstance().GetAudioService()
                 );
                 if (resumed) {
+                    BatteryTelemetryService::GetInstance().RecordEvent(
+                        BatteryTelemetryEvent::kRecordingResumed
+                    );
                     PulseRecordingFeedbackScreen("RESUME");
                 }
                 return resumed;
