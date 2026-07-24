@@ -10,17 +10,19 @@
 
 enum class BatteryTelemetryEvent : uint8_t {
     kBoot = 1,
-    kStartupSample = 2,
-    kPeriodic = 3,
-    kUsbConnected = 4,
-    kUsbDisconnected = 5,
-    kRecordingStarted = 6,
-    kRecordingPaused = 7,
-    kRecordingResumed = 8,
-    kRecordingStopped = 9,
-    kTransferStarted = 10,
-    kTransferStopped = 11,
-    kPreSleep = 12,
+    kStartup5Seconds = 2,
+    kStartup15Seconds = 3,
+    kStartup30Seconds = 4,
+    kPeriodic = 5,
+    kUsbConnected = 6,
+    kUsbDisconnected = 7,
+    kRecordingStarted = 8,
+    kRecordingPaused = 9,
+    kRecordingResumed = 10,
+    kRecordingStopped = 11,
+    kTransferStarted = 12,
+    kTransferStopped = 13,
+    kPreSleep = 14,
 };
 
 enum BatteryTelemetryFlag : uint8_t {
@@ -46,7 +48,7 @@ struct BatteryTelemetryCursor {
 };
 
 struct BatteryTelemetryRecord {
-    uint8_t version = 1;
+    uint8_t version = 2;
     BatteryTelemetryEvent event = BatteryTelemetryEvent::kPeriodic;
     uint8_t flags = 0;
     uint8_t battery_percent = 0;
@@ -67,7 +69,7 @@ struct BatteryTelemetryInfo {
 
 class BatteryTelemetryService {
 public:
-    static constexpr uint8_t kRecordVersion = 1;
+    static constexpr uint8_t kRecordVersion = 2;
     static constexpr size_t kEncodedRecordSize = 44;
 
     static BatteryTelemetryService& GetInstance();

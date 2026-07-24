@@ -19,16 +19,39 @@ constexpr char kTag[] = "BatteryTelemetry";
 constexpr char kTelemetryDirectory[] = "/sdcard/audream/telemetry/battery";
 constexpr char kCurrentFile[] = "/sdcard/audream/telemetry/battery/current.bin";
 constexpr char kPreviousFile[] = "/sdcard/audream/telemetry/battery/previous.bin";
-constexpr uint8_t kFileHeader[] = {'A', 'D', 'B', 'T', 1, 44, 0, 0};
+constexpr uint8_t kFileHeader[] = {
+    'A',
+    'D',
+    'B',
+    'T',
+    BatteryTelemetryService::kRecordVersion,
+    static_cast<uint8_t>(BatteryTelemetryService::kEncodedRecordSize),
+    0,
+    0,
+};
 constexpr size_t kFileHeaderSize = sizeof(kFileHeader);
 constexpr size_t kMaxBufferedRecords = 512;
 constexpr size_t kMaxSegmentBytes = 4 * 1024 * 1024;
 constexpr uint64_t kTimerIntervalUs = 5ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kPeriodicIntervalUs = 60ULL * 1000ULL * 1000ULL;
-constexpr uint64_t kStartupSampleTimesUs[] = {
-    5ULL * 1000ULL * 1000ULL,
-    15ULL * 1000ULL * 1000ULL,
-    30ULL * 1000ULL * 1000ULL,
+struct StartupSample {
+    uint64_t elapsed_us;
+    BatteryTelemetryEvent event;
+};
+
+constexpr StartupSample kStartupSamples[] = {
+    {
+        .elapsed_us = 5ULL * 1000ULL * 1000ULL,
+        .event = BatteryTelemetryEvent::kStartup5Seconds,
+    },
+    {
+        .elapsed_us = 15ULL * 1000ULL * 1000ULL,
+        .event = BatteryTelemetryEvent::kStartup15Seconds,
+    },
+    {
+        .elapsed_us = 30ULL * 1000ULL * 1000ULL,
+        .event = BatteryTelemetryEvent::kStartup30Seconds,
+    },
 };
 
 void AppendUInt16(std::vector<uint8_t>& output, uint16_t value) {
@@ -151,6 +174,22 @@ uint64_t FileSize(const char* path) {
     return static_cast<uint64_t>(status.st_size);
 }
 
+bool RemoveIncompatibleSegment(const char* path) {
+    if (FileSize(path) == 0) {
+        return true;
+    }
+    FILE* file = fopen(path, "rb");
+    const bool valid_header = file != nullptr && ReadHeader(file);
+    if (file != nullptr) {
+        fclose(file);
+    }
+    if (valid_header) {
+        return true;
+    }
+    ESP_LOGW(kTag, "Discarding incompatible battery telemetry segment: %s", path);
+    return RemoveIfPresent(path);
+}
+
 uint32_t RecordCount(const char* path) {
     const uint64_t size = FileSize(path);
     if (size < kFileHeaderSize) {
@@ -165,6 +204,11 @@ bool DecodeRecord(const uint8_t* data, BatteryTelemetryRecord& record) {
     if (data[0] != BatteryTelemetryService::kRecordVersion) {
         return false;
     }
+    const uint8_t event = data[1];
+    if (event < static_cast<uint8_t>(BatteryTelemetryEvent::kBoot) ||
+        event > static_cast<uint8_t>(BatteryTelemetryEvent::kPreSleep)) {
+        return false;
+    }
     const uint32_t expected_crc = ReadUInt32(
         &data[BatteryTelemetryService::kEncodedRecordSize - sizeof(uint32_t)]
     );
@@ -176,7 +220,7 @@ bool DecodeRecord(const uint8_t* data, BatteryTelemetryRecord& record) {
         return false;
     }
     record.version = data[0];
-    record.event = static_cast<BatteryTelemetryEvent>(data[1]);
+    record.event = static_cast<BatteryTelemetryEvent>(event);
     record.flags = data[2];
     record.battery_percent = data[3];
     record.battery_voltage_mv = ReadUInt16(&data[4]);
@@ -352,10 +396,10 @@ void BatteryTelemetryService::HandleTimer() {
             return;
         }
         const uint64_t elapsed_us = now_us - started_at_us_;
-        if (startup_sample_index_ < std::size(kStartupSampleTimesUs) &&
-            elapsed_us >= kStartupSampleTimesUs[startup_sample_index_]) {
+        if (startup_sample_index_ < std::size(kStartupSamples) &&
+            elapsed_us >= kStartupSamples[startup_sample_index_].elapsed_us) {
+            event = kStartupSamples[startup_sample_index_].event;
             startup_sample_index_++;
-            event = BatteryTelemetryEvent::kStartupSample;
             should_record = true;
         } else if (now_us - last_periodic_sample_us_ >= kPeriodicIntervalUs) {
             last_periodic_sample_us_ = now_us;
@@ -443,21 +487,11 @@ bool BatteryTelemetryService::FlushLocked() {
     }
 
     const size_t encoded_size = buffered_records_.size() * kEncodedRecordSize;
-    uint64_t current_size = FileSize(kCurrentFile);
-    if (current_size > 0) {
-        FILE* current = fopen(kCurrentFile, "rb");
-        const bool valid_header = current != nullptr && ReadHeader(current);
-        if (current != nullptr) {
-            fclose(current);
-        }
-        if (!valid_header) {
-            ESP_LOGW(kTag, "Discarding incompatible battery telemetry segment");
-            if (!RemoveIfPresent(kCurrentFile)) {
-                return false;
-            }
-            current_size = 0;
-        }
+    if (!RemoveIncompatibleSegment(kPreviousFile) ||
+        !RemoveIncompatibleSegment(kCurrentFile)) {
+        return false;
     }
+    uint64_t current_size = FileSize(kCurrentFile);
     if (current_size >= kFileHeaderSize &&
         current_size + encoded_size > kMaxSegmentBytes) {
         remove(kPreviousFile);
