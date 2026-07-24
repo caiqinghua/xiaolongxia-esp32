@@ -59,7 +59,7 @@ Active -> Light Sleep -> Deep Sleep
 
 在 `Light Sleep` 中，如果发生有效活动，立即回到 `Active`。
 
-如果只发生后台维护活动，例如 `listLocalRecordings` 或 `syncTime`，可以短暂处理，但保持 `Light Sleep`，且不重置 180 秒计时。
+如果只发生后台维护活动，例如 `listLocalRecordings` 或 `syncTime`，可以短暂处理，但保持 `Light Sleep`，且不重置 30 秒计时。
 
 ### Deep Sleep
 
@@ -68,7 +68,7 @@ Active -> Light Sleep -> Deep Sleep
 进入条件：
 
 - 已处于 `Light Sleep`。
-- `Light Sleep` 连续持续 180 秒。
+- `Light Sleep` 连续持续 30 秒。
 - 期间没有有效活动使设备回到 `Active`。
 - 当前没有录音。
 - 当前没有 BLE/Wi-Fi 文件传输。
@@ -105,7 +105,7 @@ Active -> Light Sleep -> Deep Sleep
 
 正式版本可以恢复 USB 供电阻塞规则：USB 供电或调试连接时，不自动进入 `Deep Sleep`，避免串口断开、烧录和 monitor 被影响。
 
-USB 不阻止进入 `Light Sleep`。正式版本如果设备已在 `Light Sleep` 且达到 180 秒，但检测到 USB 供电，应停留在 `Light Sleep`。
+USB 不阻止进入 `Light Sleep`。正式版本如果设备已在 `Light Sleep` 且达到 30 秒，但检测到 USB 供电，应停留在 `Light Sleep`。
 
 On AXP2101 boards, the USB blocker must use the PMIC VBUS input state, not
 `!IsDischarging()`. AXP2101 can report standby or charge-done states that are
@@ -121,7 +121,7 @@ Deep sleep blocked by USB power
 
 不要每秒刷屏。建议同一原因至少间隔 60 秒再打印一次。
 
-正式版本如果 USB 拔掉，设备仍处于 `Light Sleep` 且已经满足 180 秒条件，则下一次 power manager tick 可以进入 `Deep Sleep`。
+正式版本如果 USB 拔掉，设备仍处于 `Light Sleep` 且已经满足 30 秒条件，则下一次 power manager tick 可以进入 `Deep Sleep`。
 
 ## 未同步录音策略
 
@@ -132,11 +132,23 @@ Stop recording
 -> Active 120 秒同步窗口
 -> 未开始同步或同步失败
 -> Light Sleep
--> Light Sleep 连续 180 秒无有效活动
+-> Light Sleep 连续 30 秒无有效活动
 -> Deep Sleep
 ```
 
 未同步录音只能延长 `Active` 同步窗口，不能让设备绕过 `Light Sleep` 直接进入 `Deep Sleep`。
+
+## 录音低电量保护
+
+Waveshare ESP32-S3 Touch AMOLED 2.06 在录音期间复用 5 秒电源状态定时器检查负载下电池电压。AXP2101 的百分比可能在重新开机时重新估算，因此低电量停止以电压为准，百分比只用于日志和界面提示。
+
+- USB 供电或正在充电时不触发低电量停止。
+- 电压连续 3 次不高于 3450mV，也就是持续约 15 秒，执行正常录音停止流程。
+- 任一次电压不高于 3350mV，立即执行正常录音停止流程。
+- 停止操作必须调度到 Application 主任务，不能在 `esp_timer` 或 I2C 回调上下文中直接排空音频队列。
+- 正常停止会关闭 Ogg Opus 文件、写入最终 metadata、记录 `RecordingStopped` 电池事件，并保留 120 秒同步窗口。
+
+该策略优先保证录音文件完整，不继续录制到 PMIC 欠压断电。阈值需要通过实际录音放电测试验证；如果样机在更高电压失稳，应相应提高停止阈值。
 
 如果 `Light Sleep` 中 iOS 开始真实同步：
 
@@ -147,7 +159,7 @@ Light Sleep
 -> 传输完成
 -> Active idle timeout
 -> Light Sleep
--> 180 秒无有效活动
+-> 30 秒无有效活动
 -> Deep Sleep
 ```
 
@@ -209,7 +221,7 @@ Power manager 每 1 秒 tick 一次即可。日志需要节流，避免影响功
 - Active / Light Sleep / Deep Sleep 状态机。
 - 有效活动与后台维护活动区分。
 - 停止录音后的 120 秒同步窗口。
-- Light Sleep 180 秒后尝试 Deep Sleep。
+- Light Sleep 30 秒后尝试 Deep Sleep。
 - 当前调试版本中 USB 供电不阻止 Deep Sleep。
 - 按键唤醒。
 

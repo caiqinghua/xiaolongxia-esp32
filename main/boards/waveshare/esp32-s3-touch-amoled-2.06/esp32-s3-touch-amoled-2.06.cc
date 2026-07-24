@@ -38,6 +38,7 @@
 #include <lvgl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -76,6 +77,9 @@ constexpr uint8_t kAxp2101AdcChannelEnableReg = 0x30;
 constexpr uint8_t kAxp2101BatteryDetectionReg = 0x68;
 constexpr uint8_t kAxp2101BatteryVoltageHighReg = 0x34;
 constexpr uint8_t kAxp2101BatteryVoltageLowReg = 0x35;
+constexpr uint16_t kRecordingLowBatteryStopVoltageMv = 3450;
+constexpr uint16_t kRecordingEmergencyStopVoltageMv = 3350;
+constexpr uint8_t kRecordingLowBatteryRequiredSamples = 3;
 static_assert(kFeedbackMaxTextWidth <= DISPLAY_WIDTH);
 static_assert(kFeedbackTextHeight <= DISPLAY_HEIGHT);
 
@@ -626,6 +630,8 @@ private:
     bool suppress_next_wake_long_press_ = false;
     bool deep_sleep_wake_ = false;
     bool pmic_recovery_task_started_ = false;
+    uint8_t recording_low_battery_sample_count_ = 0;
+    std::atomic<bool> recording_low_battery_stop_pending_{false};
     int64_t deep_sleep_wake_button_down_us_ = 0;
 
     void InitializeCodecI2c() {
@@ -805,6 +811,90 @@ private:
         }
     }
 
+    void CheckRecordingLowBattery() {
+        auto& recording = LocalRecordingService::GetInstance();
+        if (!recording.IsRecording()) {
+            recording_low_battery_sample_count_ = 0;
+            recording_low_battery_stop_pending_.store(false);
+            return;
+        }
+
+        BatteryTelemetrySnapshot snapshot;
+        if (!ReadBatteryTelemetrySnapshot(snapshot)) {
+            return;
+        }
+        const bool externally_powered =
+            (snapshot.flags & (kBatteryTelemetryUsbPowered | kBatteryTelemetryCharging)) != 0;
+        if (externally_powered) {
+            recording_low_battery_sample_count_ = 0;
+            return;
+        }
+        if (snapshot.battery_voltage_mv == 0) {
+            return;
+        }
+
+        const bool emergency =
+            snapshot.battery_voltage_mv <= kRecordingEmergencyStopVoltageMv;
+        if (snapshot.battery_voltage_mv <= kRecordingLowBatteryStopVoltageMv) {
+            recording_low_battery_sample_count_ = std::min<uint8_t>(
+                static_cast<uint8_t>(recording_low_battery_sample_count_ + 1),
+                kRecordingLowBatteryRequiredSamples
+            );
+        } else {
+            recording_low_battery_sample_count_ = 0;
+        }
+        if (!emergency &&
+            recording_low_battery_sample_count_ < kRecordingLowBatteryRequiredSamples) {
+            return;
+        }
+
+        bool expected = false;
+        if (!recording_low_battery_stop_pending_.compare_exchange_strong(expected, true)) {
+            return;
+        }
+        ESP_LOGW(
+            TAG,
+            "Stopping local recording for low battery: level=%u voltage=%u mV emergency=%d samples=%u",
+            static_cast<unsigned>(snapshot.battery_percent),
+            static_cast<unsigned>(snapshot.battery_voltage_mv),
+            emergency ? 1 : 0,
+            static_cast<unsigned>(recording_low_battery_sample_count_)
+        );
+        Application::GetInstance().Schedule([this]() {
+            StopRecordingForLowBattery();
+        });
+    }
+
+    void StopRecordingForLowBattery() {
+        auto& recording = LocalRecordingService::GetInstance();
+        if (!recording.IsRecording()) {
+            recording_low_battery_stop_pending_.store(false);
+            ESP_LOGI(TAG, "Low-battery recording stop was canceled because recording already stopped");
+            return;
+        }
+
+        auto& audio_service = Application::GetInstance().GetAudioService();
+        const auto metadata = recording.Stop(audio_service);
+        BatteryTelemetryService::GetInstance().RecordEvent(
+            BatteryTelemetryEvent::kRecordingStopped
+        );
+        PulseRecordingFeedbackScreen("STOP");
+        if (metadata.valid) {
+            ESP_LOGW(
+                TAG,
+                "Low battery stopped local recording: id=%s duration=%lu ms size=%lu bytes",
+                metadata.recording_id.c_str(),
+                static_cast<unsigned long>(metadata.duration_ms),
+                static_cast<unsigned long>(metadata.size_bytes)
+            );
+        } else {
+            ESP_LOGE(TAG, "Low-battery recording stop did not produce valid metadata");
+        }
+        StopRecordingBleReporting(metadata);
+        recording_low_battery_sample_count_ = 0;
+        recording_low_battery_stop_pending_.store(false);
+    }
+
     bool ReadBatteryTelemetrySnapshot(BatteryTelemetrySnapshot& snapshot) {
         if (pmic_ == nullptr && !TryInitializePmic()) {
             return false;
@@ -862,6 +952,7 @@ private:
                     return;
                 }
                 board->UpdateUsbPowerState();
+                board->CheckRecordingLowBattery();
             },
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,

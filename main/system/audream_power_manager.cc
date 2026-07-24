@@ -17,7 +17,7 @@
 namespace {
 
 constexpr char kTag[] = "AudreamPower";
-constexpr int64_t kIdleToDeepSleepUs = 180LL * 1000000LL;
+constexpr int64_t kIdleToDeepSleepUs = 30LL * 1000000LL;
 constexpr int64_t kTickDelayMs = 1000;
 #if CONFIG_IDF_TARGET_ESP32C6
 constexpr int kDefaultCpuMaxMhz = 160;
