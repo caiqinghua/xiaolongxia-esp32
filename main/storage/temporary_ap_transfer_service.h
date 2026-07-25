@@ -39,6 +39,7 @@ private:
     TemporaryAPTransferSession session_;
     int64_t expires_at_us_ = 0;
     size_t active_downloads_ = 0;
+    bool stop_pending_ = false;
 
     static void ExpiryTimerCallback(void* arg);
 

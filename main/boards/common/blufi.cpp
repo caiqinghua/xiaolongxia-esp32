@@ -1,6 +1,7 @@
 #include "blufi.h"
 #include "audream_device_control.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cinttypes>
 #include <cstdio>
@@ -210,6 +211,9 @@ esp_err_t SendAudreamDeviceEvent(uint8_t event, const std::vector<uint8_t>& payl
 
 QueueHandle_t g_audream_custom_queue = nullptr;
 TaskHandle_t g_audream_custom_task = nullptr;
+std::atomic<uint8_t> g_audream_active_opcode{0};
+std::atomic<uint16_t> g_audream_active_request_id{0};
+std::atomic<uint32_t> g_audream_active_started_at_ms{0};
 
 void AudreamCustomDataTask(void* arg) {
     (void)arg;
@@ -225,6 +229,17 @@ void AudreamCustomDataTask(void* arg) {
         }
 
         char opcode_buffer[8] = {};
+        const uint8_t opcode = request->data.size() >= 2 ? request->data[1] : 0;
+        const uint16_t request_id = ReadAudreamCustomRequestId(
+            request->data.data(),
+            request->data.size()
+        );
+        g_audream_active_opcode.store(opcode, std::memory_order_relaxed);
+        g_audream_active_request_id.store(request_id, std::memory_order_relaxed);
+        g_audream_active_started_at_ms.store(
+            static_cast<uint32_t>(esp_timer_get_time() / 1000),
+            std::memory_order_relaxed
+        );
         ESP_LOGI(
             BLUFI_TAG,
             "Handling Audream custom data off the BLUFI task: %u bytes opcode=%s request_id=%u",
@@ -235,9 +250,7 @@ void AudreamCustomDataTask(void* arg) {
                 opcode_buffer,
                 sizeof(opcode_buffer)
             ),
-            static_cast<unsigned>(
-                ReadAudreamCustomRequestId(request->data.data(), request->data.size())
-            )
+            static_cast<unsigned>(request_id)
         );
         std::vector<uint8_t> response =
             AudreamDeviceControl::GetInstance().HandleRequest(
@@ -258,6 +271,9 @@ void AudreamCustomDataTask(void* arg) {
                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))
             );
         }
+        g_audream_active_started_at_ms.store(0, std::memory_order_relaxed);
+        g_audream_active_request_id.store(0, std::memory_order_relaxed);
+        g_audream_active_opcode.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -309,7 +325,21 @@ void QueueAudreamCustomData(const uint8_t* data, uint32_t length) {
     request->data.assign(data, data + length);
 
     if (xQueueSend(g_audream_custom_queue, &request, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGE(BLUFI_TAG, "Audream custom data queue is full");
+        const uint32_t active_started_at_ms = g_audream_active_started_at_ms.load(
+            std::memory_order_relaxed
+        );
+        const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        const uint32_t active_elapsed_ms = active_started_at_ms > 0
+            ? now_ms - active_started_at_ms
+            : 0;
+        ESP_LOGE(
+            BLUFI_TAG,
+            "Audream custom data queue is full: queued=%u active_opcode=0x%02x active_request_id=%u active_elapsed_ms=%lu",
+            static_cast<unsigned>(uxQueueMessagesWaiting(g_audream_custom_queue)),
+            static_cast<unsigned>(g_audream_active_opcode.load(std::memory_order_relaxed)),
+            static_cast<unsigned>(g_audream_active_request_id.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(active_elapsed_ms)
+        );
         delete request;
     }
 }

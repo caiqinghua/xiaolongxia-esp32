@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <new>
 #include <unistd.h>
 #include <vector>
 
@@ -308,6 +309,10 @@ TemporaryAPTransferService& TemporaryAPTransferService::GetInstance() {
 
 TemporaryAPTransferSession TemporaryAPTransferService::Start() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stop_pending_) {
+        ESP_LOGW(kTag, "Temporary AP transfer start deferred while the previous batch is stopping");
+        return {};
+    }
     if (session_.valid && !IsExpiredLocked()) {
         if (!StartExpiryTimerLocked()) {
             StopLocked();
@@ -353,13 +358,71 @@ void TemporaryAPTransferService::Stop() {
 bool TemporaryAPTransferService::Complete(
     const std::string& token
 ) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!IsTokenValidLocked(token)) {
-        ESP_LOGW(kTag, "Ignored temporary AP completion with an invalid token");
+    struct StopContext {
+        TemporaryAPTransferService* service = nullptr;
+        httpd_handle_t server = nullptr;
+    };
+
+    auto* context = new (std::nothrow) StopContext();
+    if (context == nullptr) {
+        ESP_LOGE(kTag, "Failed to allocate temporary AP stop context");
         return false;
     }
-    ESP_LOGI(kTag, "Temporary AP transfer batch completed");
-    StopLocked();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!IsTokenValidLocked(token)) {
+            ESP_LOGW(kTag, "Ignored temporary AP completion with an invalid token");
+            delete context;
+            return false;
+        }
+        if (stop_pending_) {
+            delete context;
+            return true;
+        }
+        stop_pending_ = true;
+        if (expiry_timer_ != nullptr && esp_timer_is_active(expiry_timer_)) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(expiry_timer_));
+        }
+        context->service = this;
+        context->server = server_;
+        server_ = nullptr;
+    }
+
+    const BaseType_t created = xTaskCreate(
+        [](void* task_arg) {
+            auto* stop_context = static_cast<StopContext*>(task_arg);
+            if (stop_context->server != nullptr) {
+                ESP_LOGI(kTag, "Stopping temporary AP HTTP server outside the service lock");
+                const esp_err_t stop_result = httpd_stop(stop_context->server);
+                ESP_LOGI(
+                    kTag,
+                    "Temporary AP HTTP server stop finished: %s",
+                    esp_err_to_name(stop_result)
+                );
+            }
+            {
+                std::lock_guard<std::mutex> lock(stop_context->service->mutex_);
+                stop_context->service->StopLocked(false);
+            }
+            delete stop_context;
+            vTaskDelete(nullptr);
+        },
+        "ap_stop",
+        4096,
+        context,
+        3,
+        nullptr
+    );
+    if (created != pdPASS) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        server_ = context->server;
+        stop_pending_ = false;
+        StartExpiryTimerLocked();
+        delete context;
+        ESP_LOGE(kTag, "Failed to create temporary AP stop task");
+        return false;
+    }
+    ESP_LOGI(kTag, "Temporary AP transfer batch completion scheduled");
     return true;
 }
 
@@ -380,6 +443,7 @@ void TemporaryAPTransferService::StopLocked(bool stop_expiry_timer) {
     session_ = {};
     expires_at_us_ = 0;
     active_downloads_ = 0;
+    stop_pending_ = false;
     AudreamPowerManager::GetInstance().SetTemporaryAPTransferActive(false);
 }
 
@@ -423,7 +487,7 @@ void TemporaryAPTransferService::FinishDownload() {
     if (active_downloads_ > 0) {
         active_downloads_--;
     }
-    if (session_.valid) {
+    if (session_.valid && !stop_pending_) {
         StartExpiryTimerLocked();
     }
 }
