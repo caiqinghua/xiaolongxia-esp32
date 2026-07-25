@@ -1,8 +1,11 @@
 #include "storage/temporary_ap_transfer_service.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 #include <vector>
 
 #include "esp_err.h"
@@ -25,8 +28,18 @@ namespace {
 
 constexpr char kTag[] = "TempAPTransfer";
 constexpr uint32_t kInactivityExpirySeconds = 45;
-constexpr size_t kHttpBufferSize = 2048;
+constexpr size_t kHttpBufferSize = 4 * 1024;
+constexpr size_t kMinimumHttpBufferSize = 2 * 1024;
 constexpr size_t kMinimumInternalHeapBeforeWifi = 48 * 1024;
+constexpr int64_t kDownloadProgressIntervalUs = 5 * 1000 * 1000;
+
+int ConnectedStationRssi() {
+    wifi_sta_list_t stations = {};
+    if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK || stations.num == 0) {
+        return 0;
+    }
+    return stations.sta[0].rssi;
+}
 
 std::string RandomHex(size_t bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
@@ -78,6 +91,32 @@ bool QueryValue(httpd_req_t* request, const char* key, char* output, size_t outp
         return false;
     }
     return httpd_query_key_value(query, key, output, output_size) == ESP_OK;
+}
+
+bool SendAll(
+    httpd_req_t* request,
+    const char* data,
+    size_t length,
+    size_t& sent_bytes,
+    int& send_result,
+    int& send_errno
+) {
+    sent_bytes = 0;
+    send_result = 0;
+    send_errno = 0;
+    while (sent_bytes < length) {
+        send_result = httpd_send(
+            request,
+            data + sent_bytes,
+            length - sent_bytes
+        );
+        if (send_result <= 0) {
+            send_errno = errno;
+            return false;
+        }
+        sent_bytes += static_cast<size_t>(send_result);
+    }
+    return true;
 }
 
 bool EnsureWifiDriverInitialized() {
@@ -446,36 +485,188 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
         return ESP_FAIL;
     }
 
-    FILE* file = fopen(file_path.c_str(), "rb");
-    if (file == nullptr) {
+    const int file = open(file_path.c_str(), O_RDONLY);
+    if (file < 0) {
         httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "Recording not found");
         return ESP_FAIL;
     }
 
-    httpd_resp_set_type(request, "audio/ogg");
-    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    char content_length[16] = {};
-    std::snprintf(content_length, sizeof(content_length), "%lu", static_cast<unsigned long>(size_bytes));
-    httpd_resp_set_hdr(request, "Content-Length", content_length);
+    size_t buffer_size = kHttpBufferSize;
+    char* buffer = nullptr;
+    while (buffer == nullptr && buffer_size >= kMinimumHttpBufferSize) {
+        buffer = static_cast<char*>(heap_caps_malloc(
+            buffer_size,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT
+        ));
+        if (buffer == nullptr) {
+            buffer_size /= 2;
+        }
+    }
+    if (buffer == nullptr) {
+        close(file);
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Insufficient transfer buffer memory");
+        ESP_LOGE(
+            kTag,
+            "Failed to allocate an internal transfer buffer: free_internal=%u",
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL))
+        );
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(
+        kTag,
+        "Recording download buffer ready: mode=fixed_length bytes=%u free_internal=%u",
+        static_cast<unsigned>(buffer_size),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL))
+    );
 
-    std::vector<char> buffer(kHttpBufferSize);
+    char response_headers[256] = {};
+    const int response_header_length = std::snprintf(
+        response_headers,
+        sizeof(response_headers),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: audio/ogg\r\n"
+        "Content-Length: %lu\r\n"
+        "Cache-Control: no-store\r\n"
+        "\r\n",
+        static_cast<unsigned long>(size_bytes)
+    );
+    if (response_header_length <= 0 ||
+        static_cast<size_t>(response_header_length) >= sizeof(response_headers)) {
+        close(file);
+        heap_caps_free(buffer);
+        ESP_LOGE(kTag, "Failed to build recording download response headers");
+        return ESP_FAIL;
+    }
+
+    size_t sent_header_bytes = 0;
+    int header_send_result = 0;
+    int header_send_errno = 0;
+    if (!SendAll(
+            request,
+            response_headers,
+            static_cast<size_t>(response_header_length),
+            sent_header_bytes,
+            header_send_result,
+            header_send_errno
+        )) {
+        close(file);
+        heap_caps_free(buffer);
+        ESP_LOGW(
+            kTag,
+            "Failed to send recording download response headers: result=%d errno=%d error=%s sent=%u total=%d",
+            header_send_result,
+            header_send_errno,
+            std::strerror(header_send_errno),
+            static_cast<unsigned>(sent_header_bytes),
+            response_header_length
+        );
+        return ESP_ERR_HTTPD_RESP_SEND;
+    }
+
     esp_err_t result = ESP_OK;
+    uint64_t sent_bytes = 0;
+    int64_t read_time_us = 0;
+    int64_t send_time_us = 0;
+    int64_t max_send_time_us = 0;
+    const int64_t started_at_us = esp_timer_get_time();
+    int64_t progress_started_at_us = started_at_us;
+    uint64_t progress_started_at_bytes = 0;
     while (true) {
-        const size_t read = fread(buffer.data(), 1, buffer.size(), file);
-        if (read > 0) {
-            result = httpd_resp_send_chunk(request, buffer.data(), read);
-            if (result != ESP_OK) {
+        const int64_t read_started_at_us = esp_timer_get_time();
+        const ssize_t bytes_read = read(file, buffer, buffer_size);
+        read_time_us += esp_timer_get_time() - read_started_at_us;
+        if (bytes_read < 0) {
+            ESP_LOGE(
+                kTag,
+                "Failed to read recording during download: id=%s error=%s",
+                recording_id,
+                std::strerror(errno)
+            );
+            result = ESP_FAIL;
+            break;
+        }
+        const size_t read_size = static_cast<size_t>(bytes_read);
+        if (read_size > 0) {
+            const int64_t send_started_at_us = esp_timer_get_time();
+            size_t chunk_sent_bytes = 0;
+            int raw_send_result = 0;
+            int raw_send_errno = 0;
+            const bool send_succeeded = SendAll(
+                request,
+                buffer,
+                read_size,
+                chunk_sent_bytes,
+                raw_send_result,
+                raw_send_errno
+            );
+            const int64_t send_elapsed_us = esp_timer_get_time() - send_started_at_us;
+            send_time_us += send_elapsed_us;
+            max_send_time_us = std::max(max_send_time_us, send_elapsed_us);
+            sent_bytes += chunk_sent_bytes;
+            if (!send_succeeded) {
+                result = ESP_ERR_HTTPD_RESP_SEND;
+                ESP_LOGW(
+                    kTag,
+                    "Recording download send failed: id=%s result=%d errno=%d error=%s chunk_sent=%u chunk_total=%u send_ms=%lld",
+                    recording_id,
+                    raw_send_result,
+                    raw_send_errno,
+                    std::strerror(raw_send_errno),
+                    static_cast<unsigned>(chunk_sent_bytes),
+                    static_cast<unsigned>(read_size),
+                    static_cast<long long>(send_elapsed_us / 1000)
+                );
                 break;
             }
+
+            const int64_t now_us = esp_timer_get_time();
+            const int64_t progress_elapsed_us = now_us - progress_started_at_us;
+            if (progress_elapsed_us >= kDownloadProgressIntervalUs) {
+                const uint64_t progress_bytes = sent_bytes - progress_started_at_bytes;
+                const uint64_t interval_kib_s = progress_bytes * 1000000ULL /
+                    static_cast<uint64_t>(progress_elapsed_us) / 1024ULL;
+                ESP_LOGI(
+                    kTag,
+                    "Recording download progress: id=%s sent=%llu total=%lu interval_kib_s=%llu last_send_ms=%lld max_send_ms=%lld rssi=%d free_internal=%u largest_internal=%u minimum_internal=%u",
+                    recording_id,
+                    static_cast<unsigned long long>(sent_bytes),
+                    static_cast<unsigned long>(size_bytes),
+                    static_cast<unsigned long long>(interval_kib_s),
+                    static_cast<long long>(send_elapsed_us / 1000),
+                    static_cast<long long>(max_send_time_us / 1000),
+                    ConnectedStationRssi(),
+                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                    static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL))
+                );
+                progress_started_at_us = now_us;
+                progress_started_at_bytes = sent_bytes;
+            }
         }
-        if (read < buffer.size()) {
+        if (read_size < buffer_size) {
             break;
         }
     }
-    fclose(file);
-    if (result == ESP_OK) {
-        result = httpd_resp_send_chunk(request, nullptr, 0);
-    }
+    close(file);
+    heap_caps_free(buffer);
+    const uint64_t elapsed_ms = static_cast<uint64_t>(
+        std::max<int64_t>(1, (esp_timer_get_time() - started_at_us) / 1000)
+    );
+    const uint64_t throughput_kib_s = sent_bytes * 1000ULL / elapsed_ms / 1024ULL;
+    const char* outcome = result == ESP_OK ? "completed" : "interrupted";
+    ESP_LOGI(
+        kTag,
+        "Recording download %s: id=%s sent=%llu total=%lu elapsed_ms=%llu read_ms=%lld send_ms=%lld max_send_ms=%lld throughput_kib_s=%llu",
+        outcome,
+        recording_id,
+        static_cast<unsigned long long>(sent_bytes),
+        static_cast<unsigned long>(size_bytes),
+        static_cast<unsigned long long>(elapsed_ms),
+        static_cast<long long>(read_time_us / 1000),
+        static_cast<long long>(send_time_us / 1000),
+        static_cast<long long>(max_send_time_us / 1000),
+        static_cast<unsigned long long>(throughput_kib_s)
+    );
     return result;
 }
 
