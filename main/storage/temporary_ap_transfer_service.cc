@@ -1,6 +1,7 @@
 #include "storage/temporary_ap_transfer_service.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,8 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/ip4_addr.h"
 #include "storage/sd_card_storage.h"
@@ -28,10 +31,148 @@ namespace {
 
 constexpr char kTag[] = "TempAPTransfer";
 constexpr uint32_t kInactivityExpirySeconds = 45;
-constexpr size_t kHttpBufferSize = 4 * 1024;
-constexpr size_t kMinimumHttpBufferSize = 2 * 1024;
+constexpr size_t kSdReadBufferSize = 4 * 1024;
+constexpr size_t kMinimumSdReadBufferSize = 2 * 1024;
+constexpr size_t kDownloadBufferSize = 16 * 1024;
+constexpr size_t kDownloadBufferCount = 16;
+constexpr size_t kMinimumDownloadBufferCount = 4;
+constexpr size_t kMetadataHttpBufferSize = 4 * 1024;
+constexpr uint32_t kDownloadReaderTaskStackSize = 3 * 1024;
+constexpr UBaseType_t kDownloadReaderTaskPriority = 4;
+constexpr TickType_t kDownloadPipelineWait = pdMS_TO_TICKS(100);
 constexpr size_t kMinimumInternalHeapBeforeWifi = 48 * 1024;
 constexpr int64_t kDownloadProgressIntervalUs = 5 * 1000 * 1000;
+
+struct DownloadReadItem {
+    uint16_t buffer_index = 0;
+    size_t size = 0;
+    bool end_of_file = false;
+    int error = 0;
+};
+
+struct DownloadReadPipeline {
+    int file = -1;
+    char* buffer_block = nullptr;
+    char* read_buffer = nullptr;
+    char* send_buffer = nullptr;
+    size_t read_buffer_size = 0;
+    size_t buffer_size = kDownloadBufferSize;
+    size_t buffer_count = 0;
+    QueueHandle_t free_buffers = nullptr;
+    QueueHandle_t ready_buffers = nullptr;
+    SemaphoreHandle_t reader_done = nullptr;
+    std::atomic<bool> cancelled{false};
+    int64_t read_time_us = 0;
+};
+
+void DownloadReaderTask(void* arg) {
+    auto* pipeline = static_cast<DownloadReadPipeline*>(arg);
+    while (!pipeline->cancelled.load(std::memory_order_relaxed)) {
+        uint16_t buffer_index = 0;
+        if (xQueueReceive(
+                pipeline->free_buffers,
+                &buffer_index,
+                kDownloadPipelineWait
+            ) != pdTRUE) {
+            continue;
+        }
+
+        char* buffer = pipeline->buffer_block +
+            buffer_index * pipeline->buffer_size;
+        size_t buffered_bytes = 0;
+        bool end_of_file = false;
+        int read_error = 0;
+        while (buffered_bytes < pipeline->buffer_size) {
+            const size_t requested_bytes = std::min(
+                pipeline->read_buffer_size,
+                pipeline->buffer_size - buffered_bytes
+            );
+            const int64_t read_started_at_us = esp_timer_get_time();
+            errno = 0;
+            const ssize_t bytes_read = read(
+                pipeline->file,
+                pipeline->read_buffer,
+                requested_bytes
+            );
+            read_error = bytes_read < 0 ? errno : 0;
+            pipeline->read_time_us += esp_timer_get_time() - read_started_at_us;
+            if (bytes_read < 0) {
+                break;
+            }
+            if (bytes_read > 0) {
+                const size_t read_size = static_cast<size_t>(bytes_read);
+                std::memcpy(
+                    buffer + buffered_bytes,
+                    pipeline->read_buffer,
+                    read_size
+                );
+                buffered_bytes += read_size;
+            }
+            if (static_cast<size_t>(bytes_read) < requested_bytes) {
+                end_of_file = true;
+                break;
+            }
+        }
+
+        DownloadReadItem item = {
+            .buffer_index = buffer_index,
+            .size = buffered_bytes,
+            .end_of_file = end_of_file,
+            .error = read_error,
+        };
+        bool queued = false;
+        while (!pipeline->cancelled.load(std::memory_order_relaxed)) {
+            if (xQueueSend(
+                    pipeline->ready_buffers,
+                    &item,
+                    kDownloadPipelineWait
+                ) == pdTRUE) {
+                queued = true;
+                break;
+            }
+        }
+        if (!queued || item.error != 0 || item.end_of_file) {
+            break;
+        }
+    }
+
+    xSemaphoreGive(pipeline->reader_done);
+    vTaskDelete(nullptr);
+}
+
+void StopDownloadReadPipeline(
+    DownloadReadPipeline& pipeline,
+    bool reader_started
+) {
+    pipeline.cancelled.store(true, std::memory_order_relaxed);
+    if (reader_started && pipeline.reader_done != nullptr) {
+        xSemaphoreTake(pipeline.reader_done, portMAX_DELAY);
+    }
+    if (pipeline.free_buffers != nullptr) {
+        vQueueDelete(pipeline.free_buffers);
+        pipeline.free_buffers = nullptr;
+    }
+    if (pipeline.ready_buffers != nullptr) {
+        vQueueDelete(pipeline.ready_buffers);
+        pipeline.ready_buffers = nullptr;
+    }
+    if (pipeline.reader_done != nullptr) {
+        vSemaphoreDelete(pipeline.reader_done);
+        pipeline.reader_done = nullptr;
+    }
+    if (pipeline.buffer_block != nullptr) {
+        heap_caps_free(pipeline.buffer_block);
+        pipeline.buffer_block = nullptr;
+    }
+    if (pipeline.read_buffer != nullptr) {
+        heap_caps_free(pipeline.read_buffer);
+        pipeline.read_buffer = nullptr;
+    }
+    if (pipeline.send_buffer != nullptr) {
+        heap_caps_free(pipeline.send_buffer);
+        pipeline.send_buffer = nullptr;
+    }
+}
 
 int ConnectedStationRssi() {
     wifi_sta_list_t stations = {};
@@ -491,32 +632,127 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
         return ESP_FAIL;
     }
 
-    size_t buffer_size = kHttpBufferSize;
-    char* buffer = nullptr;
-    while (buffer == nullptr && buffer_size >= kMinimumHttpBufferSize) {
-        buffer = static_cast<char*>(heap_caps_malloc(
-            buffer_size,
+    DownloadReadPipeline pipeline;
+    pipeline.file = file;
+    pipeline.read_buffer_size = kSdReadBufferSize;
+    while ((pipeline.read_buffer == nullptr || pipeline.send_buffer == nullptr) &&
+           pipeline.read_buffer_size >= kMinimumSdReadBufferSize) {
+        pipeline.read_buffer = static_cast<char*>(heap_caps_malloc(
+            pipeline.read_buffer_size,
             MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT
         ));
-        if (buffer == nullptr) {
-            buffer_size /= 2;
+        pipeline.send_buffer = static_cast<char*>(heap_caps_malloc(
+            pipeline.read_buffer_size,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        ));
+        if (pipeline.read_buffer == nullptr || pipeline.send_buffer == nullptr) {
+            if (pipeline.read_buffer != nullptr) {
+                heap_caps_free(pipeline.read_buffer);
+                pipeline.read_buffer = nullptr;
+            }
+            if (pipeline.send_buffer != nullptr) {
+                heap_caps_free(pipeline.send_buffer);
+                pipeline.send_buffer = nullptr;
+            }
+            pipeline.read_buffer_size /= 2;
         }
     }
-    if (buffer == nullptr) {
+    pipeline.buffer_count = kDownloadBufferCount;
+    while (pipeline.buffer_block == nullptr &&
+           pipeline.buffer_count >= kMinimumDownloadBufferCount) {
+        pipeline.buffer_block = static_cast<char*>(heap_caps_malloc(
+            pipeline.buffer_size * pipeline.buffer_count,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        ));
+        if (pipeline.buffer_block == nullptr) {
+            pipeline.buffer_count /= 2;
+        }
+    }
+    if (pipeline.read_buffer == nullptr ||
+        pipeline.send_buffer == nullptr ||
+        pipeline.buffer_block == nullptr) {
+        StopDownloadReadPipeline(pipeline, false);
         close(file);
-        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Insufficient transfer buffer memory");
+        httpd_resp_send_err(
+            request,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Insufficient transfer buffer memory"
+        );
         ESP_LOGE(
             kTag,
-            "Failed to allocate an internal transfer buffer: free_internal=%u",
-            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL))
+            "Failed to allocate recording read-ahead buffers: free_internal=%u free_spiram=%u",
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM))
         );
+        return ESP_ERR_NO_MEM;
+    }
+
+    pipeline.free_buffers = xQueueCreate(
+        pipeline.buffer_count,
+        sizeof(uint16_t)
+    );
+    pipeline.ready_buffers = xQueueCreate(
+        pipeline.buffer_count,
+        sizeof(DownloadReadItem)
+    );
+    pipeline.reader_done = xSemaphoreCreateBinary();
+    if (pipeline.free_buffers == nullptr ||
+        pipeline.ready_buffers == nullptr ||
+        pipeline.reader_done == nullptr) {
+        StopDownloadReadPipeline(pipeline, false);
+        close(file);
+        httpd_resp_send_err(
+            request,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Failed to create transfer pipeline"
+        );
+        ESP_LOGE(kTag, "Failed to create recording download pipeline resources");
+        return ESP_ERR_NO_MEM;
+    }
+    for (uint16_t index = 0; index < pipeline.buffer_count; ++index) {
+        xQueueSend(pipeline.free_buffers, &index, 0);
+    }
+
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    const BaseType_t reader_created = xTaskCreatePinnedToCore(
+        DownloadReaderTask,
+        "ap_sd_reader",
+        kDownloadReaderTaskStackSize,
+        &pipeline,
+        kDownloadReaderTaskPriority,
+        nullptr,
+        1
+    );
+#else
+    const BaseType_t reader_created = xTaskCreate(
+        DownloadReaderTask,
+        "ap_sd_reader",
+        kDownloadReaderTaskStackSize,
+        &pipeline,
+        kDownloadReaderTaskPriority,
+        nullptr
+    );
+#endif
+    const bool reader_started = reader_created == pdPASS;
+    if (!reader_started) {
+        StopDownloadReadPipeline(pipeline, false);
+        close(file);
+        httpd_resp_send_err(
+            request,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Failed to start transfer pipeline"
+        );
+        ESP_LOGE(kTag, "Failed to create recording download reader task");
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(
         kTag,
-        "Recording download buffer ready: mode=fixed_length bytes=%u free_internal=%u",
-        static_cast<unsigned>(buffer_size),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL))
+        "Recording download buffer ready: mode=read_ahead_internal_send buffers=%u bytes_each=%u io_bytes=%u free_internal=%u free_spiram=%u",
+        static_cast<unsigned>(pipeline.buffer_count),
+        static_cast<unsigned>(pipeline.buffer_size),
+        static_cast<unsigned>(pipeline.read_buffer_size),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM))
     );
 
     char response_headers[256] = {};
@@ -532,8 +768,8 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
     );
     if (response_header_length <= 0 ||
         static_cast<size_t>(response_header_length) >= sizeof(response_headers)) {
+        StopDownloadReadPipeline(pipeline, reader_started);
         close(file);
-        heap_caps_free(buffer);
         ESP_LOGE(kTag, "Failed to build recording download response headers");
         return ESP_FAIL;
     }
@@ -549,8 +785,8 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
             header_send_result,
             header_send_errno
         )) {
+        StopDownloadReadPipeline(pipeline, reader_started);
         close(file);
-        heap_caps_free(buffer);
         ESP_LOGW(
             kTag,
             "Failed to send recording download response headers: result=%d errno=%d error=%s sent=%u total=%d",
@@ -565,90 +801,123 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
 
     esp_err_t result = ESP_OK;
     uint64_t sent_bytes = 0;
-    int64_t read_time_us = 0;
     int64_t send_time_us = 0;
     int64_t max_send_time_us = 0;
     const int64_t started_at_us = esp_timer_get_time();
     int64_t progress_started_at_us = started_at_us;
     uint64_t progress_started_at_bytes = 0;
     while (true) {
-        const int64_t read_started_at_us = esp_timer_get_time();
-        const ssize_t bytes_read = read(file, buffer, buffer_size);
-        read_time_us += esp_timer_get_time() - read_started_at_us;
-        if (bytes_read < 0) {
+        DownloadReadItem item;
+        if (xQueueReceive(
+                pipeline.ready_buffers,
+                &item,
+                portMAX_DELAY
+            ) != pdTRUE) {
+            result = ESP_FAIL;
+            ESP_LOGE(kTag, "Failed to receive data from recording reader task");
+            break;
+        }
+        if (item.error != 0) {
             ESP_LOGE(
                 kTag,
                 "Failed to read recording during download: id=%s error=%s",
                 recording_id,
-                std::strerror(errno)
+                std::strerror(item.error)
             );
             result = ESP_FAIL;
             break;
         }
-        const size_t read_size = static_cast<size_t>(bytes_read);
-        if (read_size > 0) {
-            const int64_t send_started_at_us = esp_timer_get_time();
-            size_t chunk_sent_bytes = 0;
-            int raw_send_result = 0;
-            int raw_send_errno = 0;
-            const bool send_succeeded = SendAll(
-                request,
-                buffer,
-                read_size,
-                chunk_sent_bytes,
-                raw_send_result,
-                raw_send_errno
-            );
-            const int64_t send_elapsed_us = esp_timer_get_time() - send_started_at_us;
-            send_time_us += send_elapsed_us;
-            max_send_time_us = std::max(max_send_time_us, send_elapsed_us);
-            sent_bytes += chunk_sent_bytes;
-            if (!send_succeeded) {
-                result = ESP_ERR_HTTPD_RESP_SEND;
-                ESP_LOGW(
-                    kTag,
-                    "Recording download send failed: id=%s result=%d errno=%d error=%s chunk_sent=%u chunk_total=%u send_ms=%lld",
-                    recording_id,
-                    raw_send_result,
-                    raw_send_errno,
-                    std::strerror(raw_send_errno),
-                    static_cast<unsigned>(chunk_sent_bytes),
-                    static_cast<unsigned>(read_size),
-                    static_cast<long long>(send_elapsed_us / 1000)
+        bool item_send_failed = false;
+        if (item.size > 0) {
+            const char* read_ahead_buffer = pipeline.buffer_block +
+                item.buffer_index * pipeline.buffer_size;
+            size_t item_offset = 0;
+            while (item_offset < item.size) {
+                const size_t send_size = std::min(
+                    pipeline.read_buffer_size,
+                    item.size - item_offset
                 );
-                break;
-            }
+                std::memcpy(
+                    pipeline.send_buffer,
+                    read_ahead_buffer + item_offset,
+                    send_size
+                );
 
-            const int64_t now_us = esp_timer_get_time();
-            const int64_t progress_elapsed_us = now_us - progress_started_at_us;
-            if (progress_elapsed_us >= kDownloadProgressIntervalUs) {
-                const uint64_t progress_bytes = sent_bytes - progress_started_at_bytes;
-                const uint64_t interval_kib_s = progress_bytes * 1000000ULL /
-                    static_cast<uint64_t>(progress_elapsed_us) / 1024ULL;
-                ESP_LOGI(
-                    kTag,
-                    "Recording download progress: id=%s sent=%llu total=%lu interval_kib_s=%llu last_send_ms=%lld max_send_ms=%lld rssi=%d free_internal=%u largest_internal=%u minimum_internal=%u",
-                    recording_id,
-                    static_cast<unsigned long long>(sent_bytes),
-                    static_cast<unsigned long>(size_bytes),
-                    static_cast<unsigned long long>(interval_kib_s),
-                    static_cast<long long>(send_elapsed_us / 1000),
-                    static_cast<long long>(max_send_time_us / 1000),
-                    ConnectedStationRssi(),
-                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
-                    static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL))
+                const int64_t send_started_at_us = esp_timer_get_time();
+                size_t chunk_sent_bytes = 0;
+                int raw_send_result = 0;
+                int raw_send_errno = 0;
+                const bool send_succeeded = SendAll(
+                    request,
+                    pipeline.send_buffer,
+                    send_size,
+                    chunk_sent_bytes,
+                    raw_send_result,
+                    raw_send_errno
                 );
-                progress_started_at_us = now_us;
-                progress_started_at_bytes = sent_bytes;
+                const int64_t send_elapsed_us =
+                    esp_timer_get_time() - send_started_at_us;
+                send_time_us += send_elapsed_us;
+                max_send_time_us = std::max(max_send_time_us, send_elapsed_us);
+                sent_bytes += chunk_sent_bytes;
+                if (!send_succeeded) {
+                    result = ESP_ERR_HTTPD_RESP_SEND;
+                    item_send_failed = true;
+                    ESP_LOGW(
+                        kTag,
+                        "Recording download send failed: id=%s result=%d errno=%d error=%s chunk_sent=%u chunk_total=%u send_ms=%lld",
+                        recording_id,
+                        raw_send_result,
+                        raw_send_errno,
+                        std::strerror(raw_send_errno),
+                        static_cast<unsigned>(chunk_sent_bytes),
+                        static_cast<unsigned>(send_size),
+                        static_cast<long long>(send_elapsed_us / 1000)
+                    );
+                    break;
+                }
+                item_offset += send_size;
+
+                const int64_t now_us = esp_timer_get_time();
+                const int64_t progress_elapsed_us = now_us - progress_started_at_us;
+                if (progress_elapsed_us >= kDownloadProgressIntervalUs) {
+                    const uint64_t progress_bytes = sent_bytes - progress_started_at_bytes;
+                    const uint64_t interval_kib_s = progress_bytes * 1000000ULL /
+                        static_cast<uint64_t>(progress_elapsed_us) / 1024ULL;
+                    ESP_LOGI(
+                        kTag,
+                        "Recording download progress: id=%s sent=%llu total=%lu interval_kib_s=%llu last_send_ms=%lld max_send_ms=%lld ready_buffers=%u rssi=%d free_internal=%u largest_internal=%u minimum_internal=%u",
+                        recording_id,
+                        static_cast<unsigned long long>(sent_bytes),
+                        static_cast<unsigned long>(size_bytes),
+                        static_cast<unsigned long long>(interval_kib_s),
+                        static_cast<long long>(send_elapsed_us / 1000),
+                        static_cast<long long>(max_send_time_us / 1000),
+                        static_cast<unsigned>(uxQueueMessagesWaiting(pipeline.ready_buffers)),
+                        ConnectedStationRssi(),
+                        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                        static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL))
+                    );
+                    progress_started_at_us = now_us;
+                    progress_started_at_bytes = sent_bytes;
+                }
             }
         }
-        if (read_size < buffer_size) {
+        if (item_send_failed) {
             break;
         }
+        if (item.end_of_file) {
+            break;
+        }
+        xQueueSend(
+            pipeline.free_buffers,
+            &item.buffer_index,
+            portMAX_DELAY
+        );
     }
+    StopDownloadReadPipeline(pipeline, reader_started);
     close(file);
-    heap_caps_free(buffer);
     const uint64_t elapsed_ms = static_cast<uint64_t>(
         std::max<int64_t>(1, (esp_timer_get_time() - started_at_us) / 1000)
     );
@@ -662,7 +931,7 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
         static_cast<unsigned long long>(sent_bytes),
         static_cast<unsigned long>(size_bytes),
         static_cast<unsigned long long>(elapsed_ms),
-        static_cast<long long>(read_time_us / 1000),
+        static_cast<long long>(pipeline.read_time_us / 1000),
         static_cast<long long>(send_time_us / 1000),
         static_cast<long long>(max_send_time_us / 1000),
         static_cast<unsigned long long>(throughput_kib_s)
@@ -710,7 +979,7 @@ esp_err_t TemporaryAPTransferService::MetadataHandler(httpd_req_t* request) {
     if (!SdCardStorage::GetInstance().ReadRecordingMetadata(
             recording_id,
             offset,
-            kHttpBufferSize,
+            kMetadataHttpBufferSize,
             chunk,
             total_size
         )) {
@@ -743,7 +1012,7 @@ esp_err_t TemporaryAPTransferService::MetadataHandler(httpd_req_t* request) {
         if (!SdCardStorage::GetInstance().ReadRecordingMetadata(
                 recording_id,
                 offset,
-                kHttpBufferSize,
+                kMetadataHttpBufferSize,
                 chunk,
                 total_size
             )) {
