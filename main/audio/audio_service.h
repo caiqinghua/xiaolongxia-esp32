@@ -189,6 +189,7 @@ private:
     bool audio_input_need_warmup_ = false;
     bool local_recording_input_active_ = false;
     bool local_recording_encode_active_ = false;
+    uint32_t local_recording_level_frame_count_ = 0;
     std::function<void(const uint8_t*, size_t)> local_recording_packet_callback_;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
@@ -199,6 +200,7 @@ private:
     void AudioOutputTask();
     void OpusCodecTask();
     std::vector<int16_t> DownmixInputToMono(std::vector<int16_t>&& data) const;
+    std::vector<int16_t> ProcessLocalRecordingAudio(std::vector<int16_t>&& data);
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     bool CanProcessEncodeTask() const;
     bool HasLocalRecordingEncodeWorkLocked() const;

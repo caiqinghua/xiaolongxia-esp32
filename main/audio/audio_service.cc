@@ -39,6 +39,42 @@
 
 #define TAG "AudioService"
 
+namespace {
+
+constexpr uint32_t kLocalRecordingLevelLogIntervalFrames = 5000 / OPUS_FRAME_DURATION_MS;
+
+uint32_t SampleMagnitude(int16_t sample) {
+    return sample == std::numeric_limits<int16_t>::min()
+        ? 32768
+        : static_cast<uint32_t>(sample < 0 ? -sample : sample);
+}
+
+uint32_t PeakMagnitude(const std::vector<int16_t>& data) {
+    uint32_t peak = 0;
+    for (const int16_t sample : data) {
+        peak = std::max(peak, SampleMagnitude(sample));
+    }
+    return peak;
+}
+
+uint32_t InterleavedChannelPeak(
+    const std::vector<int16_t>& data,
+    int channel_count,
+    int channel_index
+) {
+    if (channel_count <= 0 || channel_index < 0 || channel_index >= channel_count) {
+        return 0;
+    }
+
+    uint32_t peak = 0;
+    for (size_t index = channel_index; index < data.size(); index += channel_count) {
+        peak = std::max(peak, SampleMagnitude(data[index]));
+    }
+    return peak;
+}
+
+}  // namespace
+
 AudioService::AudioService() {
     event_group_ = xEventGroupCreate();
 }
@@ -352,7 +388,7 @@ void AudioService::AudioInputTask() {
             std::vector<int16_t> data;
             int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
             if (ReadAudioData(data, 16000, samples)) {
-                data = DownmixInputToMono(std::move(data));
+                data = ProcessLocalRecordingAudio(std::move(data));
                 PushTaskToEncodeQueue(kAudioTaskTypeEncodeToLocalRecording, std::move(data));
                 {
                     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
@@ -433,6 +469,44 @@ std::vector<int16_t> AudioService::DownmixInputToMono(std::vector<int16_t>&& dat
         );
         mono_data[frame] = static_cast<int16_t>(sample);
     }
+    return mono_data;
+}
+
+std::vector<int16_t> AudioService::ProcessLocalRecordingAudio(std::vector<int16_t>&& data) {
+    const int channel_count = codec_ == nullptr ? 1 : codec_->input_channels();
+    const int microphone_count = channel_count - (
+        codec_ != nullptr && codec_->input_reference() ? 1 : 0
+    );
+    const bool should_log_levels = local_recording_level_frame_count_ == 0 ||
+        local_recording_level_frame_count_ >= kLocalRecordingLevelLogIntervalFrames;
+    const uint32_t microphone_1_peak = should_log_levels
+        ? InterleavedChannelPeak(data, channel_count, 0)
+        : 0;
+    const uint32_t microphone_2_peak = should_log_levels && microphone_count > 1
+        ? InterleavedChannelPeak(data, channel_count, 1)
+        : 0;
+    const uint32_t reference_peak = should_log_levels &&
+        codec_ != nullptr && codec_->input_reference()
+        ? InterleavedChannelPeak(data, channel_count, microphone_count)
+        : 0;
+
+    auto mono_data = DownmixInputToMono(std::move(data));
+    const uint32_t mixed_peak = should_log_levels ? PeakMagnitude(mono_data) : 0;
+
+    if (should_log_levels) {
+        ESP_LOGI(
+            TAG,
+            "Local recording levels: mic1_peak=%lu mic2_peak=%lu reference_peak=%lu mixed_peak=%lu",
+            static_cast<unsigned long>(microphone_1_peak),
+            static_cast<unsigned long>(microphone_2_peak),
+            static_cast<unsigned long>(reference_peak),
+            static_cast<unsigned long>(mixed_peak)
+        );
+        local_recording_level_frame_count_ = 1;
+    } else {
+        ++local_recording_level_frame_count_;
+    }
+
     return mono_data;
 }
 
@@ -804,6 +878,7 @@ void AudioService::EnableAudioTesting(bool enable) {
 void AudioService::EnableLocalRecording(bool enable) {
     ESP_LOGI(TAG, "%s local recording", enable ? "Enabling" : "Disabling");
     if (enable) {
+        local_recording_level_frame_count_ = 0;
         codec_->PrepareForLocalRecording();
         xEventGroupSetBits(event_group_, AS_EVENT_LOCAL_RECORDING_RUNNING);
     } else {

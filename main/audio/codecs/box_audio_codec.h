@@ -22,6 +22,7 @@ private:
     esp_codec_dev_handle_t output_dev_ = nullptr;
     esp_codec_dev_handle_t input_dev_ = nullptr;
     bool output_path_enabled_ = true;
+    bool normalize_tdm_input_order_ = false;
     gpio_num_t pa_pin_ = GPIO_NUM_NC;
     uint8_t input_mic_mask_ = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4;
     std::mutex data_if_mutex_;
@@ -47,6 +48,7 @@ public:
 
     virtual void SetOutputVolume(int volume) override;
     virtual void SetInputGain(float gain) override;
+    virtual bool InputData(std::vector<int16_t>& data) override;
     virtual void EnableInput(bool enable) override;
     virtual void EnableOutput(bool enable) override;
     virtual void PrepareForLocalRecording() override;

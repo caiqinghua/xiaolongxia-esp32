@@ -4,6 +4,7 @@
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
+#include <utility>
 
 #define TAG "BoxAudioCodec"
 
@@ -22,6 +23,8 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
     pa_pin_ = pa_pin;
     input_mic_mask_ = input_mic_mask == 0 ? ES7210_SEL_MIC1 | ES7210_SEL_MIC2 : input_mic_mask;
     output_path_enabled_ = enable_output_path;
+    normalize_tdm_input_order_ = input_reference_ && input_channels_ == 3 &&
+        input_mic_mask_ == (ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3);
 
     CreateDuplexChannels(mclk, bclk, ws, dout, din, output_path_enabled_);
 
@@ -89,6 +92,9 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
     input_dev_ = esp_codec_dev_new(&dev_cfg);
     assert(input_dev_ != NULL);
 
+    if (normalize_tdm_input_order_) {
+        ESP_LOGI(TAG, "ES7210 TDM slot order remapped: slots=MIC1,MIC3,MIC2 application=MIC1,MIC2,reference");
+    }
     ESP_LOGI(TAG, "BoxAudioDevice initialized");
 }
 
@@ -281,6 +287,22 @@ void BoxAudioCodec::SetInputGain(float gain) {
     AudioCodec::SetInputGain(
         gain >= kMaximumProtocolGainDb ? kMaximumEs7210GainDb : gain
     );
+}
+
+bool BoxAudioCodec::InputData(std::vector<int16_t>& data) {
+    if (!AudioCodec::InputData(data)) {
+        return false;
+    }
+    if (!normalize_tdm_input_order_) {
+        return true;
+    }
+
+    const size_t frame_count = data.size() / input_channels_;
+    for (size_t frame = 0; frame < frame_count; ++frame) {
+        const size_t base = frame * input_channels_;
+        std::swap(data[base + 1], data[base + 2]);
+    }
+    return true;
 }
 
 void BoxAudioCodec::EnableInput(bool enable) {
