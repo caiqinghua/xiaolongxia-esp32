@@ -23,7 +23,7 @@ namespace {
 constexpr char kTag[] = "AudreamControl";
 constexpr char kSettingsNamespace[] = "audream_device";
 constexpr char kAutoPowerOffKey[] = "auto_off";
-constexpr char kMicrophoneGainKey[] = "mic_gain";
+constexpr char kMicrophoneGainKey[] = "mic_gain_v2";
 constexpr char kCallGainKey[] = "call_gain";
 constexpr char kRecordingModeKey[] = "recording_mode";
 
@@ -34,7 +34,8 @@ constexpr size_t kMaxReadChunkBytes = 96;
 constexpr size_t kMaxListRecordingsPayloadBytes = 220;
 
 constexpr int32_t kDefaultAutoPowerOffSeconds = -1;
-constexpr uint8_t kDefaultMicrophoneGainDb = 30;
+constexpr uint8_t kMaxMicrophoneGainDb = 37;
+constexpr uint8_t kDefaultMicrophoneGainDb = kMaxMicrophoneGainDb;
 constexpr uint8_t kDefaultCallGain = 1;
 constexpr uint8_t kDefaultBatteryLevelPercent = 80;
 constexpr uint8_t kDefaultRecordingMode = 0;
@@ -312,7 +313,7 @@ AudreamDeviceControl::DeviceState AudreamDeviceControl::LoadState() const {
         .microphone_gain_db = static_cast<uint8_t>(std::clamp(
             settings.GetInt(kMicrophoneGainKey, kDefaultMicrophoneGainDb),
             0L,
-            30L
+            static_cast<int32_t>(kMaxMicrophoneGainDb)
         )),
         .call_gain = static_cast<uint8_t>(std::clamp(
             settings.GetInt(kCallGainKey, kDefaultCallGain),
@@ -462,7 +463,10 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             break;
 
         case Opcode::kSetMicrophoneGain: {
-            if (length != kRequestHeaderLength + 1 || data[kRequestHeaderLength] > 30) {
+            if (
+                length != kRequestHeaderLength + 1 ||
+                data[kRequestHeaderLength] > kMaxMicrophoneGainDb
+            ) {
                 return BuildResponse(
                     opcode_value,
                     request_id,

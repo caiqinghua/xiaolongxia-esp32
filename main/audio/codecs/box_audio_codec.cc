@@ -18,7 +18,7 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
     assert(!input_reference_ || input_channels_ >= 2);
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
-    input_gain_ = 30;
+    input_gain_ = 37.5f;
     pa_pin_ = pa_pin;
     input_mic_mask_ = input_mic_mask == 0 ? ES7210_SEL_MIC1 | ES7210_SEL_MIC2 : input_mic_mask;
     output_path_enabled_ = enable_output_path;
@@ -273,6 +273,14 @@ void BoxAudioCodec::SetOutputVolume(int volume) {
         ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
     }
     AudioCodec::SetOutputVolume(volume);
+}
+
+void BoxAudioCodec::SetInputGain(float gain) {
+    constexpr float kMaximumEs7210GainDb = 37.5f;
+    constexpr float kMaximumProtocolGainDb = 37.0f;
+    AudioCodec::SetInputGain(
+        gain >= kMaximumProtocolGainDb ? kMaximumEs7210GainDb : gain
+    );
 }
 
 void BoxAudioCodec::EnableInput(bool enable) {
