@@ -10,10 +10,12 @@
 BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
     gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7210_addr, bool input_reference, uint8_t input_mic_mask,
-    bool enable_output_path) {
+    bool enable_output_path, uint8_t input_channel_count) {
     duplex_ = enable_output_path;
     input_reference_ = input_reference;
-    input_channels_ = input_reference_ ? 2 : 1;
+    input_channels_ = input_channel_count == 0 ? (input_reference_ ? 2 : 1) : input_channel_count;
+    assert(input_channels_ >= 1 && input_channels_ <= 4);
+    assert(!input_reference_ || input_channels_ >= 2);
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
     input_gain_ = 30;
@@ -249,6 +251,23 @@ void BoxAudioCodec::ForcePowerAmplifierOff() {
     gpio_set_level(pa_pin_, 0);
 }
 
+uint16_t BoxAudioCodec::InputChannelMask() const {
+    uint16_t mask = 0;
+    for (int channel = 0; channel < input_channels_; ++channel) {
+        mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(channel);
+    }
+    return mask;
+}
+
+uint16_t BoxAudioCodec::MicrophoneChannelMask() const {
+    const int microphone_channels = input_channels_ - (input_reference_ ? 1 : 0);
+    uint16_t mask = 0;
+    for (int channel = 0; channel < microphone_channels; ++channel) {
+        mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(channel);
+    }
+    return mask;
+}
+
 void BoxAudioCodec::SetOutputVolume(int volume) {
     if (output_dev_ != nullptr) {
         ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
@@ -265,13 +284,10 @@ void BoxAudioCodec::EnableInput(bool enable) {
         esp_codec_dev_sample_info_t fs = {
             .bits_per_sample = 16,
             .channel = 4,
-            .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
+            .channel_mask = InputChannelMask(),
             .sample_rate = (uint32_t)input_sample_rate_,
             .mclk_multiple = 0,
         };
-        if (input_reference_) {
-            fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
-        }
         EnsureChannelEnabled(rx_handle_);
         esp_err_t result = esp_codec_dev_open(input_dev_, &fs);
         if (result != ESP_OK) {
@@ -283,7 +299,15 @@ void BoxAudioCodec::EnableInput(bool enable) {
             }
         }
         ESP_ERROR_CHECK(result);
-        ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
+        const uint16_t microphone_channel_mask = MicrophoneChannelMask();
+        ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(input_dev_, microphone_channel_mask, input_gain_));
+        ESP_LOGI(
+            TAG,
+            "Applied input gain: gain=%.1f dB microphone_mask=0x%04x input_mask=0x%04x",
+            input_gain_,
+            static_cast<unsigned>(microphone_channel_mask),
+            static_cast<unsigned>(fs.channel_mask)
+        );
     } else {
         ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
     }

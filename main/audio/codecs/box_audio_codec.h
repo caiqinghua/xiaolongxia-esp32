@@ -31,6 +31,8 @@ private:
     void EnsureChannelEnabled(i2s_chan_handle_t handle);
     void DisableChannelIfEnabled(i2s_chan_handle_t handle, const char* name);
     void ForcePowerAmplifierOff();
+    uint16_t InputChannelMask() const;
+    uint16_t MicrophoneChannelMask() const;
 
     virtual int Read(int16_t* dest, int samples) override;
     virtual int Write(const int16_t* data, int samples) override;
@@ -40,7 +42,7 @@ public:
         gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
         gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7210_addr, bool input_reference,
         uint8_t input_mic_mask = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4,
-        bool enable_output_path = true);
+        bool enable_output_path = true, uint8_t input_channel_count = 0);
     virtual ~BoxAudioCodec();
 
     virtual void SetOutputVolume(int volume) override;

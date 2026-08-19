@@ -52,6 +52,7 @@ constexpr uint64_t kRecordingFeedbackScreenOnUs = 3000ULL * 1000ULL;
 constexpr uint64_t kRecordingHoldRetryUs = 200ULL * 1000ULL;
 constexpr bool kRecordingBlePeriodicStatusReportsEnabled = false;
 constexpr bool kRecordingAudioOutputPathEnabled = false;
+constexpr uint8_t kRecordingAudioInputChannelCount = 3;
 constexpr uint64_t kRecordingBleStartGraceUs = 2ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kRecordingBleReportIntervalUs = 5ULL * 60ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kRecordingBleReportWindowUs = 30ULL * 1000ULL * 1000ULL;
@@ -2063,8 +2064,9 @@ public:
             AUDIO_CODEC_ES8311_ADDR, 
             AUDIO_CODEC_ES7210_ADDR, 
             AUDIO_INPUT_REFERENCE,
-            ES7210_SEL_MIC1 | ES7210_SEL_MIC2,
-            kRecordingAudioOutputPathEnabled);
+            ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3,
+            kRecordingAudioOutputPathEnabled,
+            kRecordingAudioInputChannelCount);
         SchedulePmicRecoveryTask("audio codec initialization");
         return &audio_codec;
     }

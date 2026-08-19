@@ -34,7 +34,7 @@ constexpr size_t kMaxReadChunkBytes = 96;
 constexpr size_t kMaxListRecordingsPayloadBytes = 220;
 
 constexpr int32_t kDefaultAutoPowerOffSeconds = -1;
-constexpr uint8_t kDefaultMicrophoneGainDb = 24;
+constexpr uint8_t kDefaultMicrophoneGainDb = 30;
 constexpr uint8_t kDefaultCallGain = 1;
 constexpr uint8_t kDefaultBatteryLevelPercent = 80;
 constexpr uint8_t kDefaultRecordingMode = 0;

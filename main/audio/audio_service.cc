@@ -127,6 +127,14 @@ void AudioService::Initialize(AudioCodec* codec) {
 void AudioService::InitializeForLocalRecording(AudioCodec* codec) {
     codec_ = codec;
     codec_->Start();
+    const int reference_channels = codec_->input_reference() ? 1 : 0;
+    ESP_LOGI(
+        TAG,
+        "Local recording input configured: channels=%d microphones=%d references=%d",
+        codec_->input_channels(),
+        codec_->input_channels() - reference_channels,
+        reference_channels
+    );
 
     esp_opus_enc_config_t opus_enc_cfg = AS_OPUS_ENC_CONFIG();
     const auto ret = esp_opus_enc_open(
@@ -404,15 +412,20 @@ std::vector<int16_t> AudioService::DownmixInputToMono(std::vector<int16_t>&& dat
         return std::move(data);
     }
 
+    const int microphone_channels = channels - (codec_->input_reference() ? 1 : 0);
+    if (microphone_channels <= 0) {
+        return {};
+    }
+
     const size_t frame_count = data.size() / channels;
     std::vector<int16_t> mono_data(frame_count);
     for (size_t frame = 0; frame < frame_count; ++frame) {
         int32_t sum = 0;
         const size_t base = frame * channels;
-        for (int channel = 0; channel < channels; ++channel) {
+        for (int channel = 0; channel < microphone_channels; ++channel) {
             sum += data[base + channel];
         }
-        int32_t sample = sum / channels;
+        int32_t sample = sum / microphone_channels;
         sample = std::clamp(
             sample,
             static_cast<int32_t>(std::numeric_limits<int16_t>::min()),
