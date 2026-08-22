@@ -47,6 +47,11 @@ public:
     StorageStatus GetStatus();
     std::string RecordingsDirectory() const;
     bool EnsureRecordingsDirectory();
+    bool ReclaimSpaceForRecording(
+        uint64_t required_free_bytes,
+        const std::string& protected_recording_id,
+        std::vector<std::string>* deleted_recording_ids = nullptr
+    );
     bool SetRecordingMtime(const std::string& recording_id, uint64_t started_at_unix_ms);
     std::vector<StoredRecordingInfo> ListRecordings(
         size_t offset,

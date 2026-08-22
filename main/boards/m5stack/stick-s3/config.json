@@ -1,0 +1,21 @@
+{
+    "manufacturer": "m5stack",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "stick-s3-endurance",
+            "sdkconfig_append": [
+                "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/stick-s3-endurance.csv\"",
+                "CONFIG_PARTITION_TABLE_FILENAME=\"partitions/stick-s3-endurance.csv\"",
+                "CONFIG_FLASH_NONE_ASSETS=y",
+                "CONFIG_WAKE_WORD_DISABLED=y",
+                "# CONFIG_USE_AUDIO_PROCESSOR is not set",
+                "CONFIG_PM_ENABLE=y",
+                "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y",
+                "CONFIG_SPIRAM=y"
+            ]
+        }
+    ]
+}

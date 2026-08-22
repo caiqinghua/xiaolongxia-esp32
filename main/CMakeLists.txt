@@ -98,6 +98,7 @@ set(AUDREAM_SD_MISO_GPIO GPIO_NUM_NC)
 set(AUDREAM_SD_CLK_GPIO GPIO_NUM_NC)
 set(AUDREAM_SD_SPI_HOST SPI2_HOST)
 set(AUDREAM_SD_USE_SDMMC 0)
+set(AUDREAM_INTERNAL_FLASH_STORAGE 0)
 
 # Add board files according to BOARD_TYPE
 # Set default assets if the board uses partition table V2
@@ -210,6 +211,10 @@ elseif(CONFIG_BOARD_TYPE_M5STACK_CORE_S3)
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
     set(BUILTIN_ICON_FONT font_awesome_20_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+elseif(CONFIG_BOARD_TYPE_M5STACK_STICK_S3_ENDURANCE)
+    set(MANUFACTURER "m5stack")
+    set(BOARD_TYPE "stick-s3")
+    set(AUDREAM_INTERNAL_FLASH_STORAGE 1)
 elseif(CONFIG_BOARD_TYPE_M5STACK_CORE_TAB5)
     set(BOARD_TYPE "m5stack-tab5")
     set(BUILTIN_TEXT_FONT font_puhui_basic_30_4)
@@ -915,6 +920,14 @@ if(CONFIG_IDF_TARGET_ESP32S3)
                         )
 endif()
 
+set(MAIN_PRIV_REQUIRES_EXTRA "")
+if(CONFIG_BOARD_TYPE_M5STACK_STICK_S3_ENDURANCE)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA
+        m5stack__m5pm1
+        wear_levelling
+    )
+endif()
+
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
@@ -938,6 +951,7 @@ idf_component_register(SRCS ${SOURCES}
                         console
                         efuse
                         bt
+                        ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
@@ -954,6 +968,8 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE AUDREAM_SD_CLK_GPIO=${AUDREAM_SD_CLK_GPIO}
                     PRIVATE AUDREAM_SD_SPI_HOST=${AUDREAM_SD_SPI_HOST}
                     PRIVATE AUDREAM_SD_USE_SDMMC=${AUDREAM_SD_USE_SDMMC}
+                    PRIVATE AUDREAM_INTERNAL_FLASH_STORAGE=${AUDREAM_INTERNAL_FLASH_STORAGE}
+                    PRIVATE AUDREAM_INTERNAL_FLASH_PARTITION_LABEL=\"recordings\"
                     )
 
 # Add generation rules

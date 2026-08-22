@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/utime.h>
@@ -18,6 +19,9 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
+#if defined(AUDREAM_INTERNAL_FLASH_STORAGE) && AUDREAM_INTERNAL_FLASH_STORAGE
+#include "wear_levelling.h"
+#endif
 #include "driver/gpio.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
@@ -51,6 +55,14 @@
 #define AUDREAM_SD_USE_SDMMC 0
 #endif
 
+#ifndef AUDREAM_INTERNAL_FLASH_STORAGE
+#define AUDREAM_INTERNAL_FLASH_STORAGE 0
+#endif
+
+#ifndef AUDREAM_INTERNAL_FLASH_PARTITION_LABEL
+#define AUDREAM_INTERNAL_FLASH_PARTITION_LABEL "recordings"
+#endif
+
 namespace {
 
 constexpr char kTag[] = "AudreamStorage";
@@ -66,6 +78,9 @@ constexpr time_t kMinimumReasonableRecordingMtime = 1704067200;
 constexpr uint64_t kEpochSortStrideMs = 1000000000000ULL;
 
 sdmmc_card_t* mounted_card = nullptr;
+#if AUDREAM_INTERNAL_FLASH_STORAGE
+wl_handle_t internal_flash_wl_handle = WL_INVALID_HANDLE;
+#endif
 
 struct RecordingScanEntry {
     StoredRecordingInfo info;
@@ -439,6 +454,7 @@ bool SdCardStorage::Mount() {
         return true;
     }
     last_error_code_ = StorageStatusErrorCode::kNone;
+#if !AUDREAM_INTERNAL_FLASH_STORAGE
     if (AUDREAM_SD_MOSI_GPIO == GPIO_NUM_NC ||
         AUDREAM_SD_MISO_GPIO == GPIO_NUM_NC ||
         AUDREAM_SD_CLK_GPIO == GPIO_NUM_NC ||
@@ -450,17 +466,36 @@ bool SdCardStorage::Mount() {
         ESP_LOGE(kTag, "SD card pins are not configured for this board");
         return false;
     }
+#endif
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+#if AUDREAM_INTERNAL_FLASH_STORAGE
+        .format_if_mount_failed = true,
+        .max_files = 12,
+#else
         .format_if_mount_failed = false,
         .max_files = 8,
+#endif
         .allocation_unit_size = 16 * 1024,
         .disk_status_check_enable = false,
         .use_one_fat = false,
     };
 
     sdmmc_card_t* card = nullptr;
-#if AUDREAM_SD_USE_SDMMC
+#if AUDREAM_INTERNAL_FLASH_STORAGE
+    ESP_LOGI(
+        kTag,
+        "Mounting internal Flash recording storage: partition=%s mount=%s",
+        AUDREAM_INTERNAL_FLASH_PARTITION_LABEL,
+        kMountPoint
+    );
+    esp_err_t ret = esp_vfs_fat_spiflash_mount_rw_wl(
+        kMountPoint,
+        AUDREAM_INTERNAL_FLASH_PARTITION_LABEL,
+        &mount_config,
+        &internal_flash_wl_handle
+    );
+#elif AUDREAM_SD_USE_SDMMC
     ESP_LOGI(
         kTag,
         "Mounting SD card in SDMMC 1-bit mode with clk=%d cmd=%d d0=%d",
@@ -542,20 +577,29 @@ bool SdCardStorage::Mount() {
         ready_ = false;
         cached_status_ = {};
         cached_status_.error_code = last_error_code_;
+#if AUDREAM_INTERNAL_FLASH_STORAGE
+        ESP_LOGE(kTag, "Failed to mount internal Flash recording storage: %s (%d)",
+            esp_err_to_name(ret), static_cast<int>(ret));
+#else
         ESP_LOGE(
             kTag,
             "Failed to mount SD card: %s (%d). Check card insertion, FAT32 formatting, power, and bus wiring.",
             esp_err_to_name(ret),
             static_cast<int>(ret)
         );
+#endif
         return false;
     }
 
     mounted_ = true;
     mounted_card = card;
     last_error_code_ = StorageStatusErrorCode::kNone;
+#if AUDREAM_INTERNAL_FLASH_STORAGE
+    ESP_LOGI(kTag, "Internal Flash recording storage mounted at %s", kMountPoint);
+#else
     sdmmc_card_print_info(stdout, card);
     ESP_LOGI(kTag, "SD card mounted at %s", kMountPoint);
+#endif
     return true;
 }
 
@@ -566,6 +610,25 @@ bool SdCardStorage::IsMounted() const {
 
 void SdCardStorage::PrepareForDeepSleep() {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+#if AUDREAM_INTERNAL_FLASH_STORAGE
+    if (internal_flash_wl_handle == WL_INVALID_HANDLE) {
+        return;
+    }
+    const esp_err_t unmount_result = esp_vfs_fat_spiflash_unmount_rw_wl(
+        kMountPoint,
+        internal_flash_wl_handle
+    );
+    if (unmount_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "Failed to unmount internal Flash recording storage: %s",
+            esp_err_to_name(unmount_result)
+        );
+    } else {
+        ESP_LOGI(kTag, "Internal Flash recording storage unmounted");
+    }
+    internal_flash_wl_handle = WL_INVALID_HANDLE;
+#else
     if (mounted_card == nullptr) {
         return;
     }
@@ -581,6 +644,7 @@ void SdCardStorage::PrepareForDeepSleep() {
         ESP_LOGI(kTag, "SD card unmounted before deep sleep");
     }
     mounted_card = nullptr;
+#endif
     mounted_ = false;
     ready_ = false;
     cached_status_ = {};
@@ -702,6 +766,75 @@ bool SdCardStorage::EnsureRecordingsDirectory() {
         return false;
     }
     return EnsureDirectory(kRecordingsDirectory);
+}
+
+bool SdCardStorage::ReclaimSpaceForRecording(
+    uint64_t required_free_bytes,
+    const std::string& protected_recording_id,
+    std::vector<std::string>* deleted_recording_ids
+) {
+    ScopedStorageBusy storage_busy;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (deleted_recording_ids != nullptr) {
+        deleted_recording_ids->clear();
+    }
+    if (!GetStatus().mounted) {
+        return false;
+    }
+
+    auto refresh_free_bytes = [this]() -> bool {
+        FATFS* fs = nullptr;
+        DWORD free_clusters = 0;
+        if (f_getfree(kMountPoint, &free_clusters, &fs) != FR_OK || fs == nullptr) {
+            return false;
+        }
+        cached_status_.free_bytes =
+            static_cast<uint64_t>(free_clusters) * fs->csize * fs->ssize;
+        cached_status_.estimated_remaining_minutes = static_cast<uint32_t>(
+            cached_status_.free_bytes / kEstimatedOpusBytesPerMinute
+        );
+        return true;
+    };
+
+    if (!refresh_free_bytes()) {
+        ESP_LOGE(kTag, "Failed to read free space before recording allocation");
+        return false;
+    }
+    if (cached_status_.free_bytes >= required_free_bytes) {
+        return true;
+    }
+
+    size_t total_count = 0;
+    auto recordings = ListRecordings(
+        0,
+        std::numeric_limits<size_t>::max(),
+        &total_count
+    );
+    for (auto it = recordings.rbegin();
+         it != recordings.rend() && cached_status_.free_bytes < required_free_bytes;
+         ++it) {
+        if (it->recording_id == protected_recording_id) {
+            continue;
+        }
+        const std::string recording_id = it->recording_id;
+        if (!DeleteRecording(recording_id)) {
+            ESP_LOGW(kTag, "Failed to reclaim recording: %s", recording_id.c_str());
+            continue;
+        }
+        if (deleted_recording_ids != nullptr) {
+            deleted_recording_ids->push_back(recording_id);
+        }
+        refresh_free_bytes();
+        ESP_LOGI(
+            kTag,
+            "Reclaimed oldest recording for circular storage: id=%s free_bytes=%llu required_bytes=%llu",
+            recording_id.c_str(),
+            static_cast<unsigned long long>(cached_status_.free_bytes),
+            static_cast<unsigned long long>(required_free_bytes)
+        );
+    }
+
+    return cached_status_.free_bytes >= required_free_bytes;
 }
 
 bool SdCardStorage::SetRecordingMtime(

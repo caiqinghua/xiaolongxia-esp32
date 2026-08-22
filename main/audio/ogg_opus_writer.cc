@@ -64,6 +64,7 @@ bool OggOpusWriter::Open(const char* path, uint32_t sample_rate, uint8_t channel
     frame_samples_ = frame_samples;
     granule_position_ = 0;
     packet_count_ = 0;
+    bytes_written_ = 0;
 
     std::vector<uint8_t> opus_head;
     opus_head.insert(opus_head.end(), {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd'});
@@ -153,5 +154,7 @@ bool OggOpusWriter::WritePage(
     page[24] = static_cast<uint8_t>((crc >> 16) & 0xFF);
     page[25] = static_cast<uint8_t>((crc >> 24) & 0xFF);
 
-    return fwrite(page.data(), 1, page.size(), file_) == page.size();
+    const size_t written = fwrite(page.data(), 1, page.size(), file_);
+    bytes_written_ += written;
+    return written == page.size();
 }

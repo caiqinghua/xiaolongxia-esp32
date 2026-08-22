@@ -7,9 +7,9 @@
 Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
     gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk, bool pa_inverted) {
-    duplex_ = true; // 是否双工
-    input_reference_ = false; // 是否使用参考输入，实现回声消除
-    input_channels_ = 1; // 输入通道数
+    duplex_ = true;
+    input_reference_ = false;
+    input_channels_ = 1;
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
     pa_pin_ = pa_pin;
@@ -185,15 +185,31 @@ void Es8311AudioCodec::EnableOutput(bool enable) {
 }
 
 int Es8311AudioCodec::Read(int16_t* dest, int samples) {
-    if (input_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(dev_, (void*)dest, samples * sizeof(int16_t)));
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    if (!input_enabled_ || dev_ == nullptr) {
+        return 0;
     }
+
+    const esp_err_t result = esp_codec_dev_read(dev_, (void*)dest, samples * sizeof(int16_t));
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read audio input: %s", esp_err_to_name(result));
+        return 0;
+    }
+
     return samples;
 }
 
 int Es8311AudioCodec::Write(const int16_t* data, int samples) {
-    if (output_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(dev_, (void*)data, samples * sizeof(int16_t)));
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    if (!output_enabled_ || dev_ == nullptr) {
+        return 0;
     }
+
+    const esp_err_t result = esp_codec_dev_write(dev_, (void*)data, samples * sizeof(int16_t));
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to write audio output: %s", esp_err_to_name(result));
+        return 0;
+    }
+
     return samples;
 }
