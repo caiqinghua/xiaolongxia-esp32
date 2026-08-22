@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/unistd.h>
@@ -30,6 +31,7 @@ constexpr uint64_t kSegmentSizeBytes = 512 * 1024;
 constexpr uint64_t kAllocationReserveBytes = 64 * 1024;
 constexpr uint32_t kDrainTimeoutMs = 3000;
 constexpr char kLastSessionFileName[] = "last-session.json";
+constexpr int kRecentSessionLimit = 7;
 
 uint32_t FileSizeBytes(const std::string& path) {
     struct stat file_stat = {};
@@ -155,7 +157,7 @@ StickS3EnduranceRecorder& StickS3EnduranceRecorder::GetInstance() {
     return instance;
 }
 
-bool StickS3EnduranceRecorder::Start(AudioService& audio_service) {
+bool StickS3EnduranceRecorder::Start(AudioService& audio_service, int start_battery_percent) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (recording_) {
         return true;
@@ -177,6 +179,8 @@ bool StickS3EnduranceRecorder::Start(AudioService& audio_service) {
     started_at_unix_ms_ = time_service.CurrentUnixTimeMs();
     rtc_epoch_seq_ = time_service.RtcEpochSeq();
     time_synchronized_ = time_service.IsSynchronized();
+    start_battery_percent_ = std::clamp(start_battery_percent, -1, 100);
+    end_battery_percent_ = -1;
     write_failed_ = false;
     stopping_ = false;
 
@@ -195,15 +199,20 @@ bool StickS3EnduranceRecorder::Start(AudioService& audio_service) {
     audio_service.EnableLocalRecording(true);
     ESP_LOGI(
         kTag,
-        "Endurance recording started: session=%s segment_bytes=%llu sample_rate=%lu",
+        "Endurance recording started: session=%s segment_bytes=%llu sample_rate=%lu start_battery_percent=%d",
         session_id_.c_str(),
         static_cast<unsigned long long>(kSegmentSizeBytes),
-        static_cast<unsigned long>(kSampleRate)
+        static_cast<unsigned long>(kSampleRate),
+        start_battery_percent_
     );
     return true;
 }
 
-bool StickS3EnduranceRecorder::Stop(AudioService& audio_service, const std::string& reason) {
+bool StickS3EnduranceRecorder::Stop(
+    AudioService& audio_service,
+    const std::string& reason,
+    int end_battery_percent
+) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!recording_ || stopping_) {
@@ -222,18 +231,24 @@ bool StickS3EnduranceRecorder::Stop(AudioService& audio_service, const std::stri
     std::lock_guard<std::mutex> lock(mutex_);
     recording_ = false;
     stopping_ = false;
+    end_battery_percent_ = std::clamp(end_battery_percent, -1, 100);
     const uint64_t elapsed_ms = DurationMsLocked();
     FinalizeCurrentSegmentLocked();
     const bool metadata_written = WriteSessionMetadataLocked(elapsed_ms, reason);
     AudreamPowerManager::GetInstance().SetRecordingActive(false);
     ESP_LOGI(
         kTag,
-        "Endurance recording stopped: session=%s elapsed_ms=%llu encoded_ms=%llu segments=%u overwritten=%u reason=%s metadata=%d",
+        "Endurance recording stopped: session=%s elapsed_ms=%llu encoded_ms=%llu segments=%u overwritten=%u start_battery_percent=%d end_battery_percent=%d consumed_percent=%d reason=%s metadata=%d",
         session_id_.c_str(),
         static_cast<unsigned long long>(elapsed_ms),
         static_cast<unsigned long long>(total_encoded_duration_ms_),
         static_cast<unsigned>(segments_.size()),
         static_cast<unsigned>(overwritten_segment_count_),
+        start_battery_percent_,
+        end_battery_percent_,
+        start_battery_percent_ >= 0 && end_battery_percent_ >= 0
+            ? std::max(0, start_battery_percent_ - end_battery_percent_)
+            : -1,
         reason.c_str(),
         metadata_written ? 1 : 0
     );
@@ -250,45 +265,175 @@ uint64_t StickS3EnduranceRecorder::DurationMs() const {
     return DurationMsLocked();
 }
 
-void StickS3EnduranceRecorder::LogLastSessionDuration() const {
-    const std::string path = SdCardStorage::GetInstance().RecordingsDirectory() +
-        "/" + kLastSessionFileName;
-    const std::string content = ReadTextFile(path);
-    if (content.empty()) {
+void StickS3EnduranceRecorder::LogRecentSessionMetadata() const {
+    const std::string directory = SdCardStorage::GetInstance().RecordingsDirectory();
+    const std::string last_session_content = ReadTextFile(
+        directory + "/" + kLastSessionFileName
+    );
+    std::string latest_session_id;
+    if (!last_session_content.empty()) {
+        cJSON* latest = cJSON_ParseWithLength(
+            last_session_content.data(),
+            last_session_content.size()
+        );
+        const cJSON* session = cJSON_GetObjectItemCaseSensitive(latest, "session_id");
+        if (cJSON_IsString(session)) {
+            latest_session_id = session->valuestring;
+        }
+        cJSON_Delete(latest);
+    }
+
+    struct SessionMetadata {
+        std::string session_id;
+        std::string reason;
+        uint64_t elapsed_ms = 0;
+        uint64_t encoded_ms = 0;
+        uint64_t retained_ms = 0;
+        uint64_t rtc_epoch_seq = 0;
+        uint64_t started_at_unix_ms = 0;
+        uint64_t started_at_rtc_ms = 0;
+        time_t modified_at = 0;
+        int segment_count = 0;
+        int overwritten_count = 0;
+        int start_battery_percent = -1;
+        int end_battery_percent = -1;
+        int battery_consumed_percent = -1;
+        bool audio_complete = false;
+        bool latest = false;
+    };
+
+    auto read_number = [](const cJSON* root, const char* name) -> uint64_t {
+        const cJSON* value = cJSON_GetObjectItemCaseSensitive(root, name);
+        if (!cJSON_IsNumber(value) || value->valuedouble < 0) {
+            return 0;
+        }
+        return static_cast<uint64_t>(value->valuedouble);
+    };
+    auto parse_metadata = [&](const std::string& content, time_t modified_at, SessionMetadata& output) {
+        cJSON* root = cJSON_ParseWithLength(content.data(), content.size());
+        if (!cJSON_IsObject(root)) {
+            cJSON_Delete(root);
+            return false;
+        }
+        const cJSON* session = cJSON_GetObjectItemCaseSensitive(root, "session_id");
+        const cJSON* elapsed = cJSON_GetObjectItemCaseSensitive(root, "elapsed_duration_ms");
+        if (!cJSON_IsString(session) || !cJSON_IsNumber(elapsed) || elapsed->valuedouble < 0) {
+            cJSON_Delete(root);
+            return false;
+        }
+        const cJSON* reason = cJSON_GetObjectItemCaseSensitive(root, "stop_reason");
+        const cJSON* segments = cJSON_GetObjectItemCaseSensitive(root, "segment_count");
+        const cJSON* overwritten = cJSON_GetObjectItemCaseSensitive(root, "overwritten_segment_count");
+        const cJSON* complete = cJSON_GetObjectItemCaseSensitive(root, "audio_complete");
+        const cJSON* start_battery = cJSON_GetObjectItemCaseSensitive(root, "start_battery_percent");
+        const cJSON* end_battery = cJSON_GetObjectItemCaseSensitive(root, "end_battery_percent");
+        const cJSON* consumed = cJSON_GetObjectItemCaseSensitive(root, "battery_consumed_percent");
+        output.session_id = session->valuestring;
+        output.reason = cJSON_IsString(reason) ? reason->valuestring : "unknown";
+        output.elapsed_ms = static_cast<uint64_t>(elapsed->valuedouble);
+        output.encoded_ms = read_number(root, "encoded_audio_duration_ms");
+        output.retained_ms = read_number(root, "retained_audio_duration_ms");
+        output.rtc_epoch_seq = read_number(root, "rtc_epoch_seq");
+        output.started_at_unix_ms = read_number(root, "started_at_unix_ms");
+        output.started_at_rtc_ms = read_number(root, "started_at_rtc_ms");
+        output.modified_at = modified_at;
+        output.segment_count = cJSON_IsNumber(segments) ? segments->valueint : 0;
+        output.overwritten_count = cJSON_IsNumber(overwritten) ? overwritten->valueint : 0;
+        output.start_battery_percent = cJSON_IsNumber(start_battery) ? start_battery->valueint : -1;
+        output.end_battery_percent = cJSON_IsNumber(end_battery) ? end_battery->valueint : -1;
+        output.battery_consumed_percent = cJSON_IsNumber(consumed) ? consumed->valueint : -1;
+        output.audio_complete = cJSON_IsTrue(complete);
+        output.latest = output.session_id == latest_session_id;
+        cJSON_Delete(root);
+        return true;
+    };
+
+    std::vector<SessionMetadata> metadata;
+    DIR* directory_handle = opendir(directory.c_str());
+    if (directory_handle != nullptr) {
+        constexpr char kSessionSuffix[] = ".session.json";
+        while (dirent* entry = readdir(directory_handle)) {
+            const std::string name = entry->d_name;
+            if (name.size() < sizeof(kSessionSuffix) - 1 ||
+                name.compare(name.size() - (sizeof(kSessionSuffix) - 1), sizeof(kSessionSuffix) - 1, kSessionSuffix) != 0) {
+                continue;
+            }
+            const std::string path = directory + "/" + name;
+            const std::string content = ReadTextFile(path);
+            struct stat file_stat = {};
+            const time_t modified_at = stat(path.c_str(), &file_stat) == 0
+                ? file_stat.st_mtime
+                : 0;
+            SessionMetadata parsed;
+            if (parse_metadata(content, modified_at, parsed)) {
+                metadata.push_back(std::move(parsed));
+            } else {
+                ESP_LOGW(kTag, "Skipping invalid endurance session metadata: %s", path.c_str());
+            }
+        }
+        closedir(directory_handle);
+    }
+
+    const bool latest_present = std::any_of(
+        metadata.begin(),
+        metadata.end(),
+        [](const SessionMetadata& entry) { return entry.latest; }
+    );
+    if (!latest_present && !last_session_content.empty()) {
+        SessionMetadata fallback;
+        if (parse_metadata(last_session_content, 0, fallback)) {
+            fallback.latest = true;
+            metadata.push_back(std::move(fallback));
+        }
+    }
+    std::sort(metadata.begin(), metadata.end(), [](const SessionMetadata& left, const SessionMetadata& right) {
+        if (left.rtc_epoch_seq != right.rtc_epoch_seq) {
+            return left.rtc_epoch_seq > right.rtc_epoch_seq;
+        }
+        if (left.started_at_unix_ms != right.started_at_unix_ms) {
+            return left.started_at_unix_ms > right.started_at_unix_ms;
+        }
+        if (left.modified_at != right.modified_at) {
+            return left.modified_at > right.modified_at;
+        }
+        if (left.latest != right.latest) {
+            return left.latest;
+        }
+        if (left.started_at_rtc_ms != right.started_at_rtc_ms) {
+            return left.started_at_rtc_ms > right.started_at_rtc_ms;
+        }
+        return left.session_id > right.session_id;
+    });
+
+    const int count = std::min(static_cast<int>(metadata.size()), kRecentSessionLimit);
+    if (count == 0) {
         ESP_LOGI(kTag, "No previous endurance recording metadata was found");
         return;
     }
-
-    cJSON* root = cJSON_ParseWithLength(content.data(), content.size());
-    if (root == nullptr) {
-        ESP_LOGW(kTag, "Previous endurance recording metadata is invalid");
-        return;
+    ESP_LOGI(kTag, "Recent endurance session metadata: count=%d", count);
+    for (int index = 0; index < count; ++index) {
+        const SessionMetadata& entry = metadata[index];
+        const uint64_t total_seconds = entry.elapsed_ms / 1000;
+        ESP_LOGI(
+            kTag,
+            "Recent endurance metadata: index=%d session=%s duration=%02llu:%02llu:%02llu elapsed_ms=%llu encoded_ms=%llu retained_ms=%llu segments=%d overwritten=%d start_battery_percent=%d end_battery_percent=%d consumed_percent=%d audio_complete=%d reason=%s",
+            index + 1,
+            entry.session_id.c_str(),
+            static_cast<unsigned long long>(total_seconds / 3600),
+            static_cast<unsigned long long>((total_seconds / 60) % 60),
+            static_cast<unsigned long long>(total_seconds % 60),
+            static_cast<unsigned long long>(entry.elapsed_ms),
+            static_cast<unsigned long long>(entry.encoded_ms),
+            static_cast<unsigned long long>(entry.retained_ms),
+            entry.segment_count,
+            entry.overwritten_count,
+            entry.start_battery_percent,
+            entry.end_battery_percent,
+            entry.battery_consumed_percent,
+            entry.audio_complete ? 1 : 0,
+            entry.reason.c_str()
+        );
     }
-    const cJSON* elapsed = cJSON_GetObjectItemCaseSensitive(root, "elapsed_duration_ms");
-    const cJSON* session = cJSON_GetObjectItemCaseSensitive(root, "session_id");
-    const cJSON* reason = cJSON_GetObjectItemCaseSensitive(root, "stop_reason");
-    if (!cJSON_IsNumber(elapsed) || elapsed->valuedouble < 0) {
-        ESP_LOGW(kTag, "Previous endurance recording duration is missing");
-        cJSON_Delete(root);
-        return;
-    }
-
-    const uint64_t elapsed_ms = static_cast<uint64_t>(elapsed->valuedouble);
-    const uint64_t total_seconds = elapsed_ms / 1000;
-    const uint64_t hours = total_seconds / 3600;
-    const uint64_t minutes = (total_seconds / 60) % 60;
-    const uint64_t seconds = total_seconds % 60;
-    ESP_LOGI(
-        kTag,
-        "Previous endurance recording: session=%s duration=%02llu:%02llu:%02llu elapsed_ms=%llu reason=%s",
-        cJSON_IsString(session) ? session->valuestring : "unknown",
-        static_cast<unsigned long long>(hours),
-        static_cast<unsigned long long>(minutes),
-        static_cast<unsigned long long>(seconds),
-        static_cast<unsigned long long>(elapsed_ms),
-        cJSON_IsString(reason) ? reason->valuestring : "unknown"
-    );
-    cJSON_Delete(root);
 }
 
 void StickS3EnduranceRecorder::HandleOpusPacket(const uint8_t* data, size_t size) {
@@ -440,11 +585,31 @@ bool StickS3EnduranceRecorder::WriteSessionMetadataLocked(
     std::ostringstream output;
     output
         << "{"
-        << "\"schema_version\":1,"
+        << "\"schema_version\":2,"
         << "\"session_id\":\"" << session_id_ << "\","
         << "\"stop_reason\":\"" << reason << "\","
         << "\"completed\":true,"
-        << "\"audio_complete\":" << (write_failed_ ? "false" : "true") << ","
+        << "\"audio_complete\":" << (write_failed_ ? "false" : "true") << ",";
+    output << "\"start_battery_percent\":";
+    if (start_battery_percent_ >= 0) {
+        output << start_battery_percent_;
+    } else {
+        output << "null";
+    }
+    output << ",\"end_battery_percent\":";
+    if (end_battery_percent_ >= 0) {
+        output << end_battery_percent_;
+    } else {
+        output << "null";
+    }
+    output << ",\"battery_consumed_percent\":";
+    if (start_battery_percent_ >= 0 && end_battery_percent_ >= 0) {
+        output << std::max(0, start_battery_percent_ - end_battery_percent_);
+    } else {
+        output << "null";
+    }
+    output
+        << ","
         << "\"elapsed_duration_ms\":" << elapsed_ms << ","
         << "\"encoded_audio_duration_ms\":" << total_encoded_duration_ms_ << ","
         << "\"retained_audio_duration_ms\":" << retained_duration_ms << ","
@@ -452,6 +617,7 @@ bool StickS3EnduranceRecorder::WriteSessionMetadataLocked(
         << "\"segment_count\":" << segments_.size() << ","
         << "\"retained_segment_count\":" << retained_segment_count << ","
         << "\"overwritten_segment_count\":" << overwritten_segment_count_ << ","
+        << "\"rtc_epoch_seq\":" << rtc_epoch_seq_ << ","
         << "\"started_at_unix_ms\":" << started_at_unix_ms_ << ","
         << "\"started_at_uptime_ms\":" << started_at_uptime_ms_ << ","
         << "\"started_at_rtc_ms\":" << started_at_rtc_ms_ << ","
@@ -469,11 +635,11 @@ bool StickS3EnduranceRecorder::WriteSessionMetadataLocked(
         return false;
     }
     const std::string last_session_path = directory + "/" + kLastSessionFileName;
-    if (!WriteTextAtomically(last_session_path, content)) {
+    const bool last_session_written = WriteTextAtomically(last_session_path, content);
+    if (!last_session_written) {
         ESP_LOGE(kTag, "Failed to update the latest session metadata: %s", last_session_path.c_str());
-        return false;
     }
-    return true;
+    return last_session_written;
 }
 
 uint64_t StickS3EnduranceRecorder::DurationMsLocked() const {

@@ -13,11 +13,11 @@ class StickS3EnduranceRecorder {
 public:
     static StickS3EnduranceRecorder& GetInstance();
 
-    bool Start(AudioService& audio_service);
-    bool Stop(AudioService& audio_service, const std::string& reason);
+    bool Start(AudioService& audio_service, int start_battery_percent);
+    bool Stop(AudioService& audio_service, const std::string& reason, int end_battery_percent);
     bool IsRecording() const;
     uint64_t DurationMs() const;
-    void LogLastSessionDuration() const;
+    void LogRecentSessionMetadata() const;
 
 private:
     struct Segment {
@@ -49,6 +49,8 @@ private:
     uint64_t started_at_unix_ms_ = 0;
     uint64_t rtc_epoch_seq_ = 0;
     int64_t started_at_us_ = 0;
+    int start_battery_percent_ = -1;
+    int end_battery_percent_ = -1;
     bool time_synchronized_ = false;
     bool recording_ = false;
     bool stopping_ = false;

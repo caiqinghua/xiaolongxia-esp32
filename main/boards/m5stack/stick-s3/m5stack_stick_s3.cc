@@ -94,8 +94,8 @@ private:
     }
 
     void InitializeButtons() {
-        boot_button_.OnClick([]() {
-            Application::GetInstance().Schedule([]() {
+        boot_button_.OnClick([this]() {
+            Application::GetInstance().Schedule([this]() {
                 auto& recorder = StickS3EnduranceRecorder::GetInstance();
                 if (recorder.IsRecording()) {
                     ESP_LOGI(
@@ -105,7 +105,10 @@ private:
                     );
                     return;
                 }
-                if (!recorder.Start(Application::GetInstance().GetAudioService())) {
+                if (!recorder.Start(
+                        Application::GetInstance().GetAudioService(),
+                        ReadBatteryPercentForMetadata("start")
+                    )) {
                     ESP_LOGE(kTag, "Boot button could not start endurance recording");
                 }
             });
@@ -116,7 +119,8 @@ private:
                 if (recorder.IsRecording()) {
                     recorder.Stop(
                         Application::GetInstance().GetAudioService(),
-                        "user_button"
+                        "user_button",
+                        ReadBatteryPercentForMetadata("stop")
                     );
                 }
             });
@@ -140,6 +144,27 @@ private:
         discharging = !charging;
         level = BatteryPercentFromVoltage(voltage_mv);
         return true;
+    }
+
+    int ReadBatteryPercentForMetadata(const char* phase) {
+        int level = 0;
+        bool charging = false;
+        bool discharging = false;
+        uint16_t voltage_mv = 0;
+        if (!ReadBatteryStatus(level, charging, discharging, voltage_mv)) {
+            ESP_LOGW(kTag, "Recording %s battery status is unavailable", phase);
+            return -1;
+        }
+        ESP_LOGI(
+            kTag,
+            "Recording %s battery status: level=%d%% voltage_mv=%u charging=%d discharging=%d",
+            phase,
+            level,
+            static_cast<unsigned>(voltage_mv),
+            charging ? 1 : 0,
+            discharging ? 1 : 0
+        );
+        return level;
     }
 
     void LogBootBatteryStatus() {
@@ -235,7 +260,8 @@ private:
         if (recorder.IsRecording()) {
             metadata_written = recorder.Stop(
                 Application::GetInstance().GetAudioService(),
-                "low_battery"
+                "low_battery",
+                ReadBatteryPercentForMetadata("low-battery stop")
             );
         }
         if (!metadata_written) {
@@ -261,7 +287,7 @@ private:
             );
             return;
         }
-        StickS3EnduranceRecorder::GetInstance().LogLastSessionDuration();
+        StickS3EnduranceRecorder::GetInstance().LogRecentSessionMetadata();
         ESP_LOGI(kTag, "Endurance recorder is ready; press the Boot button to start");
     }
 

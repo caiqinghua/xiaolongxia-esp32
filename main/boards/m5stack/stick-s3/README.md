@@ -8,7 +8,7 @@ It does not replace or alter the Note Watch board target.
 - Captures the ES8311 microphone directly at 16 kHz mono.
 - Does not initialize Wi-Fi, Bluetooth, the LCD, or the speaker amplifier while recording.
 - Uses the recording power profile with an 80 MHz CPU ceiling and tickless idle enabled.
-- Prints the previous completed session duration after the internal Flash FAT filesystem is mounted.
+- Prints metadata for up to seven recent completed sessions after the internal Flash FAT filesystem is mounted.
 - Starts recording when the Boot button is pressed.
 - Rotates Ogg/Opus files at approximately 512 KiB and removes the oldest completed segment when space is needed.
 - Stops after three consecutive battery samples at or below 5%, finalizes metadata, unmounts Flash, disables peripheral rails, and enters deep sleep.
@@ -31,4 +31,4 @@ The completed endurance session is written separately:
 /sdcard/audream/recordings/last-session.json
 ```
 
-The session metadata records elapsed duration, encoded duration, retained duration, segment counts, overwrite count, stop reason, and whether audio remained complete. Elapsed duration remains the full endurance-test duration even when early audio segments have been overwritten.
+The session metadata records elapsed duration, encoded duration, retained duration, segment counts, overwrite count, start and end battery percentages, consumed battery percentage, stop reason, and whether audio remained complete. Elapsed duration remains the full endurance-test duration even when early audio segments have been overwritten.
