@@ -85,6 +85,8 @@ int main(int argc, char** argv) {
     };
     if (scenario.rfind("saved-", 0) == 0) {
         saved_allowed = true;
+        saved_remaining = 2;
+        saved_forget_fail_call = scenario == "saved-all-second-failed" ? 2 : 0;
         app.audio_service_.enabled = scenario == "saved-enabled";
         WifiStation::GetInstance().connected = false;
         GetWatchWifiGate().Initialize(false);
@@ -106,6 +108,20 @@ int main(int argc, char** argv) {
             assert(app.HandleWatchPairingRequest(open));
             ReachApp(app, Phase::kAwaitSavedPeer);
             assert(HasReservation() && !app.PollWatchPairing().network_required);
+            if (scenario.rfind("saved-all-", 0) == 0) {
+                auto select_all = Request(app, WatchViewAction::kSelectAllSavedControlPeers);
+                --select_all.pairing_attempt; assert(!app.HandleWatchPairingRequest(select_all)); ++select_all.pairing_attempt;
+                assert(app.HandleWatchPairingRequest(select_all));
+                assert(app.PollWatchPairing().state.phase == Phase::kAwaitAllControlRemoval);
+                auto confirm_all = Request(app, WatchViewAction::kConfirmAllControlRemoval,
+                    scenario != "saved-all-reject");
+                app.ObserveWatchPairingIntent(confirm_all);
+                assert(app.HandleWatchPairingRequest(confirm_all));
+                ReachApp(app, scenario == "saved-all-reject" ? Phase::kCancelled :
+                    scenario == "saved-all-second-failed" ? Phase::kFailed : Phase::kAllControlRemoved);
+                assert(forget_calls == (scenario == "saved-all-reject" ? 0U :
+                    scenario == "saved-all-second-failed" ? 1U : 2U));
+            } else {
             auto select = Request(app, WatchViewAction::kSelectSavedControlPeer);
             select.pairing_peer_generation = lease + 1;
             --select.pairing_attempt; assert(!app.HandleWatchPairingRequest(select)); ++select.pairing_attempt;
@@ -139,6 +155,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 ReachApp(app, scenario == "saved-reject" ? Phase::kCancelled : Phase::kControlRemoved);
+            }
             }
         }
         assert(!app.watch_pairing_->Active() && !power.storage_leases && !power.network_leases && !Blufi::GetInstance().lease);

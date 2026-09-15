@@ -1137,6 +1137,8 @@ void Application::HandleWatchViewRequest(const WatchViewRequest& request) {
         case WatchViewAction::kConfirmControlRemoval:
         case WatchViewAction::kOpenSavedControlPeers:
         case WatchViewAction::kSelectSavedControlPeer:
+        case WatchViewAction::kSelectAllSavedControlPeers:
+        case WatchViewAction::kConfirmAllControlRemoval:
 #if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
             succeeded = HandleWatchPairingRequest(request);
 #endif

@@ -113,6 +113,7 @@ private:
     lv_obj_t* pairing_cloud_ = nullptr;
     lv_obj_t* pairing_forget_ = nullptr;
     lv_obj_t* pairing_saved_ = nullptr;
+    lv_obj_t* pairing_saved_all_ = nullptr;
     std::vector<lv_obj_t*> pairing_saved_choices_;
     lv_obj_t* firmware_status_ = nullptr;
     lv_obj_t* firmware_target_ = nullptr;

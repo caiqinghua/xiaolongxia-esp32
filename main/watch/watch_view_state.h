@@ -27,7 +27,8 @@ enum class WatchViewAction { kTimeCommand, kSetAlarm, kSetPreferences,
     kSetNotificationsEnabled, kConfirmNotificationPeer, kOpenNotification, kClearNotifications, kWristCommand, kSetPowerMode,
     kPrepareAssistantNetwork, kOpenDevicePairing, kCancelDevicePairing, kConfirmDevicePairingPeer, kApproveDevicePairingAccount,
     kOpenBindingRemoval, kConfirmBindingRemoval, kOpenControlRemoval, kConfirmControlRemoval,
-    kOpenSavedControlPeers, kSelectSavedControlPeer, kCheckFirmware, kCancelFirmware, kInstallFirmware, kRebootFirmware,
+    kOpenSavedControlPeers, kSelectSavedControlPeer, kSelectAllSavedControlPeers, kConfirmAllControlRemoval,
+    kCheckFirmware, kCancelFirmware, kInstallFirmware, kRebootFirmware,
     kSelectUpdateTarget };
 
 struct WatchViewRequest {

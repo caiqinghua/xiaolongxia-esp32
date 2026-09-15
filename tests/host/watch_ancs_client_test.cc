@@ -1495,6 +1495,23 @@ void TestSavedControlBondRemoval(const std::string& scenario) {
     assert(Client().InspectSavedControlPeers(choices) && choices.size() == 1);
     assert(choices.front().stored_address[0] == 8);
     assert(watch_control::ReadApproval(second_fingerprint) == Status::kApproved);
+    if (scenario == "saved-all") {
+        const auto remaining = choices.front().selection;
+        assert(Client().ForgetSavedControlPeer(remaining));
+        Client().Poll();
+        assert(Client().ControlRemovalSnapshot().phase == Phase::kRemovingNative);
+        assert(removed_bond_addresses.size() == 2);
+        gap = {};
+        std::copy(removed_bond_addresses[1].begin(), removed_bond_addresses[1].end(), gap.remove_bond_dev_cmpl.bd_addr);
+        gap.remove_bond_dev_cmpl.status = ESP_BT_STATUS_SUCCESS;
+        bond_fixture::bonds.clear();
+        Client().GapEvent(ESP_GAP_BLE_REMOVE_BOND_DEV_COMPLETE_EVT, &gap);
+        Client().Poll();
+        assert(Client().ControlRemovalSnapshot().phase == Phase::kComplete);
+        assert(Client().ControlRemovalSnapshot().peer_generation == remaining);
+        assert(Client().InspectSavedControlPeers(choices) && choices.empty());
+        assert(watch_control::ReadApproval(second_fingerprint) == Status::kRemoved);
+    }
 }
 void TestLocalControlBondRemoval(const std::string& scenario) {
     using Phase = WatchControlRemovalPhase;

@@ -36,7 +36,9 @@ public:
     bool OpenControlRemoval(uint64_t peer_generation);
     bool OpenSavedControlPeers();
     bool SelectSavedControlPeer(uint64_t selection);
+    bool SelectAllSavedControlPeers();
     bool ConfirmControlRemoval(uint64_t peer_generation, bool accept);
+    bool ConfirmAllControlRemoval(bool accept);
     bool ConfirmPeer(uint64_t confirmation, bool accept);
     bool ApproveAccount(uint64_t request, bool accept);
     void Cancel();

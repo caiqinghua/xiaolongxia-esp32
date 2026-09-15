@@ -48,7 +48,8 @@ for scenario in success approval invalid-challenge clock identity unprotected op
     forget-success forget-reject forget-cancel-before forget-expired forget-clock-rollback forget-admission-failed \
     forget-storage-failed forget-cancel-failed forget-pending-io forget-cancel-active forget-stop-active forget-stop-completed \
     saved-success saved-empty saved-read-failed saved-cancel-read saved-stop-read saved-stale saved-expired \
-    saved-clock-rollback saved-reject saved-cancel-active saved-pending-io saved-storage-failed saved-selected-stale; do
+    saved-clock-rollback saved-reject saved-cancel-active saved-pending-io saved-storage-failed saved-selected-stale \
+    saved-all-success saved-all-reject saved-all-second-failed; do
     "$build/controller_test" "$scenario"
 done
 for scenario in success offline provisioning wake-running busy storage-failure network-lease-failure \
@@ -60,6 +61,7 @@ for scenario in success offline provisioning wake-running busy storage-failure n
     forget-success forget-enabled forget-busy forget-starting forget-storage-lease forget-ble-lease forget-queued-cancel \
     forget-reject forget-enable-cancel forget-cancel-active forget-recording-handoff forget-failed \
     saved-success saved-enabled saved-busy saved-native-busy saved-storage-lease saved-ble-lease \
-    saved-reject saved-enable-cancel saved-cancel-active saved-queued-cancel saved-recording-handoff; do
+    saved-reject saved-enable-cancel saved-cancel-active saved-queued-cancel saved-recording-handoff \
+    saved-all-success saved-all-reject saved-all-second-failed; do
     "$build/application_test" "$scenario"
 done

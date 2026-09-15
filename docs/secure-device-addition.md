@@ -1066,9 +1066,39 @@ scrolling, explicit confirmation, sleep blocking, queued-open cancellation and
 empty state. Screenshots are under `/tmp/audream-watch-saved-phones-shots` and
 `/tmp/audream-watch-saved-phones-zh-shots`. These are not phone or target tests.
 
-Full bond reset, legacy migration and phone-side OS bond cleanup remain separate
-work. `kEraseAndRemove` remains a simulated legacy command and must not be
-presented as a real secure erase implementation. Production flags remain off.
+The watch can now remove every approved control-phone bond through the same
+verified one-at-a-time native pipeline. Legacy saved-device migration and
+phone-side OS bond cleanup remain separate work. `kEraseAndRemove` remains a
+simulated legacy command and must not be presented as a real secure erase
+implementation. Production flags remain off.
+
+## Approved Control-Phone Reset
+
+The saved-phone page now offers a separate **Forget all phones** action only
+after a successful disconnected inspection finds at least one approved phone.
+It has its own consequence screen and does not reuse a magic selection token.
+Acceptance runs on the existing pairing worker and repeatedly performs a fresh
+approved-bond inspection, removes exactly one selected approval and native SDK
+bond, waits for the correlated callback and verifies absence before continuing.
+Refreshing the list between removals prevents stale selection tokens or changed
+native bond material from authorizing the next removal.
+
+Once accepted, leaving the page or requesting cancellation cannot claim to undo
+already committed revocations. The owner and storage/BLE leases remain held
+until the worker reaches a verified empty approved list or an explicit failure.
+Failure stops the batch and reports incomplete removal; it does not erase the
+remaining approvals or report all phones removed. Recordings, cloud
+authorization, unapproved notification-only bonds and factory identity remain
+unchanged. Each phone may still retain its own OS pairing record, which the
+watch cannot remotely delete; the UI instructs the user to forget the watch in
+the phone's Bluetooth settings separately.
+
+Controller and Application host tests cover all-success, rejection and failure
+on the second phone. The native suite removes two real fixture bonds in sequence
+through `WatchAncsClient`, including fresh inspection and tombstone verification.
+English and Chinese LVGL tests cover list reachability, the separate confirmation,
+non-cancellable in-progress wording, durable success and empty-list behavior.
+These tests do not replace mobile/RF acceptance or legacy saved-device migration.
 
 ### Pending-Reconnect Buffer Cleanup Implemented (2026-09-15)
 

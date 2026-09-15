@@ -18,7 +18,8 @@ enum class PairingPhase { kClosed, kPreparing, kAwaitPeer, kReadingChallenge, kA
                           kSigning, kAwaitCredential, kVerifying, kBound, kFailed, kCancelled, kControlReady,
                           kInspectingBinding, kAwaitRemoval, kRemovingBinding, kBindingRemoved,
                           kAwaitControlRemoval, kRemovingControl, kControlRemoved,
-                          kInspectingSavedPeers, kAwaitSavedPeer };
+                          kInspectingSavedPeers, kAwaitSavedPeer, kAwaitAllControlRemoval,
+                          kRemovingAllControl, kAllControlRemoved };
 struct SavedControlPeer {
     uint64_t selection = 0;
     std::array<uint8_t, 6> address{};
@@ -39,6 +40,7 @@ struct PairingState {
     bool removing_binding = false;
     bool removing_control = false;
     bool removing_saved_control = false;
+    bool removing_all_control = false;
     std::vector<SavedControlPeer> saved_peers;
     uint64_t control_peer_generation = 0;
 };

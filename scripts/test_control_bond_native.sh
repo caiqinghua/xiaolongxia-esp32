@@ -28,7 +28,7 @@ for scenario in success unapproved provisional storage-failure api-failure chang
     "$build/test" "forget-$scenario"
 done
 for scenario in success empty unapproved malformed list-race lifecycle-race poll-race inspection-busy refresh expired \
-    clock-rollback reconnect host-stop notifications changed-bond storage-failure; do
+    clock-rollback reconnect host-stop notifications changed-bond storage-failure all; do
     "$build/test" "saved-$scenario"
 done
 if [[ -n "${AUDREAM_PAIRING_GATT_CLIENT:-}" ]]; then

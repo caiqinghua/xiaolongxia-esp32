@@ -27,7 +27,8 @@ bool IsPairingAction(WatchViewAction action) {
         action == WatchViewAction::kConfirmDevicePairingPeer || action == WatchViewAction::kApproveDevicePairingAccount ||
         action == WatchViewAction::kOpenBindingRemoval || action == WatchViewAction::kConfirmBindingRemoval ||
         action == WatchViewAction::kOpenControlRemoval || action == WatchViewAction::kConfirmControlRemoval ||
-        action == WatchViewAction::kOpenSavedControlPeers || action == WatchViewAction::kSelectSavedControlPeer;
+        action == WatchViewAction::kOpenSavedControlPeers || action == WatchViewAction::kSelectSavedControlPeer ||
+        action == WatchViewAction::kSelectAllSavedControlPeers || action == WatchViewAction::kConfirmAllControlRemoval;
 }
 bool SamePairing(const WatchPairingSnapshot& a, const WatchPairingSnapshot& b) {
     return a.available == b.available && a.active == b.active && a.can_open == b.can_open &&
@@ -39,6 +40,7 @@ bool SamePairing(const WatchPairingSnapshot& a, const WatchPairingSnapshot& b) {
         a.state.phase == b.state.phase && a.state.error == b.state.error && a.state.attempt == b.state.attempt &&
         a.state.control_only == b.state.control_only && a.state.control_peer_generation == b.state.control_peer_generation &&
         a.state.removing_binding == b.state.removing_binding && a.state.removing_control == b.state.removing_control &&
+        a.state.removing_all_control == b.state.removing_all_control &&
         a.state.binding_generation == b.state.binding_generation && a.state.device_id == b.state.device_id &&
         a.state.offer.request == b.state.offer.request && a.state.offer.user_id == b.state.offer.user_id &&
         a.state.offer.device_id == b.state.offer.device_id && a.state.offer.challenge_id == b.state.offer.challenge_id;
@@ -714,7 +716,7 @@ void WatchView::Render() {
     wifi_switch_ = wifi_status_ = wifi_retry_ = nullptr;
     notification_switch_ = notification_accept_ = notification_reject_ = notification_clear_ = nullptr;
     pairing_open_ = pairing_remove_ = pairing_cloud_ = pairing_forget_ = pairing_accept_ = pairing_reject_ = pairing_cancel_ = nullptr;
-    pairing_saved_ = nullptr;
+    pairing_saved_ = pairing_saved_all_ = nullptr;
     firmware_status_ = firmware_version_ = firmware_progress_ = firmware_progress_text_ = nullptr;
     firmware_target_ = firmware_installed_ = nullptr;
     firmware_check_ = firmware_install_ = firmware_cancel_ = firmware_reboot_ = nullptr;
@@ -1292,10 +1294,14 @@ void WatchView::BuildDevicePairing() {
             ? WATCH_BINDING_REMOVED : WATCH_PAIR_FAILED; break;
         case Phase::kInspectingSavedPeers: status = WATCH_SAVED_PHONES_READING; break;
         case Phase::kAwaitSavedPeer: status = state.saved_peers.empty() ? WATCH_SAVED_PHONES_EMPTY : WATCH_SAVED_PHONES; break;
+        case Phase::kAwaitAllControlRemoval: status = WATCH_SAVED_PHONES_REMOVE_ALL_CONFIRM; break;
         case Phase::kAwaitControlRemoval: status = state.removing_saved_control ? WATCH_SAVED_PHONE_CONFIRM : WATCH_CONTROL_REMOVE_CONFIRM; break;
         case Phase::kRemovingControl: status = WATCH_CONTROL_REMOVING; break;
         case Phase::kControlRemoved: status = state.removing_control && state.control_peer_generation
             ? WATCH_CONTROL_REMOVED : WATCH_PAIR_FAILED; break;
+        case Phase::kRemovingAllControl: status = WATCH_SAVED_PHONES_REMOVING_ALL; break;
+        case Phase::kAllControlRemoved: status = state.removing_saved_control && state.removing_all_control
+            ? WATCH_SAVED_PHONES_REMOVED_ALL : WATCH_PAIR_FAILED; break;
     }
     if (state.phase == Phase::kFailed) {
         switch (state.error) {
@@ -1334,6 +1340,28 @@ void WatchView::BuildDevicePairing() {
             });
             pairing_saved_choices_.push_back(button);
         }
+        if (!state.saved_peers.empty()) {
+            pairing_saved_all_ = Button(body_, WATCH_SAVED_PHONES_REMOVE_ALL, [this, snapshot]() {
+                if (!SamePairing(snapshot, state_.pairing) || !visible_ || page_ != WatchPage::kDevicePairing) return;
+                WatchViewRequest request;
+                request.action = WatchViewAction::kSelectAllSavedControlPeers;
+                request.pairing_attempt = snapshot.state.attempt;
+                Submit(request);
+            });
+        }
+    }
+    if (snapshot.active && state.removing_all_control && state.phase == Phase::kAwaitAllControlRemoval) {
+        Label(body_, WATCH_SAVED_PHONES_REMOVE_ALL_NOTICE);
+        const auto confirm = [this, snapshot](bool accept) {
+            if (!SamePairing(snapshot, state_.pairing) || !visible_ || page_ != WatchPage::kDevicePairing) return;
+            WatchViewRequest request;
+            request.action = WatchViewAction::kConfirmAllControlRemoval;
+            request.pairing_attempt = snapshot.state.attempt;
+            request.enabled = accept;
+            Submit(request);
+        };
+        pairing_accept_ = Button(body_, WATCH_SAVED_PHONES_REMOVE_ALL, [confirm]() { confirm(true); });
+        pairing_reject_ = Button(body_, WATCH_NOTIFY_REJECT, [confirm]() { confirm(false); });
     }
     if (snapshot.active && state.removing_control && state.phase == Phase::kAwaitControlRemoval && state.control_peer_generation) {
         if (state.removing_saved_control) {
@@ -1407,7 +1435,8 @@ void WatchView::BuildDevicePairing() {
         pairing_accept_ = Button(body_, WATCH_PAIR_BIND_ACCOUNT, [approve]() { approve(true); });
         pairing_reject_ = Button(body_, WATCH_NOTIFY_REJECT, [approve]() { approve(false); });
     }
-    if (snapshot.active && state.phase != Phase::kBound && state.phase != Phase::kRemovingControl) {
+    if (snapshot.active && state.phase != Phase::kBound && state.phase != Phase::kRemovingControl &&
+        state.phase != Phase::kRemovingAllControl) {
         pairing_cancel_ = Button(body_, WATCH_PAIR_CANCEL, [this, snapshot]() {
             if (snapshot.state.attempt == state_.pairing.state.attempt) CancelPairing();
         });
@@ -1481,6 +1510,7 @@ void WatchView::RefreshPairingControls() {
     enable(pairing_cloud_, available && state_.pairing.can_authorize_cloud && !pending_request_ && !state_.time.sleep_prepared);
     enable(pairing_forget_, available && state_.pairing.forget_peer_generation && !pending_request_ && !state_.time.sleep_prepared);
     enable(pairing_saved_, available && state_.pairing.can_inspect_saved_peers && !pending_request_ && !state_.time.sleep_prepared);
+    enable(pairing_saved_all_, available && state_.pairing.active && !pending_request_ && !state_.time.sleep_prepared);
     for (auto* button : pairing_saved_choices_)
         enable(button, available && state_.pairing.active && !pending_request_ && !state_.time.sleep_prepared);
     enable(pairing_accept_, available && state_.pairing.active && !pending_request_ && !state_.time.sleep_prepared);

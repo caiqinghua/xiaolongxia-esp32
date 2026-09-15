@@ -65,6 +65,8 @@ bool local_control_mode = false;
 uint64_t local_control_grant = 0;
 bool forget_allowed = false;
 bool saved_allowed = false, saved_read_ok = true, saved_empty = false;
+unsigned saved_remaining = 2, saved_forget_fail_call = 0;
+bool saved_forget_active = false;
 unsigned saved_reads = 0;
 WatchControlRemovalSnapshot forget_snapshot;
 WatchControlRemovalError forget_error = WatchControlRemovalError::kNone;
@@ -180,18 +182,25 @@ bool WatchAncsClient::InspectSavedControlPeers(std::vector<WatchSavedControlPeer
     ++saved_reads;
     peers.clear();
     if (!saved_allowed || !native_host_ready || !saved_read_ok) return false;
-    if (!saved_empty) peers = {{lease, {1,2,3,4,5,6}}, {lease + 1, {6,5,4,3,2,1}}};
+    if (!saved_empty && saved_remaining) {
+        peers.push_back({lease, {1,2,3,4,5,6}});
+        if (saved_remaining > 1) peers.push_back({lease + 1, {6,5,4,3,2,1}});
+    }
     return true;
 }
 bool WatchAncsClient::CanForgetSavedControlPeer(uint64_t token) const {
     std::lock_guard<std::mutex> lock(transport_mutex);
-    return saved_allowed && native_host_ready && !saved_empty && (token == lease || token == lease + 1);
+    return saved_allowed && native_host_ready && !saved_empty && saved_remaining &&
+        (token == lease || (saved_remaining > 1 && token == lease + 1));
 }
 bool WatchAncsClient::ForgetSavedControlPeer(uint64_t token) {
     assert(HasReservation() && std::this_thread::get_id() != owner);
     std::lock_guard<std::mutex> lock(transport_mutex);
-    if (!saved_allowed || !native_host_ready || saved_empty || (token != lease && token != lease + 1)) return false;
+    if (!saved_allowed || !native_host_ready || saved_empty || !saved_remaining ||
+        (token != lease && (saved_remaining <= 1 || token != lease + 1)) ||
+        (saved_forget_fail_call && forget_calls + 1 == saved_forget_fail_call)) return false;
     saved_allowed = false;
+    saved_forget_active = true;
     ++forget_calls;
     forget_snapshot = {token, WatchControlRemovalPhase::kRevoking, WatchControlRemovalError::kNone};
     return true;
@@ -217,6 +226,12 @@ void WatchAncsClient::Poll() {
     forget_snapshot.phase = forget_error == WatchControlRemovalError::kNone
         ? WatchControlRemovalPhase::kComplete : WatchControlRemovalPhase::kFailed;
     forget_snapshot.error = forget_error;
+    if (saved_forget_active && forget_error == WatchControlRemovalError::kNone) {
+        assert(saved_remaining);
+        --saved_remaining;
+        saved_allowed = true;
+        saved_forget_active = false;
+    }
 }
 WatchControlRemovalSnapshot WatchAncsClient::ControlRemovalSnapshot() const {
     std::lock_guard<std::mutex> lock(transport_mutex);
@@ -397,6 +412,8 @@ int main(int argc, char** argv) {
     Controller controller(endpoints, Hooks());
     if (scenario.rfind("saved-", 0) == 0) {
         saved_allowed = true;
+        saved_remaining = 2;
+        saved_forget_fail_call = scenario == "saved-all-second-failed" ? 2 : 0;
         identity_present = encrypted = tls_ok = false; unix_seconds = 0;
         saved_empty = scenario == "saved-empty";
         saved_read_ok = scenario != "saved-read-failed";
@@ -423,6 +440,17 @@ int main(int argc, char** argv) {
                 else now = scenario == "saved-expired" ? 121000 : 999;
                 assert(!controller.SelectSavedControlPeer(lease));
                 Reach(controller, Phase::kFailed);
+            } else if (scenario.rfind("saved-all-", 0) == 0) {
+                assert(controller.SelectAllSavedControlPeers());
+                assert(controller.Snapshot().phase == Phase::kAwaitAllControlRemoval);
+                assert(controller.Snapshot().removing_all_control);
+                assert(!controller.SelectSavedControlPeer(lease));
+                const bool reject = scenario == "saved-all-reject";
+                assert(controller.ConfirmAllControlRemoval(!reject));
+                Reach(controller, reject ? Phase::kCancelled :
+                    scenario == "saved-all-second-failed" ? Phase::kFailed : Phase::kAllControlRemoved);
+                assert(forget_calls == (reject ? 0U : scenario == "saved-all-second-failed" ? 1U : 2U));
+                if (!reject && scenario != "saved-all-second-failed") assert(saved_remaining == 0);
             } else {
                 assert(controller.SelectSavedControlPeer(lease + 1));
                 assert(!controller.SelectSavedControlPeer(lease));

@@ -105,14 +105,16 @@ void Application::ObserveWatchPairingIntent(const WatchViewRequest& request) {
         (request.action == WatchViewAction::kConfirmDevicePairingPeer ||
          request.action == WatchViewAction::kApproveDevicePairingAccount ||
          request.action == WatchViewAction::kConfirmBindingRemoval || request.action == WatchViewAction::kConfirmControlRemoval);
-    if (!cancel && !wifi_off && !voice_on && !reject) return;
+    const bool reject_all = !request.enabled && request.action == WatchViewAction::kConfirmAllControlRemoval;
+    if (!cancel && !wifi_off && !voice_on && !reject && !reject_all) return;
     std::lock_guard<std::mutex> lock(watch_pairing_intent_mutex_);
     if (cancel && request.pairing_open_request)
         watch_pairing_cancelled_open_ = std::max(watch_pairing_cancelled_open_, request.pairing_open_request);
     const bool same_open = cancel && request.pairing_open_request &&
         request.pairing_open_request == watch_pairing_open_request_;
     const bool same_attempt = request.pairing_attempt && request.pairing_attempt == watch_pairing_attempt_;
-    const bool same_rejection = reject && same_attempt &&
+    const auto pairing_state = watch_pairing_ ? watch_pairing_->Snapshot() : watch_voice::PairingState{};
+    const bool same_rejection = (reject || reject_all) && same_attempt &&
         ((request.action == WatchViewAction::kConfirmDevicePairingPeer && request.pairing_confirmation &&
           request.pairing_confirmation == watch_pairing_peer_confirmation_) ||
          (request.action == WatchViewAction::kApproveDevicePairingAccount && request.pairing_request &&
@@ -120,7 +122,8 @@ void Application::ObserveWatchPairingIntent(const WatchViewRequest& request) {
          (request.action == WatchViewAction::kConfirmBindingRemoval && request.binding_generation &&
           request.binding_generation == watch_pairing_account_request_) ||
          (request.action == WatchViewAction::kConfirmControlRemoval && request.pairing_peer_generation &&
-          request.pairing_peer_generation == watch_pairing_account_request_));
+          request.pairing_peer_generation == watch_pairing_account_request_) ||
+         (request.action == WatchViewAction::kConfirmAllControlRemoval && pairing_state.removing_all_control));
     if (same_rejection) watch_pairing_rejected_request_ = request.id;
     if (watch_pairing_ && (wifi_off || voice_on || same_rejection ||
         (cancel && (request.pairing_open_request ? same_open : same_attempt)))) {
@@ -169,13 +172,16 @@ bool Application::HandleWatchPairingRequest(const WatchViewRequest& request) {
     if (!request.pairing_attempt || request.pairing_attempt != state.attempt) return false;
     if (request.action == WatchViewAction::kSelectSavedControlPeer)
         return watch_pairing_->SelectSavedControlPeer(request.pairing_peer_generation);
+    if (request.action == WatchViewAction::kSelectAllSavedControlPeers)
+        return watch_pairing_->SelectAllSavedControlPeers();
     bool rejected = false;
     {
         std::lock_guard<std::mutex> lock(watch_pairing_intent_mutex_);
         rejected = !request.enabled && request.id == watch_pairing_rejected_request_ &&
             (request.action == WatchViewAction::kConfirmDevicePairingPeer ||
              request.action == WatchViewAction::kApproveDevicePairingAccount ||
-             request.action == WatchViewAction::kConfirmBindingRemoval || request.action == WatchViewAction::kConfirmControlRemoval);
+             request.action == WatchViewAction::kConfirmBindingRemoval || request.action == WatchViewAction::kConfirmControlRemoval ||
+             request.action == WatchViewAction::kConfirmAllControlRemoval);
     }
     if (rejected) { StopWatchPairing(0); return true; }
     if (request.action == WatchViewAction::kConfirmDevicePairingPeer)
@@ -186,6 +192,8 @@ bool Application::HandleWatchPairingRequest(const WatchViewRequest& request) {
         return watch_pairing_->ConfirmBindingRemoval(request.binding_generation, request.enabled);
     if (request.action == WatchViewAction::kConfirmControlRemoval)
         return watch_pairing_->ConfirmControlRemoval(request.pairing_peer_generation, request.enabled);
+    if (request.action == WatchViewAction::kConfirmAllControlRemoval)
+        return watch_pairing_->ConfirmAllControlRemoval(request.enabled);
     return false;
 }
 

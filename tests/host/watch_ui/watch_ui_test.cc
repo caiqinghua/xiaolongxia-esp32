@@ -548,9 +548,40 @@ void TestDevicePairingUi(WatchViewState state, const std::filesystem::path& scre
     Check(requests.back().action == WatchViewAction::kConfirmControlRemoval && requests.back().pairing_peer_generation == 131,
         "saved removal reuses explicit native removal confirmation");
     view.Complete(requests.back().id, true);
+    controller.control_peer_generation = 0;
+    controller.phase = Phase::kAwaitSavedPeer;
+    update();
+    Click(view, WATCH_SAVED_PHONES_REMOVE_ALL);
+    Check(requests.back().action == WatchViewAction::kSelectAllSavedControlPeers && requests.back().pairing_attempt == 16,
+        "saved-phone list offers an explicit non-destructive all-phone selection");
+    view.Complete(requests.back().id, true);
+    controller.removing_all_control = true;
+    controller.phase = Phase::kAwaitAllControlRemoval;
+    update();
+    Check(FindLabel(view.Root(), WATCH_SAVED_PHONES_REMOVE_ALL_CONFIRM) &&
+        FindLabel(view.Root(), WATCH_SAVED_PHONES_REMOVE_ALL_NOTICE),
+        "all-phone removal has a separate consequence confirmation");
+    Screenshot(view.Root(), screenshots / "device-pairing-saved-remove-all-confirm.ppm");
+    lv_obj_scroll_to_view(FindButton(view.Root(), WATCH_SAVED_PHONES_REMOVE_ALL), LV_ANIM_OFF); Tick();
+    Screenshot(view.Root(), screenshots / "device-pairing-saved-remove-all-confirm-bottom.ppm");
+    Click(view, WATCH_SAVED_PHONES_REMOVE_ALL);
+    Check(requests.back().action == WatchViewAction::kConfirmAllControlRemoval && requests.back().enabled,
+        "all-phone removal requires explicit confirmation");
+    view.Complete(requests.back().id, true);
+    controller.phase = Phase::kRemovingAllControl;
+    update();
+    Check(FindLabel(view.Root(), WATCH_SAVED_PHONES_REMOVING_ALL) && !FindButton(view.Root(), WATCH_PAIR_CANCEL),
+        "started all-phone removal cannot claim that cancellation will restore removed bonds");
+    controller.phase = Phase::kAllControlRemoved;
+    update(false);
+    Check(FindLabel(view.Root(), WATCH_SAVED_PHONES_REMOVED_ALL),
+        "verified all-phone removal reports its distinct durable result");
+    Screenshot(view.Root(), screenshots / "device-pairing-saved-remove-all-complete.ppm");
     controller.saved_peers.clear(); controller.control_peer_generation = 0;
+    controller.removing_all_control = false;
     controller.phase = Phase::kAwaitSavedPeer; update();
-    Check(FindLabel(view.Root(), WATCH_SAVED_PHONES_EMPTY) && !FindButton(view.Root(), WATCH_CONTROL_REMOVE),
+    Check(FindLabel(view.Root(), WATCH_SAVED_PHONES_EMPTY) && !FindButton(view.Root(), WATCH_CONTROL_REMOVE) &&
+        !FindButton(view.Root(), WATCH_SAVED_PHONES_REMOVE_ALL),
         "empty approved list has no destructive action");
     controller.phase = Phase::kCancelled; update(false);
     peer.enabled = true;

@@ -76,6 +76,17 @@ bool PairingController::SelectSavedControlPeer(uint64_t selection) {
     state_.phase = Phase::kAwaitControlRemoval;
     return true;
 }
+bool PairingController::SelectAllSavedControlPeers() {
+    if (!reserved_ || !state_.removing_saved_control || state_.phase != Phase::kAwaitSavedPeer ||
+        !Current() || state_.saved_peers.empty() || !WatchAncsClient::Get().CanInspectSavedControlPeers() ||
+        std::any_of(state_.saved_peers.begin(), state_.saved_peers.end(), [&](const auto& peer) {
+            return !WatchAncsClient::Get().CanForgetSavedControlPeer(peer.selection);
+        })) return false;
+    state_.removing_all_control = true;
+    state_.control_peer_generation = 0;
+    state_.phase = Phase::kAwaitAllControlRemoval;
+    return true;
+}
 bool PairingController::Begin(bool control_only, bool removing_binding, uint64_t control_peer, bool saved_control) {
     if (reserved_ || task_->Active()) return false;
     state_ = {};
@@ -230,6 +241,50 @@ bool PairingController::ConfirmControlRemoval(uint64_t generation, bool accept) 
         }
     }, Phase::kRemovingControl);
 }
+bool PairingController::ConfirmAllControlRemoval(bool accept) {
+    if (!reserved_ || !state_.removing_saved_control || !state_.removing_all_control ||
+        state_.phase != Phase::kAwaitAllControlRemoval || state_.saved_peers.empty() || !Current()) return false;
+    if (!accept) { Cancel(); Finish(Phase::kCancelled); return true; }
+    job_ = std::make_shared<Job>();
+    const auto job = job_;
+    // Acceptance authorizes the complete local cleanup. Once the first durable
+    // revocation starts, cancellation cannot promise to restore removed bonds.
+    job->control_removal_started = true;
+    return Launch([job](const Client::Cancelled&, Response&) {
+        auto& native = WatchAncsClient::Get();
+        while (true) {
+            std::vector<WatchSavedControlPeer> peers;
+            if (!native.InspectSavedControlPeers(peers)) {
+                job->error = Error::kControlRemoval;
+                return Result::kConflict;
+            }
+            if (peers.empty()) {
+                job->control_removed = true;
+                return Result::kOk;
+            }
+            const auto selection = peers.front().selection;
+            if (!selection || !native.ForgetSavedControlPeer(selection)) {
+                job->error = Error::kControlRemoval;
+                return Result::kConflict;
+            }
+            while (true) {
+                native.Poll();
+                const auto result = native.ControlRemovalSnapshot();
+                if (result.peer_generation != selection) {
+                    job->error = Error::kControlRemoval;
+                    return Result::kConflict;
+                }
+                if (result.phase == WatchControlRemovalPhase::kComplete && !result.io_pending) break;
+                if (result.phase == WatchControlRemovalPhase::kFailed && !result.io_pending) {
+                    job->error = result.error == WatchControlRemovalError::kStorage
+                        ? Error::kStorage : Error::kControlRemoval;
+                    return Result::kConflict;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+    }, Phase::kRemovingAllControl);
+}
 void PairingController::Cancel() {
     {
         std::lock_guard<std::mutex> lock(admission_mutex_);
@@ -320,7 +375,9 @@ void PairingController::Verify(WatchPairingGattServer::Request request) {
 }
 void PairingController::HandleJob(Result result) {
     if (job_->control_removal_started) {
-        Finish(job_->control_removed ? Phase::kControlRemoved : Phase::kFailed, job_->error);
+        Finish(job_->control_removed ? (state_.removing_all_control ? Phase::kAllControlRemoved : Phase::kControlRemoved)
+                                     : Phase::kFailed,
+            job_->error);
         return;
     }
     // Durable truth wins over cancellation and over a lost final BLE response.
@@ -405,7 +462,8 @@ void PairingController::Poll() {
     if (task_->Poll(result, response)) HandleJob(result);
     if (!reserved_ || state_.phase == Phase::kBound || task_->Active()) return;
     if (state_.removing_saved_control && !cancelled_.load() &&
-        (state_.phase == Phase::kAwaitSavedPeer || state_.phase == Phase::kAwaitControlRemoval)) {
+        (state_.phase == Phase::kAwaitSavedPeer || state_.phase == Phase::kAwaitControlRemoval ||
+         state_.phase == Phase::kAwaitAllControlRemoval)) {
         auto& native = WatchAncsClient::Get();
         if (!native.CanInspectSavedControlPeers() || std::any_of(state_.saved_peers.begin(), state_.saved_peers.end(),
             [&](const auto& peer) { return !native.CanForgetSavedControlPeer(peer.selection); })) {
@@ -450,7 +508,9 @@ bool PairingController::StopWithin(uint32_t timeout_ms) {
     CloseTransport();
     if (!task_->StopWithin(timeout_ms)) return false;
     if (job_ && job_->control_removal_started) {
-        Finish(job_->control_removed ? Phase::kControlRemoved : Phase::kFailed, job_->error);
+        Finish(job_->control_removed ? (state_.removing_all_control ? Phase::kAllControlRemoved : Phase::kControlRemoved)
+                                     : Phase::kFailed,
+            job_->error);
         return true;
     }
     if (job_ && job_->committed) state_.binding_generation = expected_generation_ + 1;
