@@ -1,6 +1,6 @@
 # Unified Secure Device Addition
 
-Status: required product behavior; not yet implemented end to end.
+Status: implemented behind experimental flags; real-device acceptance and production enablement remain.
 Updated: 2026-09-15.
 
 ## Product Contract
@@ -39,8 +39,8 @@ physical/OOB approval mechanism; never substitute a fixed public PIN.
 
 | Existing source | Verified behavior | Required change |
 | --- | --- | --- |
-| iOS `DevicePairingManager` and `DeviceControlService` | Experimental NoteWatch addition uses the existing control connection and saves only after protected read and subscription; legacy paths remain separate | Verify OS confirmation, cancellation, approved bond restoration and real reconnects before production enablement |
-| Android `DevicesViewModel.pair` and `completePairing` | Now require the existing control manager's ready handshake before saving; the setup UI checks completion's result | Verify actual OS pairing, cancellation and persistence races on a phone; secure mode is experimental |
+| iOS `DevicePairingManager` and `DeviceControlService` | Experimental NoteWatch addition and saved-device reconnect use the existing protected control connection; successful migration is persisted separately from authorization | Verify OS confirmation, approved bond restoration and real reconnects before production enablement |
+| Android `DevicesViewModel.pair` and `DeviceControlManager` | Addition and saved-device reconnect require the same live protected handshake; successful migration is persisted in DataStore | Verify actual OS pairing, process interruption and persistence behavior on a phone; secure mode is experimental |
 | iOS `DeviceControlProtocol.encodeBLUFICustomFrame` | Sets the BLUFI frame-control byte to zero | This is not BLUFI application-layer encryption; require the authenticated link before writes and responses |
 | Android `DeviceControlManager` | Experimental NoteWatch path reads protected readiness on the same GATT before subscribing or sending commands | Complete native/mobile acceptance and approved bond recovery before production enablement |
 | Firmware `WatchAncsClient::ConfigureSecurity` | Already configures SC, MITM, bonding and 16-byte maximum keys | Reuse the native security owner; do not introduce a competing GAP callback or auto-confirm numeric comparison |
@@ -397,8 +397,8 @@ not automatically confirm comparison codes or invent another exchange.
 
 The compile-time flag remains off by default and applies only to NoteWatch with
 matching experimental firmware. CB08/AI08 and screenless legacy profiles do not
-receive this requirement. Approved bond persistence/recovery still needs device
-acceptance, as do BLE startup and asynchronous registration; this flag must not be presented as production
+receive this requirement. Approved bond persistence/recovery and saved-device
+migration still need device acceptance, as do BLE startup and asynchronous registration; this flag must not be presented as production
 security or silently enabled for existing users.
 
 `scripts/test_device_secure_control_ios.sh` compiles and executes the actual Swift
@@ -447,10 +447,42 @@ contact production or establish a physical BLE connection.
 
 The iOS workflow below connects these calls to the existing approved GATT
 connection, with monotonic expiry, captured context and a required bound response.
-Android still needs that integration. The complete mobile/server/device
-verification and persistence transaction needs real-device acceptance. Cancelled
-cloud pairing must not erase an already approved local control relationship.
-Existing device migration and removal/bond cleanup remain open.
+Android now has the equivalent same-connection integration. Complete
+mobile/server/device verification and the persistence transaction still need
+real-device acceptance. Cancelled cloud pairing must not erase an already approved
+local control relationship.
+Existing device migration is implemented as described below. Real-device migration
+and mobile/OS bond cleanup acceptance remain open.
+
+## Saved Mobile Device Migration
+
+iOS and Android now migrate a previously saved NoteWatch without deleting it or
+asking the user to add it again. The existing saved identifier is connected through
+the same protected-read and notification-subscription handshake used by new addition.
+No ordinary command can use the migration marker to bypass that live handshake.
+
+Only after the protected attribute assertion and subscription both succeed does the
+app write a versioned confirmation keyed by device identifier and normalized serial
+number. iOS stores the separate ledger in `UserDefaults`; Android stores it beside
+the paired device list in DataStore. A missing marker, process death, cancellation,
+Bluetooth loss, unsupported firmware or persistence failure cannot produce a
+confirmed migration. The next connection retries the full live handshake. A serial
+number change invalidates the old confirmation unless iOS updates it while refreshing
+the identity of the same secured peripheral.
+
+The device detail page reports required, migrating, protected and action-required
+states. The failure action retries persistence on an already protected live connection
+or starts a new protected connection. Removing the device clears the mobile migration
+record. Neither path deletes recordings, silently removes the OS bond or authorizes
+notifications or cloud voice.
+
+The Swift contract exercises the real migration ledger and durable `UserDefaults`
+round-trip in addition to handshake ordering. Android unit tests cover legacy absence,
+successful confirmation, identity mismatch, interruption without confirmation and
+removal; the Android debug source and Compose parameter chain compile in the targeted
+unit-test build. These are not CoreBluetooth/BluetoothGatt RF tests, OS pairing-prompt
+tests or power-loss atomicity proof. Production flags remain disabled until real-phone,
+watch reboot and approved-bond restoration acceptance pass.
 
 ## iOS Same-Connection Cloud Transport
 
@@ -646,8 +678,10 @@ native libsodium build via `SODIUM_SOURCE_DIR` and runs both bond suites.
 
 These tests do not establish real NVS atomicity across power loss, controller radio
 encryption, privacy-address rotation or originating-link identity of every delayed
-SDK security callback. Initial BLE availability, mobile migration/removal, orphan
-cleanup, SDK lifecycle audit and full hardware acceptance remain open. No production
+SDK security callback. Initial BLE availability, mobile removal acceptance, orphan
+cleanup, SDK lifecycle audit and full hardware acceptance remain open. Mobile migration
+code is complete behind the experimental flag but has not passed real-phone interruption
+and reconnect acceptance. No production
 profile is enabled and no ESP firmware is built or flashed by these host tests.
 
 ### Secure Host Startup Failure Handling
