@@ -892,15 +892,14 @@ menu "Camera Configuration"
 endmenu
 
 config AUDREAM_WATCH_UI
-    bool "Experimental Audream watch and voice assistant runtime"
+    bool "Audream watch and voice assistant runtime"
     default n
     depends on BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_06
     select LV_FONT_MONTSERRAT_48
     help
-        Development-only combined watch runtime. Starts the watch offline and
-        preserves local recording. Hardware, sleep, and assistant integration
-        validation is not complete. Leave disabled for production recording
-        firmware; watch UI, fonts, and transport overlay remain excluded.
+        Combined watch, local recording, and Audream voice assistant runtime.
+        The Waveshare 2.06 product profile enables it. Other profiles remain
+        unchanged unless they opt in explicitly.
 
 config AUDREAM_OTA_PUBLIC_KEY_HEX
     string "Audream firmware release Ed25519 public key (lowercase hex)"
@@ -989,28 +988,29 @@ config AUDREAM_WATCH_ANCS
         characteristic permissions are unchanged. No NimBLE adapter is included.
 
 config AUDREAM_WATCH_ANDROID_NOTIFICATIONS
-    bool "Audream watch experimental Android notification service"
+    bool "Audream watch Android notification service"
     default n
     depends on AUDREAM_WATCH_ANCS && BT_GATTS_ENABLE
     help
         Add an AWN1 GATT service on the existing Bluedroid host. Runtime consent,
         authenticated peer pairing and a separately verified owner grant are
-        required before accepting notification content. The Android native client
-        and hardware acceptance remain incomplete. Leave disabled in production.
+        required before accepting notification content. The Waveshare 2.06 product
+        profile includes the service; notification collection remains off until
+        the user grants access on both the phone and watch.
 
 config AUDREAM_WATCH_DEVICE_PAIRING
-    bool "Audream watch experimental device pairing service"
+    bool "Audream watch secure device pairing service"
     default n
     depends on AUDREAM_WATCH_ANCS && BT_GATTS_ENABLE
-    depends on NVS_ENCRYPTION && NVS_SEC_KEY_PROTECT_USING_FLASH_ENC
     help
         Add bounded challenge and credential transport on the shared BLE host.
         Notification consent is independent. Protected factory identity, physical
         confirmation, trusted API verification and durable binding are required.
         The watch controller supports offline local control pairing and separate
-        cloud binding. Mobile secure addition, SDK queue provenance and hardware
-        acceptance remain incomplete. No remote operation can open the local
-        window. Leave disabled in production.
+        cloud binding. Builds without encrypted NVS and enabled flash encryption
+        include the service but fail closed with a protection-required result;
+        firmware never provisions or burns security keys at runtime. No remote
+        operation can open the local pairing window.
 
 config AUDREAM_NOTIFICATION_SERVER_PUBLIC_KEY_B64
     string "Audream notification server RSA public key (base64 DER SPKI)"

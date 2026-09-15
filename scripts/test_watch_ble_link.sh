@@ -6,6 +6,9 @@ build="$(mktemp -d "${TMPDIR:-/tmp}/audream-ble-link.XXXXXX")"
 trap 'rm -rf "$build"' EXIT
 # Desktop tests only. SDK public types are real; Bluetooth I/O is controlled.
 for setting in \
+    CONFIG_AUDREAM_WATCH_UI=y \
+    CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS=y \
+    CONFIG_AUDREAM_WATCH_DEVICE_PAIRING=y \
     CONFIG_BT_CTRL_MODEM_SLEEP=y \
     CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y \
     CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y \
