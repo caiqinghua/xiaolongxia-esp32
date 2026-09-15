@@ -1,0 +1,71 @@
+# Keep the pinned SensorLib download pristine and share patched HAL definitions
+# between its translation units and the watch adapter.
+get_filename_component(AUDREAM_MOTION_PATCH
+    "${CMAKE_CURRENT_LIST_DIR}/../patches/sensorlib-qmi8658-lifecycle.patch" ABSOLUTE)
+
+function(audream_prepare_motion_overlay component_dir output_dir)
+    set(expected_files
+        "src/platform/SensorCommBase.hpp|67b72b16e9652181ea28738abaffb2fbb8d6120f4366ba4198dee1949983edd7"
+        "src/platform/SensorCommCustom.hpp|a05c56cc9d166f845035cc0dd2af76a18704758d3a96c2292e511433e9c62742"
+        "src/sensor/imu/qmi8658/SensorQMI8658.cpp|b4089909512dfefc5427e8aaed541e5bcb9d52c4595b4b2b650b69439bb8fd16"
+        "src/sensor/imu/qmi8658/SensorQMI8658.hpp|7765aba715c435352e0bf2bf7cae64421edee44dc54b58c32d86c7d6d2ad29d2")
+    foreach(entry IN LISTS expected_files)
+        string(REPLACE "|" ";" fields "${entry}")
+        list(GET fields 0 relative_path)
+        list(GET fields 1 expected_hash)
+        file(SHA256 "${component_dir}/${relative_path}" actual_hash)
+        if(NOT actual_hash STREQUAL expected_hash)
+            message(FATAL_ERROR "Motion overlay requires the pinned SensorLib source: ${relative_path}")
+        endif()
+    endforeach()
+    file(MAKE_DIRECTORY "${output_dir}")
+    file(COPY "${component_dir}/src" DESTINATION "${output_dir}")
+    find_program(AUDREAM_MOTION_GIT git REQUIRED)
+    get_filename_component(git_ceiling "${output_dir}/.." REALPATH)
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${git_ceiling}"
+            "${AUDREAM_MOTION_GIT}" apply "${AUDREAM_MOTION_PATCH}"
+        WORKING_DIRECTORY "${output_dir}"
+        RESULT_VARIABLE result ERROR_VARIABLE failure)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "Failed to apply motion lifecycle overlay: ${failure}")
+    endif()
+endfunction()
+
+function(audream_enable_motion_overlay)
+    idf_build_get_property(components BUILD_COMPONENTS)
+    if(NOT "lewisxhe__sensorlib" IN_LIST components)
+        if(CONFIG_AUDREAM_WATCH_UI)
+            message(FATAL_ERROR "The watch target requires the pinned SensorLib component")
+        endif()
+        return()
+    endif()
+    idf_component_get_property(component_dir lewisxhe__sensorlib COMPONENT_DIR)
+    idf_component_get_property(component_lib lewisxhe__sensorlib COMPONENT_LIB)
+    set(output_dir "${CMAKE_BINARY_DIR}/audream_components/sensorlib")
+    audream_prepare_motion_overlay("${component_dir}" "${output_dir}")
+    get_target_property(source_dir ${component_lib} SOURCE_DIR)
+    get_target_property(sources ${component_lib} SOURCES)
+    set(replacement_sources)
+    foreach(source IN LISTS sources)
+        if(source MATCHES "\\$<")
+            message(FATAL_ERROR "Unsupported generated SensorLib source: ${source}")
+        endif()
+        get_filename_component(absolute_source "${source}" ABSOLUTE BASE_DIR "${source_dir}")
+        file(RELATIVE_PATH relative_source "${component_dir}" "${absolute_source}")
+        if(NOT relative_source MATCHES "^src/")
+            message(FATAL_ERROR "Unreviewed SensorLib source: ${source}")
+        endif()
+        list(APPEND replacement_sources "${output_dir}/${relative_source}")
+    endforeach()
+    set_property(TARGET ${component_lib} PROPERTY SOURCES "${replacement_sources}")
+    foreach(property IN ITEMS INCLUDE_DIRECTORIES INTERFACE_INCLUDE_DIRECTORIES)
+        get_target_property(directories ${component_lib} ${property})
+        if(directories)
+            string(REPLACE "${component_dir}" "${output_dir}" directories "${directories}")
+            set_property(TARGET ${component_lib} PROPERTY ${property} "${directories}")
+        endif()
+    endforeach()
+    target_compile_definitions(${component_lib} PUBLIC AUDREAM_SENSORLIB_LIFECYCLE_PATCHED=1)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${AUDREAM_MOTION_PATCH}")
+endfunction()

@@ -891,6 +891,132 @@ menu "Camera Configuration"
     endif
 endmenu
 
+config AUDREAM_WATCH_UI
+    bool "Experimental Audream watch and voice assistant runtime"
+    default n
+    depends on BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_06
+    select LV_FONT_MONTSERRAT_48
+    help
+        Development-only combined watch runtime. Starts the watch offline and
+        preserves local recording. Hardware, sleep, and assistant integration
+        validation is not complete. Leave disabled for production recording
+        firmware; watch UI, fonts, and transport overlay remain excluded.
+
+config AUDREAM_OTA_PUBLIC_KEY_HEX
+    string "Audream firmware release Ed25519 public key (lowercase hex)"
+    depends on AUDREAM_WATCH_UI
+    default ""
+    help
+        A separately managed release-signing public key, not a device identity
+        key. An empty key disables watch firmware updates. Never store the
+        signing private key in firmware or source control.
+
+config AUDREAM_OTA_API_ORIGIN
+    string "Audream signed firmware discovery HTTPS origin"
+    depends on AUDREAM_WATCH_UI
+    default "https://audream-api.tulingbc.com"
+    help
+        A trusted build-time HTTPS origin without path, query or credentials.
+        Discovery is public and does not send a user or device access token.
+        An empty or invalid origin disables discovery, not signature checking.
+
+config AUDREAM_ASSET_PUBLIC_KEY_HEX
+    string "Audream asset release Ed25519 public key (lowercase hex)"
+    depends on AUDREAM_WATCH_UI
+    default ""
+    help
+        Independently managed asset verification key. Empty keeps factory
+        asset loading and disables update-bank selection. Never embed private keys.
+
+config AUDREAM_ASSET_SR_ABI
+    string "Audream tested ESP-SR model ABI identifier"
+    depends on AUDREAM_WATCH_UI
+    default ""
+    help
+        Exact trusted compatibility label for the tested ESP-SR release and
+        target. Empty disables update-bank selection. Do not guess this value
+        from the remote manifest or treat the label as a runtime model test.
+
+config AUDREAM_ASSET_MANIFEST_URL
+    string "Audream signed asset manifest HTTPS URL"
+    depends on AUDREAM_WATCH_UI
+    default ""
+    help
+        Trusted release manifest endpoint. Empty disables asset discovery.
+        The endpoint may return an empty 204 response or a signed manifest.
+        It never replaces the compiled asset key, ABI or firmware identity.
+
+config AUDREAM_OTA_RELEASE_SEQUENCE
+    int "Audream firmware release sequence"
+    depends on AUDREAM_WATCH_UI
+    range 0 2147483647
+    default 0
+    help
+        Monotonically increasing release number compiled into this image.
+        Signed releases must have a strictly larger sequence. This is not an
+        eFuse anti-rollback counter and does not prevent physical reflashing.
+
+config AUDREAM_WATCH_ANCS
+    bool "Audream watch native iOS notifications"
+    default y
+    depends on AUDREAM_WATCH_UI && USE_ESP_BLUFI_WIFI_PROVISIONING
+    depends on BT_BLUEDROID_ENABLED && BT_GATTC_ENABLE && BT_BLE_SMP_ENABLE
+    depends on !BT_BLUFI_BLE_SMP_ENABLE
+    help
+        Share the Bluedroid host with BLUFI and use an authorized ANCS client.
+        Runtime notification collection defaults off and requires watch consent.
+        The BLUFI example's automatic SMP policy is not used. Existing control
+        characteristic permissions are unchanged. No NimBLE adapter is included.
+
+config AUDREAM_WATCH_ANDROID_NOTIFICATIONS
+    bool "Audream watch experimental Android notification service"
+    default n
+    depends on AUDREAM_WATCH_ANCS && BT_GATTS_ENABLE
+    help
+        Add an AWN1 GATT service on the existing Bluedroid host. Runtime consent,
+        authenticated peer pairing and a separately verified owner grant are
+        required before accepting notification content. The Android native client
+        and hardware acceptance remain incomplete. Leave disabled in production.
+
+config AUDREAM_WATCH_DEVICE_PAIRING
+    bool "Audream watch experimental device pairing service"
+    default n
+    depends on AUDREAM_WATCH_ANCS && BT_GATTS_ENABLE
+    depends on NVS_ENCRYPTION && NVS_SEC_KEY_PROTECT_USING_FLASH_ENC
+    help
+        Add bounded challenge and credential transport on the shared BLE host.
+        Notification consent is independent. Protected factory identity, physical
+        confirmation, trusted API verification and durable binding are required.
+        The watch controller supports offline local control pairing and separate
+        cloud binding. Mobile secure addition, SDK queue provenance and hardware
+        acceptance remain incomplete. No remote operation can open the local
+        window. Leave disabled in production.
+
+config AUDREAM_NOTIFICATION_SERVER_PUBLIC_KEY_B64
+    string "Audream notification server RSA public key (base64 DER SPKI)"
+    depends on AUDREAM_WATCH_ANDROID_NOTIFICATIONS
+    default ""
+    help
+        Provision a trusted RSA 2048, 3072 or 4096-bit public key matching the
+        device API signer. Never obtain this trust anchor from the BLE peer.
+        An empty or invalid key rejects all notification owner proofs. Changing
+        the API signing key requires coordinated trusted firmware provisioning.
+
+config AUDREAM_VOICE_API_ORIGIN
+    string "Audream device API HTTPS origin"
+    depends on AUDREAM_WATCH_UI
+    default "https://audream-api.tulingbc.com"
+    help
+        Trusted build-time endpoint for device bootstrap. BLE clients cannot
+        override this endpoint or redirect device credentials elsewhere.
+
+config AUDREAM_VOICE_WEBSOCKET_URL
+    string "Audream voice WSS endpoint"
+    depends on AUDREAM_WATCH_UI
+    default "wss://voice.audream.ai/v1/device"
+    help
+        Exact trusted voice endpoint. Bootstrap responses must match this URL.
+
 menu "TAIJIPAI_S3_CONFIG"
     depends on BOARD_TYPE_TAIJI_PI_S3
     choice I2S_TYPE_TAIJIPI_S3

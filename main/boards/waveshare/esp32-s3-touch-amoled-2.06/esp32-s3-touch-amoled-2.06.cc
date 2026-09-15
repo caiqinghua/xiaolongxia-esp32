@@ -1,5 +1,6 @@
 #include "wifi_board.h"
 #include "display/lcd_display.h"
+#include "display/sh8601_panel_factory.h"
 #include "esp_lcd_sh8601.h"
 
 #include "codecs/box_audio_codec.h"
@@ -17,6 +18,14 @@
 #include "system/battery_telemetry_service.h"
 #include "system/audream_power_manager.h"
 #include "blufi.h"
+#if CONFIG_AUDREAM_WATCH_UI
+#include "recording_button_intent.h"
+#include "watch/watch_view.h"
+#include "watch/watch_motion_runtime.h"
+#include "watch/watch_rtc_runtime.h"
+#include "system/device_time_service.h"
+#include "display/lvgl_display/lvgl_theme.h"
+#endif
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -41,8 +50,14 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <memory>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch06"
+
+#if CONFIG_AUDREAM_WATCH_UI
+LV_FONT_DECLARE(font_puhui_30_4);
+#endif
 
 namespace {
 
@@ -50,8 +65,15 @@ constexpr uint16_t kRecordingButtonHoldMs = 1500;
 constexpr int64_t kDeepSleepWakeRecordHoldUs = static_cast<int64_t>(kRecordingButtonHoldMs) * 1000LL;
 constexpr uint64_t kRecordingFeedbackScreenOnUs = 3000ULL * 1000ULL;
 constexpr uint64_t kRecordingHoldRetryUs = 200ULL * 1000ULL;
+#if CONFIG_AUDREAM_WATCH_UI
+constexpr int64_t kWatchRecordingIntentTimeoutUs = 10LL * 1000LL * 1000LL;
+#endif
 constexpr bool kRecordingBlePeriodicStatusReportsEnabled = false;
+#if CONFIG_AUDREAM_WATCH_UI
+constexpr bool kRecordingAudioOutputPathEnabled = true;
+#else
 constexpr bool kRecordingAudioOutputPathEnabled = false;
+#endif
 constexpr uint8_t kRecordingAudioInputChannelCount = 3;
 constexpr uint64_t kRecordingBleStartGraceUs = 2ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kRecordingBleReportIntervalUs = 5ULL * 60ULL * 1000ULL * 1000ULL;
@@ -481,6 +503,105 @@ static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
 // Display class for the Waveshare AMOLED panel.
 class CustomLcdDisplay : public SpiLcdDisplay {
 public:
+#if CONFIG_AUDREAM_WATCH_UI
+private:
+    std::unique_ptr<WatchView> watch_view_;
+    bool watch_port_resume_required_ = false;
+    bool watch_display_idle_ = false;
+
+public:
+    ~CustomLcdDisplay() override {
+        if (watch_view_ && Lock()) {
+            watch_view_.reset();
+            Unlock();
+        }
+    }
+
+    bool SetupWatchUI(std::function<void(const WatchViewRequest&)> handler) override {
+        if (watch_view_) { return true; }
+        if (setup_ui_called_ || !display_ || !Lock(3000)) { return false; }
+        auto* theme = static_cast<LvglTheme*>(current_theme_);
+        // The basic font omits characters used by localized watch controls.
+        const auto* text_font = &font_puhui_30_4;
+        const auto* digits_font = &lv_font_montserrat_48;
+        watch_view_ = std::make_unique<WatchView>(lv_display_get_screen_active(display_), text_font,
+            digits_font, theme->icon_font()->font(), std::move(handler), []() {
+                Application::GetInstance().Schedule([]() {
+                    AudreamPowerManager::GetInstance().NotifyUserActivity("watch_touch");
+                });
+            });
+        lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, nullptr);
+        setup_ui_called_ = true;
+        Unlock();
+        return true;
+    }
+
+    void UpdateWatchState(const WatchViewState& state) override {
+        const bool idle = AudreamPowerManager::GetInstance().IsDisplayIdle();
+        bool visibility_changed = false;
+        if (watch_view_ && Lock(1000)) {
+            watch_view_->Update(state);
+            if (!watch_port_resume_required_ && watch_display_idle_ != idle) {
+                watch_view_->SetVisible(!idle);
+                watch_display_idle_ = idle;
+                visibility_changed = true;
+            }
+            Unlock();
+        }
+        if (visibility_changed) {
+            if (auto* backlight = Board::GetInstance().GetBacklight()) {
+                if (idle) backlight->SetBrightness(0);
+                else backlight->RestoreBrightness();
+            }
+        }
+    }
+
+    void CompleteWatchRequest(uint64_t id, bool succeeded) override {
+        if (watch_view_ && Lock()) {
+            watch_view_->Complete(id, succeeded);
+            Unlock();
+        }
+    }
+
+    void SetPowerSaveMode(bool on) override {
+        if (watch_view_) {
+            if (Lock(1000)) {
+                watch_view_->SetVisible(!on);
+                watch_display_idle_ = on;
+                Unlock();
+            }
+        } else {
+            SpiLcdDisplay::SetPowerSaveMode(on);
+        }
+    }
+
+    void UpdateStatusBar(bool update_all = false) override {
+        if (!watch_view_) { SpiLcdDisplay::UpdateStatusBar(update_all); }
+    }
+
+    bool PauseWatchForSleep() {
+        if (!watch_view_ || !Lock(1500)) { return false; }
+        watch_view_->SetVisible(false);
+        watch_port_resume_required_ = true;
+        const esp_err_t result = lvgl_port_stop();
+        Unlock();
+        return result == ESP_OK;
+    }
+
+    bool RestoreWatchAfterSleepCancellation() {
+        if (!watch_view_ || !Lock(1500)) { return false; }
+        if (watch_port_resume_required_) {
+            const esp_err_t result = lvgl_port_resume();
+            if (result != ESP_OK) { Unlock(); return false; }
+            watch_port_resume_required_ = false;
+        }
+        watch_view_->SetVisible(true);
+        watch_display_idle_ = false;
+        Unlock();
+        return true;
+    }
+#endif
+
     static void rounder_event_cb(lv_event_t* e) {
         lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
         uint16_t x1 = area->x1;
@@ -513,6 +634,9 @@ public:
     }
 
     virtual void SetupUI() override {
+#if CONFIG_AUDREAM_WATCH_UI
+        if (watch_view_) { return; }
+#endif
         // Call parent SetupUI() first to create all lvgl objects
         SpiLcdDisplay::SetupUI();
 
@@ -521,6 +645,8 @@ public:
         lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.1, 0);
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
     }
+
+    lv_display_t* LvglHandle() const { return display_; }
 };
 
 class CustomBacklight : public Backlight {
@@ -553,12 +679,13 @@ public:
         return display_on_result == ESP_OK;
     }
 
-    void PrepareForDeepSleep() {
+    bool PrepareForDeepSleep() {
         SetImmediateBrightness(0);
-        SendCommand(0x28, nullptr, 0);
-        SendCommand(0x10, nullptr, 0);
+        const esp_err_t display_off = SendCommand(0x28, nullptr, 0);
+        const esp_err_t sleep_in = SendCommand(0x10, nullptr, 0);
         esp_rom_delay_us(120000);
-        panel_awake_ = false;
+        if (sleep_in == ESP_OK) { panel_awake_ = false; }
+        return display_off == ESP_OK && sleep_in == ESP_OK;
     }
 
 protected:
@@ -596,13 +723,57 @@ private:
     enum class RecordingHoldStartSource {
         kButton,
         kDeepSleepWake,
+        kWatchControl,
     };
 
     i2c_master_bus_handle_t i2c_bus_;
+#if CONFIG_AUDREAM_WATCH_UI
+    std::unique_ptr<WatchMotionRuntime> motion_;
+    WatchRtcRuntime rtc_;
+    std::atomic<bool> rtc_save_pending_{false};
+    std::mutex rtc_save_mutex_;
+
+    void InitializeWatchRtc() {
+        const bool ready = rtc_.Begin(i2c_bus_);
+        uint64_t utc = 0;
+        auto& time = DeviceTimeService::GetInstance();
+        if (ready && !time.IsSynchronized() && rtc_.ReadTime(utc) && utc >= 1600000000000ULL) {
+            time.SyncUnixTimeMs(utc);
+            ESP_LOGI(TAG, "Watch UTC restored from external RTC");
+        } else {
+            ESP_LOGI(TAG, "External RTC initialization: bus_ready=%d system_time_valid=%d", ready, time.IsSynchronized());
+        }
+        AudreamDeviceControl::GetInstance().SetTimeSynchronizedCallback([this]() {
+            rtc_save_pending_.store(true);
+            Application::GetInstance().Schedule([this]() {
+                if (AudreamPowerManager::GetInstance().State() != AudreamPowerState::kDeepSleepPreparing)
+                    FlushWatchRtc();
+            });
+        });
+    }
+
+    void FlushWatchRtc() {
+        std::lock_guard<std::mutex> lock(rtc_save_mutex_);
+        if (!rtc_save_pending_.exchange(false)) return;
+        const auto utc = DeviceTimeService::GetInstance().CurrentUnixTimeMs();
+        if (utc < 1600000000000ULL || !rtc_.SaveTime(utc)) {
+            rtc_save_pending_.store(true);
+            ESP_LOGW(TAG, "External RTC UTC write was not verified; system clock remains available");
+        } else {
+            ESP_LOGI(TAG, "External RTC UTC write verified");
+        }
+    }
+#endif
     Pmic* pmic_ = nullptr;
     SemaphoreHandle_t pmic_mutex_ = nullptr;
     CustomLcdDisplay* display_ = nullptr;
     CustomBacklight* backlight_ = nullptr;
+    std::mutex panel_init_mutex_;
+    bool panel_spi_initialized_ = false;
+    esp_lcd_touch_handle_t touch_ = nullptr;
+    esp_lcd_panel_io_handle_t touch_io_ = nullptr;
+    lv_indev_t* touch_input_ = nullptr;
+    bool watch_peripherals_prepared_ = false;
     Button boot_button_;
     esp_timer_handle_t power_status_timer_ = nullptr;
     esp_timer_handle_t deep_sleep_record_hold_timer_ = nullptr;
@@ -617,11 +788,15 @@ private:
     bool usb_powered_ = false;
     bool recording_button_pressed_ = false;
     bool recording_hold_start_pending_ = false;
+    WatchRecordingError watch_recording_error_ = WatchRecordingError::kNone;
+#if CONFIG_AUDREAM_WATCH_UI
+    RecordingButtonIntent recording_button_intent_{kDeepSleepWakeRecordHoldUs};
+    int64_t recording_hold_deadline_us_ = 0;
+#endif
     RecordingHoldStartSource recording_hold_start_source_ = RecordingHoldStartSource::kButton;
-    bool recording_feedback_display_task_started_ = false;
-    bool recording_feedback_display_initialized_ = false;
-    bool recording_feedback_spi_initialized_ = false;
-    bool recording_feedback_pulse_pending_ = false;
+    std::atomic<bool> recording_feedback_display_task_started_{false};
+    std::atomic<bool> recording_feedback_display_initialized_{false};
+    std::atomic<bool> recording_feedback_pulse_pending_{false};
     esp_lcd_panel_handle_t recording_feedback_panel_ = nullptr;
     uint16_t* recording_feedback_draw_buffer_ = nullptr;
     uint16_t* recording_feedback_logo_tile_buffer_ = nullptr;
@@ -876,6 +1051,11 @@ private:
 
         auto& audio_service = Application::GetInstance().GetAudioService();
         const auto metadata = recording.Stop(audio_service);
+        if (recording.IsRecording()) {
+            recording_low_battery_stop_pending_.store(false);
+            ESP_LOGE(TAG, "Low-battery stop did not finish; retaining recording state for retry");
+            return;
+        }
         BatteryTelemetryService::GetInstance().RecordEvent(
             BatteryTelemetryEvent::kRecordingStopped
         );
@@ -943,7 +1123,7 @@ private:
         ESP_LOGI(TAG, "Automatic light sleep and dynamic CPU frequency are enabled");
 #endif
         auto& power_manager = AudreamPowerManager::GetInstance();
-        power_manager.Start(BOOT_BUTTON_GPIO);
+        power_manager.Start(BOOT_BUTTON_GPIO, UsesIdleDeepSleep(GetRuntimeProfile()));
         UpdateUsbPowerState(true);
 
         const esp_timer_create_args_t timer_args = {
@@ -974,7 +1154,8 @@ private:
         );
     }
 
-    void InitializeSpi() {
+    bool InitializeSpi() {
+        if (panel_spi_initialized_) { return true; }
         spi_bus_config_t buscfg = {};
         buscfg.sclk_io_num = EXAMPLE_PIN_NUM_LCD_PCLK;
         buscfg.data0_io_num = EXAMPLE_PIN_NUM_LCD_DATA0;
@@ -983,23 +1164,19 @@ private:
         buscfg.data3_io_num = EXAMPLE_PIN_NUM_LCD_DATA3;
         buscfg.max_transfer_sz = DISPLAY_WIDTH*  DISPLAY_HEIGHT*  sizeof(uint16_t);
         buscfg.flags = SPICOMMON_BUSFLAG_QUAD;
-        ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+        const esp_err_t result = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Display SPI initialization failed: %s", esp_err_to_name(result));
+            return false;
+        }
+        panel_spi_initialized_ = true;
+        return true;
     }
 
-    void InitializeSH8601Display() {
-        esp_lcd_panel_io_handle_t panel_io = nullptr;
-        esp_lcd_panel_handle_t panel = nullptr;
-
-        // Initialize LCD panel IO.
-        ESP_LOGD(TAG, "Install panel IO");
-        esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(
-            EXAMPLE_PIN_NUM_LCD_CS,
-            nullptr,
-            nullptr);
-        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI2_HOST, &io_config, &panel_io));
-
-        // Initialize LCD panel driver.
-        ESP_LOGD(TAG, "Install LCD driver");
+    bool CreateDisplayPanel(esp_lcd_panel_io_handle_t& panel_io, esp_lcd_panel_handle_t& panel) {
+        if (!InitializeSpi()) { return false; }
+        const esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(
+            EXAMPLE_PIN_NUM_LCD_CS, nullptr, nullptr);
         const sh8601_vendor_config_t vendor_config = {
             .init_cmds = &vendor_specific_init[0],
             .init_cmds_size = sizeof(vendor_specific_init) / sizeof(sh8601_lcd_init_cmd_t),
@@ -1011,25 +1188,37 @@ private:
         panel_config.reset_gpio_num = EXAMPLE_PIN_NUM_LCD_RST;
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
-        panel_config.vendor_config = (void* )&vendor_config;
-        ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(panel_io, &panel_config, &panel));
-        esp_lcd_panel_set_gap(panel, 0x16, 0);
-        esp_lcd_panel_reset(panel);
-        esp_lcd_panel_init(panel);
-        esp_lcd_panel_invert_color(panel, false);
-        esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
-        esp_lcd_panel_disp_on_off(panel, true);
+        panel_config.vendor_config = const_cast<sh8601_vendor_config_t*>(&vendor_config);
+        const esp_err_t result = CreateSh8601Panel(SPI2_HOST, io_config, panel_config,
+            0x16, 0, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, panel_io, panel);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Display panel initialization failed: %s", esp_err_to_name(result));
+            return false;
+        }
+        return true;
+    }
+
+    bool InitializeSH8601Display() {
+        std::lock_guard<std::mutex> lock(panel_init_mutex_);
+        if (display_) { return display_->LvglHandle() != nullptr; }
+        if (recording_feedback_panel_ || recording_feedback_display_task_started_.load()) {
+            ESP_LOGE(TAG, "LVGL initialization rejected: recording feedback owns the panel");
+            return false;
+        }
+        esp_lcd_panel_io_handle_t panel_io = nullptr;
+        esp_lcd_panel_handle_t panel = nullptr;
+        if (!CreateDisplayPanel(panel_io, panel)) { return false; }
         display_ = new CustomLcdDisplay(panel_io, panel,
                                         DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
-        backlight_ = new CustomBacklight(panel_io);
+        backlight_ = new CustomBacklight(panel_io, true);
         backlight_->RestoreBrightness();
+        return display_->LvglHandle() != nullptr;
     }
 
     void InitializeRecordingFeedbackDisplay() {
-        if (recording_feedback_display_task_started_) {
+        if (recording_feedback_display_task_started_.exchange(true)) {
             return;
         }
-        recording_feedback_display_task_started_ = true;
         const BaseType_t created = xTaskCreate(
             [](void* arg) {
                 auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
@@ -1179,77 +1368,20 @@ private:
     }
 
     void InitializeRecordingFeedbackDisplayTask() {
-        if (!recording_feedback_spi_initialized_) {
-            InitializeSpi();
-            recording_feedback_spi_initialized_ = true;
-        }
-
-        esp_lcd_panel_io_handle_t panel_io = nullptr;
-        esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(
-            EXAMPLE_PIN_NUM_LCD_CS,
-            nullptr,
-            nullptr);
-        const esp_err_t io_result = esp_lcd_new_panel_io_spi(SPI2_HOST, &io_config, &panel_io);
-        if (io_result != ESP_OK) {
+        std::lock_guard<std::mutex> lock(panel_init_mutex_);
+        if (display_) {
             recording_feedback_display_task_started_ = false;
-            ESP_LOGE(TAG, "Failed to create recording feedback panel IO: %s", esp_err_to_name(io_result));
+            PulseRecordingFeedbackScreen();
             return;
         }
-        const sh8601_vendor_config_t vendor_config = {
-            .init_cmds = &vendor_specific_init[0],
-            .init_cmds_size = sizeof(vendor_specific_init) / sizeof(sh8601_lcd_init_cmd_t),
-            .flags = {
-                .use_qspi_interface = 1,
-            },
-        };
-        esp_lcd_panel_dev_config_t panel_config = {};
-        panel_config.reset_gpio_num = EXAMPLE_PIN_NUM_LCD_RST;
-        panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
-        panel_config.bits_per_pixel = 16;
-        panel_config.vendor_config = const_cast<sh8601_vendor_config_t*>(&vendor_config);
-
-        esp_lcd_panel_handle_t panel = nullptr;
-        const esp_err_t panel_create_result =
-            esp_lcd_new_panel_sh8601(panel_io, &panel_config, &panel);
-        if (panel_create_result != ESP_OK) {
-            recording_feedback_display_task_started_ = false;
-            ESP_LOGE(
-                TAG,
-                "Failed to create recording feedback SH8601 panel: %s",
-                esp_err_to_name(panel_create_result)
-            );
-            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_del(panel_io));
-            return;
-        }
-
-        const auto run_panel_step = [](const char* name, esp_err_t result) {
-            if (result == ESP_OK) {
-                return true;
+        if (!recording_feedback_panel_) {
+            esp_lcd_panel_io_handle_t panel_io = nullptr;
+            if (!CreateDisplayPanel(panel_io, recording_feedback_panel_)) {
+                recording_feedback_display_task_started_ = false;
+                return;
             }
-            ESP_LOGE(
-                TAG,
-                "Recording feedback panel step failed: step=%s result=%s",
-                name,
-                esp_err_to_name(result)
-            );
-            return false;
-        };
-        const bool panel_initialized =
-            run_panel_step("set_gap", esp_lcd_panel_set_gap(panel, 0x16, 0)) &&
-            run_panel_step("reset", esp_lcd_panel_reset(panel)) &&
-            run_panel_step("initialize", esp_lcd_panel_init(panel)) &&
-            run_panel_step("invert", esp_lcd_panel_invert_color(panel, false)) &&
-            run_panel_step("mirror", esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y)) &&
-            run_panel_step("display_on", esp_lcd_panel_disp_on_off(panel, true));
-        if (!panel_initialized) {
-            recording_feedback_display_task_started_ = false;
-            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_del(panel));
-            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_del(panel_io));
-            return;
+            backlight_ = new CustomBacklight(panel_io, true);
         }
-
-        recording_feedback_panel_ = panel;
-        backlight_ = new CustomBacklight(panel_io, true);
         backlight_->SetImmediateBrightness(0);
         if (!DrawRecordingFeedbackFrame()) {
             recording_feedback_display_task_started_ = false;
@@ -1263,6 +1395,22 @@ private:
     }
 
     void PulseRecordingFeedbackScreen(const char* text = nullptr) {
+        if (display_) {
+            // LVGL owns the panel for the entire combined-mode boot. Never
+            // initialize or draw the lightweight feedback path over its buffer.
+            Application::GetInstance().Schedule([this]() {
+                AudreamPowerManager::GetInstance().NotifyUserActivity("watch_recording_feedback");
+                if (backlight_ && backlight_->WakeForRecordingFeedback()) {
+                    display_->SetPowerSaveMode(false);
+                    backlight_->RestoreBrightness();
+                }
+            });
+            return;
+        }
+#if CONFIG_AUDREAM_WATCH_UI
+        ESP_LOGW(TAG, "Recording feedback skipped because the watch display is unavailable");
+        return;
+#endif
         if (text != nullptr && text[0] != '\0') {
             recording_feedback_text_ = text;
         }
@@ -1422,7 +1570,7 @@ private:
                 );
             }
         }
-        if (backlight_ != nullptr) {
+        if (backlight_ != nullptr && !watch_peripherals_prepared_) {
             backlight_->PrepareForDeepSleep();
         }
         PrepareAudioForDeepSleep();
@@ -1437,8 +1585,60 @@ private:
         ConfigureI2cPinsForDeepSleep();
     }
 
-    void InitializeTouch() {
-        esp_lcd_touch_handle_t tp;
+    // Caller holds panel_init_mutex_. Retain failed handles for the next retry.
+    bool ReleaseTouch() {
+        if (touch_input_) {
+            if (lvgl_port_remove_touch(touch_input_) != ESP_OK) { return false; }
+            touch_input_ = nullptr;
+        }
+        if (touch_) {
+            if (esp_lcd_touch_del(touch_) != ESP_OK) { return false; }
+            touch_ = nullptr;
+        }
+        if (touch_io_) {
+            if (esp_lcd_panel_io_del(touch_io_) != ESP_OK) { return false; }
+            touch_io_ = nullptr;
+        }
+        return true;
+    }
+
+#if CONFIG_AUDREAM_WATCH_UI
+    bool PrepareWatchPeripheralsForSleep() {
+        FlushWatchRtc();
+        rtc_.Suspend();
+        if (motion_ && !motion_->PrepareForSleep()) return false;
+        {
+            std::lock_guard<std::mutex> lock(panel_init_mutex_);
+            if (!ReleaseTouch()) { return false; }
+        }
+        if (!display_ || !backlight_ || !display_->PauseWatchForSleep()) { return false; }
+        // Parameter commands drain queued SPI color transfers after LVGL stops.
+        if (!backlight_->PrepareForDeepSleep()) { return false; }
+        watch_peripherals_prepared_ = true;
+        return true;
+    }
+
+    bool RestoreWatchPeripherals() {
+        if (motion_ && !motion_->CancelSleep()) return false;
+        if (!display_ || !backlight_ || !backlight_->WakeForRecordingFeedback()) { return false; }
+        if (!display_->RestoreWatchAfterSleepCancellation() || !InitializeTouch()) { return false; }
+        backlight_->RestoreBrightness();
+        watch_peripherals_prepared_ = false;
+        rtc_.Resume();
+        FlushWatchRtc();
+        return true;
+    }
+#endif
+
+    bool InitializeTouch() {
+        std::lock_guard<std::mutex> lock(panel_init_mutex_);
+        if (touch_input_) { return true; }
+        if (!ReleaseTouch()) { return false; }
+        if (!display_ || !display_->LvglHandle()) {
+            ESP_LOGE(TAG, "Touch initialization requires an initialized LVGL display");
+            return false;
+        }
+        esp_lcd_touch_handle_t tp = nullptr;
         esp_lcd_touch_config_t tp_cfg = {
             .x_max = DISPLAY_WIDTH - 1,
             .y_max = DISPLAY_HEIGHT - 1,
@@ -1457,18 +1657,71 @@ private:
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_FT5x06_CONFIG();
         tp_io_config.scl_speed_hz = 400*  1000;
-        ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
+        esp_err_t result = esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Touch panel IO initialization failed: %s", esp_err_to_name(result));
+            return false;
+        }
         ESP_LOGI(TAG, "Initialize touch controller");
-        ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp));
+        result = esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Touch controller initialization failed: %s", esp_err_to_name(result));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_del(tp_io_handle));
+            return false;
+        }
         const lvgl_port_touch_cfg_t touch_cfg = {
-            .disp = lv_display_get_default(),
+            .disp = display_->LvglHandle(),
             .handle = tp,
         };
-        lvgl_port_add_touch(&touch_cfg);
+        auto* input = lvgl_port_add_touch(&touch_cfg);
+        if (!input) {
+            ESP_LOGE(TAG, "LVGL touch registration failed");
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_touch_del(tp));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_del(tp_io_handle));
+            return false;
+        }
+        touch_ = tp;
+        touch_io_ = tp_io_handle;
+        touch_input_ = input;
+#if CONFIG_AUDREAM_WATCH_UI
+        // The hidden watch root cannot receive touch events. Keep the input device
+        // alive so the first touch wakes the screen without activating a hidden control.
+        lv_indev_add_event_cb(input, [](lv_event_t* event) {
+            if (AudreamPowerManager::GetInstance().IsDisplayIdle()) {
+                lv_indev_wait_release(static_cast<lv_indev_t*>(lv_event_get_user_data(event)));
+            }
+            Application::GetInstance().Schedule([]() {
+                AudreamPowerManager::GetInstance().NotifyUserActivity("watch_touch_input");
+            });
+        }, LV_EVENT_PRESSED, input);
+#endif
         ESP_LOGI(TAG, "Touch panel initialized successfully");
+        return true;
     }
 
     void InitializeRecordingButton() {
+#if CONFIG_AUDREAM_WATCH_UI
+        boot_button_.OnPressDown([this]() {
+            recording_button_intent_.Press(esp_timer_get_time());
+        });
+        boot_button_.OnPressUp([this]() {
+            QueueWatchRecordingHold(recording_button_intent_.Release(esp_timer_get_time()));
+        });
+        boot_button_.OnLongPress([this]() {
+            QueueWatchRecordingHold(recording_button_intent_.ConfirmHold());
+        });
+        boot_button_.OnClick([this]() {
+            if (recording_button_intent_.LastPressWasHold()) return;
+            Application::GetInstance().Schedule([this]() {
+                auto& recording = LocalRecordingService::GetInstance();
+                if (recording.IsRecording() && AddRecordingHighlight("device_button")) {
+                    AudreamPowerManager::GetInstance().NotifyUserActivity("recording_highlight");
+                } else {
+                    AudreamPowerManager::GetInstance().NotifyUserActivity("button_click");
+                }
+            });
+        });
+#else
         boot_button_.OnPressDown([this]() {
             recording_button_pressed_ = true;
         });
@@ -1507,7 +1760,58 @@ private:
                 HandleRecordingLongPressTrigger();
             });
         });
+#endif
     }
+
+#if CONFIG_AUDREAM_WATCH_UI
+    void QueueWatchRecordingHold(uint64_t token) {
+        if (token == 0) return;
+        const int64_t confirmed_at_us = esp_timer_get_time();
+        Application::GetInstance().Schedule([this, token, confirmed_at_us]() {
+            if (!recording_button_intent_.Consume(token)) return;
+            if (esp_timer_get_time() - confirmed_at_us >= kWatchRecordingIntentTimeoutUs) {
+                ESP_LOGW(TAG, "Queued recording hold expired before the application was ready");
+                return;
+            }
+            AudreamPowerManager::GetInstance().NotifyUserActivity("button_long_press");
+            if (recording_hold_start_pending_) {
+                ExecuteWatchRecordingCommand(WatchRecordingCommand::kStop);
+                ESP_LOGI(TAG, "Pending recording start canceled by another hold");
+                return;
+            }
+            HandleRecordingLongPressTrigger();
+        });
+    }
+
+    void DetectWatchBootRecordingIntent() {
+        if (gpio_get_level(BOOT_BUTTON_GPIO) != 0) return;
+        recording_button_intent_.Press(esp_timer_get_time());
+        const esp_timer_create_args_t args = {
+            .callback = [](void* arg) {
+                auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+                if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+                    board->QueueWatchRecordingHold(
+                        board->recording_button_intent_.ConfirmElapsed(esp_timer_get_time()));
+                } else {
+                    // A high level alone cannot establish when the button was released.
+                    board->recording_button_intent_.CancelPress();
+                }
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "audream_boot_hold",
+            .skip_unhandled_events = true,
+        };
+        auto result = esp_timer_create(&args, &deep_sleep_record_hold_timer_);
+        if (result == ESP_OK) {
+            result = esp_timer_start_once(deep_sleep_record_hold_timer_, kDeepSleepWakeRecordHoldUs);
+        }
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Boot hold timer unavailable; button callbacks remain active: %s",
+                     esp_err_to_name(result));
+        }
+    }
+#endif
 
     void DetectDeepSleepRecordingIntent() {
         const esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
@@ -1855,11 +2159,28 @@ private:
     }
 
     void HandleRecordingLongPressTrigger() {
+#if CONFIG_AUDREAM_WATCH_UI
+        ExecuteWatchRecordingCommand(LocalRecordingService::GetInstance().IsRecording()
+            ? WatchRecordingCommand::kStop : WatchRecordingCommand::kStart);
+#else
+        if (LocalRecordingService::GetInstance().IsRecording()) {
+            StopLocalRecordingWithFeedback();
+        } else {
+            BeginRecordingHoldStart(RecordingHoldStartSource::kButton);
+        }
+#endif
+    }
+
+    bool StopLocalRecordingWithFeedback() {
         auto& recording = LocalRecordingService::GetInstance();
         auto& audio_service = Application::GetInstance().GetAudioService();
         if (recording.IsRecording()) {
             recording_hold_start_pending_ = false;
             const auto metadata = recording.Stop(audio_service);
+            if (recording.IsRecording()) {
+                ESP_LOGE(TAG, "Local recording stop did not finish; recording resources remain reserved");
+                return false;
+            }
             BatteryTelemetryService::GetInstance().RecordEvent(
                 BatteryTelemetryEvent::kRecordingStopped
             );
@@ -1867,24 +2188,45 @@ private:
             if (metadata.valid) {
                 ESP_LOGI(
                     TAG,
-                    "Button stopped local recording: id=%s duration=%lu ms size=%lu bytes",
+                    "Local recording stopped: id=%s duration=%lu ms size=%lu bytes",
                     metadata.recording_id.c_str(),
                     static_cast<unsigned long>(metadata.duration_ms),
                     static_cast<unsigned long>(metadata.size_bytes)
                 );
             } else {
-                ESP_LOGW(TAG, "Button stopped local recording without valid metadata");
+                ESP_LOGW(TAG, "Local recording stopped without valid metadata");
             }
             StopRecordingBleReporting(metadata);
-            return;
+            return metadata.valid;
         }
+        return false;
+    }
 
-        BeginRecordingHoldStart(RecordingHoldStartSource::kButton);
+    bool SetLocalRecordingPaused(bool paused) {
+        auto& recording = LocalRecordingService::GetInstance();
+        auto& audio = Application::GetInstance().GetAudioService();
+        const bool succeeded = paused ? recording.Pause(audio) : recording.Resume(audio);
+        if (succeeded) {
+            BatteryTelemetryService::GetInstance().RecordEvent(paused
+                ? BatteryTelemetryEvent::kRecordingPaused : BatteryTelemetryEvent::kRecordingResumed);
+            PulseRecordingFeedbackScreen(paused ? "PAUSE" : "RESUME");
+        }
+        return succeeded;
+    }
+
+    bool AddRecordingHighlight(const char* source) {
+        if (!LocalRecordingService::GetInstance().AddMarkerHighlight(source)) return false;
+        PulseRecordingFeedbackScreen();
+        return true;
     }
 
     void BeginRecordingHoldStart(RecordingHoldStartSource source) {
+        watch_recording_error_ = WatchRecordingError::kNone;
         recording_hold_start_source_ = source;
         recording_hold_start_pending_ = true;
+#if CONFIG_AUDREAM_WATCH_UI
+        recording_hold_deadline_us_ = esp_timer_get_time() + kWatchRecordingIntentTimeoutUs;
+#endif
         TryStartRecordingFromHold();
     }
 
@@ -1892,6 +2234,8 @@ private:
         switch (recording_hold_start_source_) {
             case RecordingHoldStartSource::kDeepSleepWake:
                 return "Deep sleep wake";
+            case RecordingHoldStartSource::kWatchControl:
+                return "Watch control";
             case RecordingHoldStartSource::kButton:
             default:
                 return "Button";
@@ -1902,11 +2246,20 @@ private:
         if (!recording_hold_start_pending_) {
             return;
         }
+#if CONFIG_AUDREAM_WATCH_UI
+        if (esp_timer_get_time() >= recording_hold_deadline_us_) {
+            recording_hold_start_pending_ = false;
+            watch_recording_error_ = WatchRecordingError::kStartFailed;
+            ESP_LOGW(TAG, "Recording start expired while waiting for storage or audio resources");
+            return;
+        }
+#else
         if (!recording_button_pressed_ && gpio_get_level(BOOT_BUTTON_GPIO) != 0) {
             recording_hold_start_pending_ = false;
             ESP_LOGI(TAG, "Recording hold start canceled because the button was released");
             return;
         }
+#endif
         const auto storage_status = SdCardStorage::GetInstance().GetStatus();
         if (!storage_status.mounted) {
             ScheduleRecordingHoldStartRetry();
@@ -1914,6 +2267,13 @@ private:
         }
 
         auto& recording = LocalRecordingService::GetInstance();
+#if CONFIG_AUDREAM_WATCH_UI
+        if (recording.GetSnapshot().state == LocalRecordingService::State::kOpening) {
+            // Failed-start cleanup can retain the opening state until audio drains.
+            ScheduleRecordingHoldStartRetry();
+            return;
+        }
+#endif
         if (recording.IsRecording()) {
             recording_hold_start_pending_ = false;
             ESP_LOGI(TAG, "%s recording hold start skipped because recording is already active", RecordingHoldStartSourceName());
@@ -1959,6 +2319,7 @@ private:
             const esp_err_t result = esp_timer_create(&timer_args, &recording_hold_retry_timer_);
             if (result != ESP_OK) {
                 recording_hold_start_pending_ = false;
+                watch_recording_error_ = WatchRecordingError::kStartFailed;
                 ESP_LOGE(TAG, "Failed to create recording hold retry timer: %s", esp_err_to_name(result));
                 return;
             }
@@ -1966,6 +2327,7 @@ private:
         const esp_err_t result = esp_timer_start_once(recording_hold_retry_timer_, kRecordingHoldRetryUs);
         if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
             recording_hold_start_pending_ = false;
+            watch_recording_error_ = WatchRecordingError::kStartFailed;
             ESP_LOGE(TAG, "Failed to schedule recording hold retry: %s", esp_err_to_name(result));
         }
     }
@@ -1983,6 +2345,10 @@ public:
     WaveshareEsp32s3TouchAMOLED2inch06() : boot_button_(BOOT_BUTTON_GPIO, false, kRecordingButtonHoldMs) {
         deep_sleep_wake_ = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0;
         LogWakeContext();
+#if CONFIG_AUDREAM_WATCH_UI
+        InitializeRecordingButton();
+        DetectWatchBootRecordingIntent();
+#endif
         InitializeCodecI2c();
         pmic_mutex_ = xSemaphoreCreateMutex();
         if (pmic_mutex_ == nullptr) {
@@ -1995,35 +2361,22 @@ public:
             HandleRecordingStatusAcknowledged();
         });
         AudreamDeviceControl::GetInstance().SetRecordingPauseCallbacks(
-            [this]() {
-                const bool paused = LocalRecordingService::GetInstance().Pause(
-                    Application::GetInstance().GetAudioService()
-                );
-                if (paused) {
-                    BatteryTelemetryService::GetInstance().RecordEvent(
-                        BatteryTelemetryEvent::kRecordingPaused
-                    );
-                    PulseRecordingFeedbackScreen("PAUSE");
-                }
-                return paused;
-            },
-            [this]() {
-                const bool resumed = LocalRecordingService::GetInstance().Resume(
-                    Application::GetInstance().GetAudioService()
-                );
-                if (resumed) {
-                    BatteryTelemetryService::GetInstance().RecordEvent(
-                        BatteryTelemetryEvent::kRecordingResumed
-                    );
-                    PulseRecordingFeedbackScreen("RESUME");
-                }
-                return resumed;
-            }
+            [this]() { return SetLocalRecordingPaused(true); },
+            [this]() { return SetLocalRecordingPaused(false); }
         );
+#if CONFIG_AUDREAM_WATCH_UI
+        InitializeWatchRtc();
+        if (!InitializeSH8601Display() || !InitializeTouch()) {
+            ESP_LOGE(TAG, "Watch display or touch initialization failed; recording remains available");
+        }
+        motion_ = std::make_unique<WatchMotionRuntime>(i2c_bus_);
+        if (!motion_->Start()) ESP_LOGE(TAG, "Motion worker could not be started");
+#else
         InitializeRecordingButton();
         DetectDeepSleepRecordingIntent();
         PulseBootBatteryScreen();
         ESP_LOGI(TAG, "Touch and WiFi application features are disabled");
+#endif
         auto& storage = SdCardStorage::GetInstance();
         storage.SetInitializationCompleteCallback([this](const StorageStatus& status) {
             HandleStorageInitializationComplete(status);
@@ -2031,16 +2384,111 @@ public:
         storage.StartInitializationTask();
     }
 
+    WatchRecordingControlStatus GetWatchRecordingControlStatus() const override {
+        return {recording_hold_start_pending_, watch_recording_error_};
+    }
+
+    WatchMotionSnapshot GetWatchMotionSnapshot() const override {
+#if CONFIG_AUDREAM_WATCH_UI
+        return motion_ ? motion_->Snapshot() : WatchMotionSnapshot{};
+#else
+        return {};
+#endif
+    }
+
+    WatchWristSnapshot GetWatchWristSnapshot() const override {
+#if CONFIG_AUDREAM_WATCH_UI
+        return motion_ ? motion_->GetWristSnapshot() : WatchWristSnapshot{};
+#else
+        return {};
+#endif
+    }
+
+    bool RequestWatchWrist(uint64_t id, WatchWristAction action, bool enabled) override {
+#if CONFIG_AUDREAM_WATCH_UI
+        return motion_ && motion_->RequestWrist(id, action, enabled);
+#else
+        (void)id; (void)action; (void)enabled;
+        return false;
+#endif
+    }
+
+    bool RetryWatchActivityStorage(uint64_t request_id) override {
+#if CONFIG_AUDREAM_WATCH_UI
+        return motion_ && motion_->RetryStorage(request_id);
+#else
+        (void)request_id;
+        return false;
+#endif
+    }
+
+    bool ResetCorruptWatchActivityStorage(uint64_t request_id, uint64_t token) override {
+#if CONFIG_AUDREAM_WATCH_UI
+        return motion_ && motion_->ResetCorruptStorage(request_id, token);
+#else
+        (void)request_id;
+        (void)token;
+        return false;
+#endif
+    }
+
+    bool ExecuteWatchRecordingCommand(WatchRecordingCommand command) override {
+#if CONFIG_AUDREAM_WATCH_UI
+        auto& recording = LocalRecordingService::GetInstance();
+        watch_recording_error_ = WatchRecordingError::kNone;
+        bool succeeded = false;
+        switch (command) {
+            case WatchRecordingCommand::kStart:
+                if (recording_hold_start_pending_ || recording.IsRecording()) return false;
+                BeginRecordingHoldStart(RecordingHoldStartSource::kWatchControl);
+                return recording_hold_start_pending_ || recording.IsRecording();
+            case WatchRecordingCommand::kStop: {
+                const bool was_pending = recording_hold_start_pending_;
+                recording_hold_start_pending_ = false;
+                StopTimerIfActive(recording_hold_retry_timer_, "audream_rec_hold");
+                succeeded = recording.IsRecording() ? StopLocalRecordingWithFeedback() : was_pending;
+                if (!succeeded) watch_recording_error_ = WatchRecordingError::kSaveFailed;
+                return succeeded;
+            }
+            case WatchRecordingCommand::kPause: succeeded = SetLocalRecordingPaused(true); break;
+            case WatchRecordingCommand::kResume: succeeded = SetLocalRecordingPaused(false); break;
+            case WatchRecordingCommand::kHighlight: succeeded = AddRecordingHighlight("watch_ui"); break;
+        }
+        if (!succeeded) watch_recording_error_ = WatchRecordingError::kControlFailed;
+        return succeeded;
+#else
+        (void)command;
+        return false;
+#endif
+    }
+
     virtual bool IsRecordingOnlyMode() const override {
-        return true;
+        return GetRuntimeProfile() == BoardRuntimeProfile::kRecordingOnly;
+    }
+
+    BoardRuntimeProfile GetRuntimeProfile() const override {
+#if CONFIG_AUDREAM_WATCH_UI
+        return WaveshareWatchRuntimeProfile(true);
+#else
+        return WaveshareWatchRuntimeProfile(false);
+#endif
     }
 
     virtual void StartNetwork() override {
         const esp_err_t result = Blufi::GetInstance().init(false);
         if (result != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start Audream BLE control: %s", esp_err_to_name(result));
+#if !CONFIG_AUDREAM_WATCH_UI
             return;
+#endif
         }
+#if CONFIG_AUDREAM_WATCH_UI
+        if (GetRuntimeProfile() == BoardRuntimeProfile::kWatchAssistantRecorder) {
+            AudreamPowerManager::GetInstance().SetPeripheralSleepCallbacks(
+                [this]() { return PrepareWatchPeripheralsForSleep(); },
+                [this]() { return RestoreWatchPeripherals(); });
+        }
+#endif
         AudreamPowerManager::GetInstance().SetBeforeDeepSleepCallback([this]() {
             auto& blufi = Blufi::GetInstance();
             blufi.SendDeviceWillSleepEvent();
@@ -2048,6 +2496,9 @@ public:
             blufi.deinit();
             PrepareBoardForDeepSleep();
         });
+#if CONFIG_AUDREAM_WATCH_UI
+        WifiBoard::StartNetwork();
+#endif
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -2094,7 +2545,11 @@ public:
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+#if CONFIG_AUDREAM_WATCH_UI
+        WifiBoard::SetPowerSaveLevel(level);
+#else
         (void)level;
+#endif
     }
 };
 

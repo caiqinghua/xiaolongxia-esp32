@@ -44,9 +44,10 @@ bool DeviceStateMachine::IsValidTransition(DeviceState from, DeviceState to) con
             return to == kDeviceStateStarting;
 
         case kDeviceStateStarting:
-            // Can go to wifi configuring or activating
+            // Offline watch startup does not require network activation.
             return to == kDeviceStateWifiConfiguring ||
-                   to == kDeviceStateActivating;
+                   to == kDeviceStateActivating ||
+                   to == kDeviceStateIdle;
 
         case kDeviceStateWifiConfiguring:
             // Can go to activating (after wifi connected) or audio testing

@@ -5,11 +5,13 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <esp_timer.h>
+#include <atomic>
 
 class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
-    bool in_config_mode_ = false;
+    std::atomic<bool> in_config_mode_{false};
+    std::atomic<bool> provision_after_timeout_{true};
     NetworkEventCallback network_event_callback_ = nullptr;
 
     virtual std::string GetBoardJson() override;
@@ -24,12 +26,13 @@ protected:
     /**
      * Start WiFi connection attempt
      */
-    void TryWifiConnect();
+    bool TryWifiConnect(bool allow_provisioning = true);
+    bool InitializeWifiManager();
 
     /**
      * Enter WiFi configuration mode
      */
-    void StartWifiConfigMode();
+    bool StartWifiConfigMode();
 
     /**
      * WiFi connection timeout callback
@@ -47,6 +50,11 @@ public:
      * This function returns immediately. Network events are notified through the callback set by SetNetworkEventCallback().
      */
     virtual void StartNetwork() override;
+    bool ApplyWatchWifiEnabled(bool enabled) override;
+    bool RestoreWatchStation() override;
+    bool HasWatchWifiCredentials() override;
+    bool SuspendIdleWatchStation() override;
+    bool IsWatchWifiProvisioning() override;
     
     virtual NetworkInterface* GetNetwork() override;
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) override;

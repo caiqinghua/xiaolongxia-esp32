@@ -1,8 +1,11 @@
 #include "storage/temporary_ap_transfer_service.h"
+#include "watch/watch_wifi_gate.h"
+#include <wifi_manager.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -25,8 +28,10 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/sockets.h"
 #include "storage/sd_card_storage.h"
 #include "system/audream_power_manager.h"
+#include "system/battery_telemetry_service.h"
 
 namespace {
 
@@ -241,12 +246,17 @@ bool SendAll(
     size_t length,
     size_t& sent_bytes,
     int& send_result,
-    int& send_errno
+    int& send_errno,
+    const std::atomic<bool>& cancelled
 ) {
     sent_bytes = 0;
     send_result = 0;
     send_errno = 0;
     while (sent_bytes < length) {
+        if (cancelled.load()) {
+            send_errno = ECANCELED;
+            return false;
+        }
         send_result = httpd_send(
             request,
             data + sent_bytes,
@@ -284,20 +294,24 @@ bool EnsureWifiDriverInitialized() {
     return true;
 }
 
-void StopWifiDriver() {
+bool StopWifiDriver() {
     esp_err_t ret = esp_wifi_stop();
     if (ret != ESP_OK &&
         ret != ESP_ERR_WIFI_NOT_INIT &&
         ret != ESP_ERR_WIFI_NOT_STARTED) {
         ESP_LOGW(kTag, "Failed to stop WiFi driver: %s", esp_err_to_name(ret));
+        return false;
     }
+    return true;
 }
 
-void DeinitializeWifiDriver() {
+bool DeinitializeWifiDriver() {
     const esp_err_t ret = esp_wifi_deinit();
     if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_INIT) {
         ESP_LOGW(kTag, "Failed to deinitialize WiFi driver: %s", esp_err_to_name(ret));
+        return false;
     }
+    return true;
 }
 
 }  // namespace
@@ -308,14 +322,22 @@ TemporaryAPTransferService& TemporaryAPTransferService::GetInstance() {
 }
 
 TemporaryAPTransferSession TemporaryAPTransferService::Start() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    const auto generation = stop_generation_.load();
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    if (generation != stop_generation_.load()) return {};
+    if (ownership_required_ && !audio_coordinator_) return {};
     if (stop_pending_) {
+        ScheduleStopLocked();
         ESP_LOGW(kTag, "Temporary AP transfer start deferred while the previous batch is stopping");
         return {};
     }
     if (session_.valid && !IsExpiredLocked()) {
-        if (!StartExpiryTimerLocked()) {
-            StopLocked();
+        if (audio_coordinator_ && !audio_coordinator_->IsCurrent(audio_generation_)) {
+            ScheduleStopLocked();
+            return {};
+        }
+        if (!StartExpiryTimerLocked() || generation != stop_generation_.load()) {
+            ScheduleStopLocked();
             return {};
         }
         ESP_LOGI(
@@ -326,8 +348,23 @@ TemporaryAPTransferSession TemporaryAPTransferService::Start() {
         return session_;
     }
 
-    StopLocked();
-
+    if (HasResourcesLocked()) {
+        ScheduleStopLocked();
+        return {};
+    }
+    cancel_downloads_ = false;
+    AudioSessionTransition transition;
+    if (audio_coordinator_) {
+        transition = audio_coordinator_->Begin(AudioSessionMode::kFileTransfer);
+        if (!transition) return {};
+        audio_generation_ = transition.generation;
+        audio_ready_ = prepare_audio_(audio_generation_, 3000);
+        if (!audio_ready_ || !audio_coordinator_->IsCurrent(audio_generation_) || generation != stop_generation_.load()) {
+            audio_coordinator_->Fail(transition, false);
+            ScheduleStopLocked();
+            return {};
+        }
+    }
     session_ = {};
     session_.ssid = BuildStableSSID();
     session_.password = BuildPassword();
@@ -335,8 +372,11 @@ TemporaryAPTransferSession TemporaryAPTransferService::Start() {
     session_.expires_in_seconds = kInactivityExpirySeconds;
     session_.url = "http://192.168.4.1/download?token=" + session_.token;
 
-    if (!StartAccessPointLocked() || !StartHttpServerLocked() || !StartExpiryTimerLocked()) {
-        StopLocked();
+    if (!StartAccessPointLocked() || generation != stop_generation_.load() ||
+        !StartHttpServerLocked() || !StartExpiryTimerLocked() ||
+        generation != stop_generation_.load() ||
+        (audio_coordinator_ && !audio_coordinator_->Complete(transition))) {
+        ScheduleStopLocked();
         return {};
     }
 
@@ -350,101 +390,151 @@ TemporaryAPTransferSession TemporaryAPTransferService::Start() {
     return session_;
 }
 
-void TemporaryAPTransferService::Stop() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    StopLocked();
+bool TemporaryAPTransferService::SetAudioOwnership(AudioSessionCoordinator& coordinator,
+    std::function<bool(uint64_t, uint32_t)> prepare, std::function<void()> released,
+    std::function<void()> finished) {
+    ownership_required_ = true;
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    if (HasResourcesLocked() || cleanup_running_ || stop_pending_ || audio_coordinator_ || !prepare || !released) return false;
+    audio_coordinator_ = &coordinator;
+    prepare_audio_ = std::move(prepare);
+    audio_released_ = std::move(released);
+    cleanup_finished_ = std::move(finished);
+    return true;
 }
 
-bool TemporaryAPTransferService::Complete(
-    const std::string& token
-) {
-    struct StopContext {
-        TemporaryAPTransferService* service = nullptr;
-        httpd_handle_t server = nullptr;
-    };
+bool TemporaryAPTransferService::HasResourcesLocked() const {
+    return server_ != nullptr || wifi_owned_ || ap_netif_ != nullptr || active_downloads_ != 0 || audio_generation_ != 0;
+}
 
-    auto* context = new (std::nothrow) StopContext();
-    if (context == nullptr) {
-        ESP_LOGE(kTag, "Failed to allocate temporary AP stop context");
-        return false;
+bool TemporaryAPTransferService::ScheduleStopLocked() {
+    ++stop_generation_;
+    stop_pending_ = true;
+    cancel_downloads_ = true;
+    if (cleanup_running_) return true;
+    if (expiry_timer_ != nullptr && esp_timer_is_active(expiry_timer_)) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(expiry_timer_));
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!IsTokenValidLocked(token)) {
-            ESP_LOGW(kTag, "Ignored temporary AP completion with an invalid token");
-            delete context;
-            return false;
-        }
-        if (stop_pending_) {
-            delete context;
-            return true;
-        }
-        stop_pending_ = true;
-        if (expiry_timer_ != nullptr && esp_timer_is_active(expiry_timer_)) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(expiry_timer_));
-        }
-        context->service = this;
-        context->server = server_;
-        server_ = nullptr;
-    }
-
+    cleanup_running_ = true;
     const BaseType_t created = xTaskCreate(
         [](void* task_arg) {
-            auto* stop_context = static_cast<StopContext*>(task_arg);
-            if (stop_context->server != nullptr) {
-                ESP_LOGI(kTag, "Stopping temporary AP HTTP server outside the service lock");
-                const esp_err_t stop_result = httpd_stop(stop_context->server);
-                ESP_LOGI(
-                    kTag,
-                    "Temporary AP HTTP server stop finished: %s",
-                    esp_err_to_name(stop_result)
-                );
-            }
-            {
-                std::lock_guard<std::mutex> lock(stop_context->service->mutex_);
-                stop_context->service->StopLocked(false);
-            }
-            delete stop_context;
+            static_cast<TemporaryAPTransferService*>(task_arg)->RunStop();
             vTaskDelete(nullptr);
         },
         "ap_stop",
         4096,
-        context,
+        this,
         3,
         nullptr
     );
     if (created != pdPASS) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        server_ = context->server;
-        stop_pending_ = false;
-        StartExpiryTimerLocked();
-        delete context;
+        cleanup_running_ = false;
         ESP_LOGE(kTag, "Failed to create temporary AP stop task");
         return false;
     }
-    ESP_LOGI(kTag, "Temporary AP transfer batch completion scheduled");
     return true;
 }
 
-void TemporaryAPTransferService::StopLocked(bool stop_expiry_timer) {
-    if (stop_expiry_timer && expiry_timer_ != nullptr && esp_timer_is_active(expiry_timer_)) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(expiry_timer_));
-    }
+bool TemporaryAPTransferService::Complete(const std::string& token) {
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    if (!session_.valid || token != session_.token) return false;
+    return ScheduleStopLocked();
+}
+
+bool TemporaryAPTransferService::StopWithin(uint32_t timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    ++stop_generation_;
+    cancel_downloads_ = true;
+    std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
+    if (!lock.try_lock_until(deadline)) return false;
+    if (!HasResourcesLocked() && !cleanup_running_ && !stop_pending_) return true;
+    if (!ScheduleStopLocked()) return false;
+    if (!cleanup_done_.wait_until(lock, deadline,
+        [this]() { return !cleanup_running_; })) return false;
+    return !HasResourcesLocked() && !stop_pending_;
+}
+
+void TemporaryAPTransferService::RunStop() {
+    std::unique_lock<std::timed_mutex> lock(mutex_);
+    const bool had_resources = HasResourcesLocked();
+    const auto finish = [this]() {
+        cleanup_running_ = false;
+        cleanup_done_.notify_all();
+    };
     if (server_ != nullptr) {
-        httpd_stop(server_);
+        const auto server = server_;
+        // The synchronous handler keeps this descriptor alive until its guard
+        // is released. Interrupt a blocked socket send without closing or
+        // reusing the descriptor; HTTP server teardown owns the final close.
+        if (active_socket_ >= 0 && shutdown(active_socket_, SHUT_RDWR) != 0) {
+            ESP_LOGW(kTag, "Temporary AP client shutdown failed: errno=%d", errno);
+        }
+        // Handlers release their download guards under mutex_. Joining the
+        // HTTP task with this lock held would deadlock that final release.
+        lock.unlock();
+        const auto result = httpd_stop(server);
+        lock.lock();
+        if (result != ESP_OK) {
+            ESP_LOGE(kTag, "Temporary AP HTTP shutdown failed: %s", esp_err_to_name(result));
+            finish();
+            return;
+        }
         server_ = nullptr;
     }
-    StopWifiDriver();
-    if (ap_netif_ != nullptr) {
-        esp_netif_destroy_default_wifi(ap_netif_);
-        ap_netif_ = nullptr;
+    if (active_downloads_ != 0) {
+        ESP_LOGE(kTag, "Temporary AP shutdown still has active downloads");
+        finish();
+        return;
     }
-    DeinitializeWifiDriver();
+    if (wifi_owned_) {
+        const bool released = GetWatchWifiGate().EndTransfer([this]() {
+            if (!StopWifiDriver()) return false;
+            if (ap_netif_ != nullptr) {
+                esp_netif_destroy_default_wifi(ap_netif_);
+                ap_netif_ = nullptr;
+            }
+            // WifiManager retains its initialization state for later station
+            // connections; do not deinitialize a driver that it still owns.
+            return WifiManager::GetInstance().IsInitialized() || DeinitializeWifiDriver();
+        });
+        if (!released) {
+            stop_pending_ = true;
+            ESP_LOGE(kTag, "Temporary AP radio cleanup incomplete; WiFi remains reserved");
+            finish();
+            return;
+        }
+        wifi_owned_ = false;
+    }
+    bool released_audio = false;
+    if (audio_generation_ != 0) {
+        if (audio_coordinator_->IsCurrent(audio_generation_)) {
+            if (!audio_ready_) audio_ready_ = prepare_audio_(audio_generation_, 3000);
+            if (!audio_ready_ && audio_coordinator_->IsCurrent(audio_generation_)) {
+                ESP_LOGE(kTag, "Temporary AP assistant handoff remains incomplete");
+                finish();
+                return;
+            }
+            released_audio = audio_coordinator_->ReleaseFileTransfer(audio_generation_);
+        }
+        // A newer recording owner must perform its own checked audio handoff.
+        // This older transfer must neither clear its lease nor resume audio.
+        audio_generation_ = 0;
+        audio_ready_ = false;
+    }
+    const bool stopped_session = session_.valid;
     session_ = {};
     expires_at_us_ = 0;
     active_downloads_ = 0;
     stop_pending_ = false;
     AudreamPowerManager::GetInstance().SetTemporaryAPTransferActive(false);
+    finish();
+    lock.unlock();
+    if (released_audio) audio_released_();
+    // Recovery is only requested here. Its owner task must recheck newer
+    // recording/transfer ownership before restarting any network resources.
+    if (had_resources && cleanup_finished_) cleanup_finished_();
+    // Telemetry samples the board, which can query this service again.
+    if (stopped_session) BatteryTelemetryService::GetInstance().RecordEvent(BatteryTelemetryEvent::kTransferStopped);
 }
 
 void TemporaryAPTransferService::ExpiryTimerCallback(void* arg) {
@@ -469,8 +559,8 @@ void TemporaryAPTransferService::ExpiryTimerCallback(void* arg) {
 }
 
 void TemporaryAPTransferService::StopFromExpiry() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!session_.valid) {
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    if (!session_.valid || stop_pending_ || !IsExpiredLocked()) {
         return;
     }
     if (active_downloads_ > 0) {
@@ -479,11 +569,12 @@ void TemporaryAPTransferService::StopFromExpiry() {
         return;
     }
     ESP_LOGI(kTag, "Temporary AP transfer batch expired after inactivity");
-    StopLocked(false);
+    ScheduleStopLocked();
 }
 
-void TemporaryAPTransferService::FinishDownload() {
-    std::lock_guard<std::mutex> lock(mutex_);
+void TemporaryAPTransferService::FinishDownload(int socket) {
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    if (active_socket_ == socket) active_socket_ = -1;
     if (active_downloads_ > 0) {
         active_downloads_--;
     }
@@ -493,11 +584,19 @@ void TemporaryAPTransferService::FinishDownload() {
 }
 
 bool TemporaryAPTransferService::IsActive() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return session_.valid && !IsExpiredLocked();
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    return HasResourcesLocked() || cleanup_running_;
 }
 
 bool TemporaryAPTransferService::StartAccessPointLocked() {
+    return GetWatchWifiGate().BeginTransfer([this]() {
+        wifi_owned_ = true;
+        AudreamPowerManager::GetInstance().SetTemporaryAPTransferActive(true);
+        return StartAccessPointAllowed();
+    });
+}
+
+bool TemporaryAPTransferService::StartAccessPointAllowed() {
     const size_t internal_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     if (internal_heap < kMinimumInternalHeapBeforeWifi) {
         ESP_LOGE(
@@ -509,7 +608,9 @@ bool TemporaryAPTransferService::StartAccessPointLocked() {
         return false;
     }
 
-    if (!EnsureWifiDriverInitialized()) {
+    auto& wifi = WifiManager::GetInstance();
+    if (wifi.IsInitialized()) wifi.StopStation();
+    if (!wifi.IsInitialized() && !EnsureWifiDriverInitialized()) {
         return false;
     }
 
@@ -642,7 +743,7 @@ bool TemporaryAPTransferService::IsExpiredLocked() const {
 }
 
 bool TemporaryAPTransferService::IsTokenValidLocked(const std::string& token) const {
-    return session_.valid && !IsExpiredLocked() && token == session_.token;
+    return !stop_pending_ && session_.valid && !IsExpiredLocked() && token == session_.token;
 }
 
 esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
@@ -657,7 +758,7 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
     }
 
     {
-        std::lock_guard<std::mutex> lock(service->mutex_);
+        std::lock_guard<std::timed_mutex> lock(service->mutex_);
         if (!service->IsTokenValidLocked(token)) {
             httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Invalid token");
             return ESP_FAIL;
@@ -668,16 +769,18 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
             httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to extend session");
             return ESP_FAIL;
         }
+        service->active_socket_ = httpd_req_to_sockfd(request);
     }
 
     struct DownloadGuard {
         TemporaryAPTransferService* service = nullptr;
+        int socket = -1;
         ~DownloadGuard() {
             if (service != nullptr) {
-                service->FinishDownload();
+                service->FinishDownload(socket);
             }
         }
-    } download_guard{service};
+    } download_guard{service, httpd_req_to_sockfd(request)};
 
     std::string file_path;
     uint32_t size_bytes = 0;
@@ -847,7 +950,8 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
             static_cast<size_t>(response_header_length),
             sent_header_bytes,
             header_send_result,
-            header_send_errno
+            header_send_errno,
+            service->cancel_downloads_
         )) {
         StopDownloadReadPipeline(pipeline, reader_started);
         close(file);
@@ -871,15 +975,17 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
     int64_t progress_started_at_us = started_at_us;
     uint64_t progress_started_at_bytes = 0;
     while (true) {
+        if (service->cancel_downloads_.load()) {
+            result = ESP_FAIL;
+            break;
+        }
         DownloadReadItem item;
         if (xQueueReceive(
                 pipeline.ready_buffers,
                 &item,
-                portMAX_DELAY
+                kDownloadPipelineWait
             ) != pdTRUE) {
-            result = ESP_FAIL;
-            ESP_LOGE(kTag, "Failed to receive data from recording reader task");
-            break;
+            continue;
         }
         if (item.error != 0) {
             ESP_LOGE(
@@ -917,7 +1023,8 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
                     send_size,
                     chunk_sent_bytes,
                     raw_send_result,
-                    raw_send_errno
+                    raw_send_errno,
+                    service->cancel_downloads_
                 );
                 const int64_t send_elapsed_us =
                     esp_timer_get_time() - send_started_at_us;
@@ -974,11 +1081,14 @@ esp_err_t TemporaryAPTransferService::DownloadHandler(httpd_req_t* request) {
         if (item.end_of_file) {
             break;
         }
-        xQueueSend(
+        if (xQueueSend(
             pipeline.free_buffers,
             &item.buffer_index,
-            portMAX_DELAY
-        );
+            kDownloadPipelineWait
+        ) != pdTRUE) {
+            result = ESP_FAIL;
+            break;
+        }
     }
     StopDownloadReadPipeline(pipeline, reader_started);
     close(file);
@@ -1015,7 +1125,7 @@ esp_err_t TemporaryAPTransferService::MetadataHandler(httpd_req_t* request) {
     }
 
     {
-        std::lock_guard<std::mutex> lock(service->mutex_);
+        std::lock_guard<std::timed_mutex> lock(service->mutex_);
         if (!service->IsTokenValidLocked(token)) {
             httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Invalid token");
             return ESP_FAIL;
@@ -1026,16 +1136,18 @@ esp_err_t TemporaryAPTransferService::MetadataHandler(httpd_req_t* request) {
             httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to extend session");
             return ESP_FAIL;
         }
+        service->active_socket_ = httpd_req_to_sockfd(request);
     }
 
     struct DownloadGuard {
         TemporaryAPTransferService* service = nullptr;
+        int socket = -1;
         ~DownloadGuard() {
             if (service != nullptr) {
-                service->FinishDownload();
+                service->FinishDownload(socket);
             }
         }
-    } download_guard{service};
+    } download_guard{service, httpd_req_to_sockfd(request)};
 
     uint32_t total_size = 0;
     uint32_t offset = 0;
@@ -1059,6 +1171,10 @@ esp_err_t TemporaryAPTransferService::MetadataHandler(httpd_req_t* request) {
 
     esp_err_t result = ESP_OK;
     while (true) {
+        if (service->cancel_downloads_.load()) {
+            result = ESP_FAIL;
+            break;
+        }
         if (!chunk.empty()) {
             result = httpd_resp_send_chunk(
                 request,

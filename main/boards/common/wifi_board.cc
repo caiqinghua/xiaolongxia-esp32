@@ -4,6 +4,8 @@
 #include "application.h"
 #include "system_info.h"
 #include "settings.h"
+#include "watch/watch_wifi_gate.h"
+#include <esp_wifi.h>
 #include "assets/lang_config.h"
 
 #include <freertos/FreeRTOS.h>
@@ -50,13 +52,20 @@ std::string WifiBoard::GetBoardType() {
 }
 
 void WifiBoard::StartNetwork() {
+    if (InitializeWifiManager()) TryWifiConnect();
+}
+
+bool WifiBoard::InitializeWifiManager() {
     auto& wifi_manager = WifiManager::GetInstance();
 
     // Initialize WiFi manager
     WifiManagerConfig config;
-    config.ssid_prefix = "Xiaozhi";
+    config.ssid_prefix = KeepsAudreamBleControl(GetRuntimeProfile()) ? "Audream" : "Xiaozhi";
     config.language = Lang::CODE;
-    wifi_manager.Initialize(config);
+    if (!GetWatchWifiGate().Run([&]() { return wifi_manager.Initialize(config); }, false)) {
+        ESP_LOGE(TAG, "WiFi initialization failed");
+        return false;
+    }
 
     // Set unified event callback - forward to NetworkEvent with SSID data
     wifi_manager.SetEventCallback([this](WifiEvent event, const std::string& data) {
@@ -82,24 +91,31 @@ void WifiBoard::StartNetwork() {
         }
     });
 
-    // Try to connect or enter config mode
-    TryWifiConnect();
+    return true;
 }
 
-void WifiBoard::TryWifiConnect() {
+bool WifiBoard::TryWifiConnect(bool allow_provisioning) {
+    if (!GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed()) return false;
     auto& ssid_manager = SsidManager::GetInstance();
     bool have_ssid = !ssid_manager.GetSsidList().empty();
 
     if (have_ssid) {
         // Start connection attempt with timeout
         ESP_LOGI(TAG, "Starting WiFi connection attempt");
-        esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
-        WifiManager::GetInstance().StartStation();
+        return GetWatchWifiGate().RunStation([this, allow_provisioning]() {
+            if (!WifiManager::GetInstance().IsInitialized()) return false;
+            esp_timer_stop(connect_timer_);
+            provision_after_timeout_ = allow_provisioning;
+            if (esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL) != ESP_OK) return false;
+            WifiManager::GetInstance().StartStation();
+            return true;
+        });
     } else {
+        if (!allow_provisioning) return true;
         // No SSID configured, enter config mode
         // Wait for the board version to be shown
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        StartWifiConfigMode();
+        if (!UsesOfflineWatchStartup(GetRuntimeProfile())) vTaskDelay(pdMS_TO_TICKS(1500));
+        return StartWifiConfigMode();
     }
 }
 
@@ -108,10 +124,8 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
         case NetworkEvent::Connected:
             // Stop timeout timer
             esp_timer_stop(connect_timer_);
-#ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
-            // make sure blufi resources has been released
-            Blufi::GetInstance().deinit();
-#endif
+            // BLUFI owns completion reporting and teardown. Closing it here can
+            // race the success report and destroy the persistent control role.
             in_config_mode_ = false;
             ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
             break;
@@ -150,14 +164,74 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
 
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
     auto* board = static_cast<WifiBoard*>(arg);
-    ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
+    if (!GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed()) return;
+    ESP_LOGW(TAG, "WiFi connection timed out");
 
-    WifiManager::GetInstance().StopStation();
-    board->StartWifiConfigMode();
+    if (!GetWatchWifiGate().RunStation([]() {
+        WifiManager::GetInstance().StopStation();
+        return true;
+    })) return;
+    if (board->provision_after_timeout_) board->StartWifiConfigMode();
 }
 
-void WifiBoard::StartWifiConfigMode() {
+bool WifiBoard::RestoreWatchStation() {
+    if (!UsesOfflineWatchStartup(GetRuntimeProfile()) || !GetWatchWifiGate().Enabled() ||
+        !GetWatchWifiGate().StationAllowed()) return false;
+    if (SsidManager::GetInstance().GetSsidList().empty()) return true;
+    if (!WifiManager::GetInstance().IsInitialized() && !InitializeWifiManager()) return false;
+    ESP_LOGI(TAG, "Restoring saved watch WiFi station");
+    return TryWifiConnect(false);
+}
+
+bool WifiBoard::HasWatchWifiCredentials() {
+    return UsesOfflineWatchStartup(GetRuntimeProfile()) && !SsidManager::GetInstance().GetSsidList().empty();
+}
+
+bool WifiBoard::IsWatchWifiProvisioning() {
+#ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
+    if (Blufi::GetInstance().IsWifiProvisioning()) return true;
+#endif
+    return in_config_mode_.load();
+}
+
+bool WifiBoard::SuspendIdleWatchStation() {
+    if (!UsesOfflineWatchStartup(GetRuntimeProfile()) || in_config_mode_) return false;
+    const auto stop = [this]() {
+        return GetWatchWifiGate().Run([this]() {
+            if (in_config_mode_) return false;
+            esp_timer_stop(connect_timer_);
+            auto& wifi = WifiManager::GetInstance();
+            if (wifi.IsInitialized()) wifi.StopStation();
+            const auto result = esp_wifi_stop();
+            return result == ESP_OK || result == ESP_ERR_WIFI_NOT_INIT || result == ESP_ERR_WIFI_NOT_STARTED;
+        }, false);
+    };
+#ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
+    // Hold the BLUFI lifecycle lock through the checked stop. A phone cannot
+    // begin provisioning between the idle check and stopping the driver.
+    return Blufi::GetInstance().RunWithoutWifiProvisioning(stop);
+#else
+    return stop();
+#endif
+}
+
+bool WifiBoard::StartWifiConfigMode() {
+    if (!GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed()) return false;
     in_config_mode_ = true;
+    if (UsesOfflineWatchStartup(GetRuntimeProfile())) {
+#ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
+        const auto result = Blufi::GetInstance().init(BlufiRole::kProvisioningAndControl);
+        if (result != ESP_OK) {
+            in_config_mode_ = false;
+            ESP_LOGE(TAG, "Watch WiFi provisioning startup failed: %s", esp_err_to_name(result));
+        }
+#else
+        in_config_mode_ = false;
+        ESP_LOGW(TAG, "Watch WiFi provisioning requires BLUFI support");
+#endif
+        // Keep the face usable; provisioning must not acquire the microphone.
+        return in_config_mode_;
+    }
     // Transition to wifi configuring state
     Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring);
 #ifdef CONFIG_USE_HOTSPOT_WIFI_PROVISIONING
@@ -177,7 +251,13 @@ void WifiBoard::StartWifiConfigMode() {
 #elif CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
     auto &blufi = Blufi::GetInstance();
     // initialize esp-blufi protocol
-    blufi.init();
+    const auto role = KeepsAudreamBleControl(GetRuntimeProfile())
+        ? BlufiRole::kProvisioningAndControl : BlufiRole::kWifiProvisioning;
+    const esp_err_t result = blufi.init(role);
+    if (result != ESP_OK) {
+        in_config_mode_ = false;
+        ESP_LOGE(TAG, "WiFi provisioning startup failed: %s", esp_err_to_name(result));
+    }
 #endif
 #if CONFIG_USE_ACOUSTIC_WIFI_PROVISIONING
     // Start acoustic provisioning task
@@ -194,9 +274,35 @@ void WifiBoard::StartWifiConfigMode() {
         vTaskDelete(NULL);
     }, "acoustic_wifi", 4096, reinterpret_cast<void*>(channel), 2, NULL);
 #endif
+    return in_config_mode_;
+}
+
+bool WifiBoard::ApplyWatchWifiEnabled(bool enabled) {
+    if (!UsesOfflineWatchStartup(GetRuntimeProfile())) return false;
+    if (enabled) {
+        if (!WifiManager::GetInstance().IsInitialized() && !InitializeWifiManager()) return false;
+        return TryWifiConnect();
+    }
+    // Invalidate provisioning before taking the radio lock. BLUFI uses the
+    // lifecycle -> radio lock order, including in its connection worker.
+#ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
+    Blufi::GetInstance().SuspendWifiProvisioning();
+#endif
+    return GetWatchWifiGate().Run([this]() {
+        esp_timer_stop(connect_timer_);
+        in_config_mode_ = false;
+        auto& wifi = WifiManager::GetInstance();
+        if (wifi.IsInitialized()) wifi.StopStation();
+        const auto result = esp_wifi_stop();
+        const bool stopped = result == ESP_OK || result == ESP_ERR_WIFI_NOT_INIT || result == ESP_ERR_WIFI_NOT_STARTED;
+        if (!stopped) ESP_LOGE(TAG, "Watch WiFi stop failed: %s", esp_err_to_name(result));
+        return stopped;
+    }, false);
 }
 
 void WifiBoard::EnterWifiConfigMode() {
+    if (!GetWatchWifiGate().Enabled() || GetWatchWifiGate().TransferActive()) return;
+    GetWatchWifiGate().SetStationAllowed(true);
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
 
@@ -214,11 +320,11 @@ void WifiBoard::EnterWifiConfigMode() {
             vTaskDelay(pdMS_TO_TICKS(1000));
 
             // Stop any ongoing connection attempt
-            esp_timer_stop(board->connect_timer_);
-            WifiManager::GetInstance().StopStation();
-
-            // Enter config mode
-            board->StartWifiConfigMode();
+            if (GetWatchWifiGate().Run([board]() {
+                esp_timer_stop(board->connect_timer_);
+                WifiManager::GetInstance().StopStation();
+                return true;
+            })) board->StartWifiConfigMode();
 
             vTaskDelete(NULL);
         }, "wifi_cfg_delay", 4096, this, 2, NULL);
@@ -231,13 +337,15 @@ void WifiBoard::EnterWifiConfigMode() {
     }
 
     // Stop any ongoing connection attempt
-    esp_timer_stop(connect_timer_);
-    WifiManager::GetInstance().StopStation();
-
-    StartWifiConfigMode();
+    if (GetWatchWifiGate().Run([this]() {
+        esp_timer_stop(connect_timer_);
+        WifiManager::GetInstance().StopStation();
+        return true;
+    })) StartWifiConfigMode();
 }
 
 bool WifiBoard::IsInWifiConfigMode() const {
+    if (UsesOfflineWatchStartup(GetRuntimeProfile())) return in_config_mode_.load();
     return WifiManager::GetInstance().IsConfigMode();
 }
 

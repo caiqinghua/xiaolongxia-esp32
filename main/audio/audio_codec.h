@@ -20,6 +20,7 @@ public:
     virtual ~AudioCodec();
     
     virtual void SetOutputVolume(int volume);
+    virtual bool SetWatchOutputVolume(int volume) { (void)volume; return false; }
     virtual void SetInputGain(float gain);
     virtual void EnableInput(bool enable);
     virtual void EnableOutput(bool enable);
@@ -27,6 +28,9 @@ public:
     virtual void PrepareForDeepSleep();
 
     virtual void OutputData(std::vector<int16_t>& data);
+    virtual bool SupportsWatchPlayback() const { return false; }
+    virtual bool SetWatchPlaybackOutput(bool enable) { (void)enable; return false; }
+    virtual bool WriteWatchPlayback(const std::vector<int16_t>& data) { (void)data; return false; }
     virtual bool InputData(std::vector<int16_t>& data);
     virtual void Start();
 

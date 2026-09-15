@@ -6,6 +6,9 @@
 #include <functional>
 #include <chrono>
 #include <vector>
+#include <memory>
+#include <cstdint>
+#include <atomic>
 
 struct AudioStreamPacket {
     int sample_rate = 0;
@@ -62,10 +65,23 @@ public:
     void OnNetworkError(std::function<void(const std::string& message)> callback);
     void OnConnected(std::function<void()> callback);
     void OnDisconnected(std::function<void()> callback);
+    void OnReceiveReady(std::function<void()> callback) { on_receive_ready_ = std::move(callback); }
+    virtual void Poll() {}
+    std::function<bool()> CaptureEventGuard() const {
+        std::weak_ptr<std::atomic<bool>> epoch = event_epoch_;
+        return [epoch]() {
+            auto state = epoch.lock();
+            return state && state->load();
+        };
+    }
 
     virtual bool Start() = 0;
     virtual bool OpenAudioChannel() = 0;
     virtual void CloseAudioChannel(bool send_goodbye = true) = 0;
+    virtual bool CloseAudioChannelWithin(uint32_t timeout_ms) { (void)timeout_ms; return false; }
+    virtual bool HasPendingClose() const { return false; }
+    virtual bool SupportsConversationTurns() const { return false; }
+    virtual bool SuspendIncomingTurn() { return false; }
     virtual bool IsAudioChannelOpened() const = 0;
     virtual bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) = 0;
     virtual void SendWakeWordDetected(const std::string& wake_word);
@@ -76,6 +92,12 @@ public:
     virtual void SendUserText(const std::string& text);
 
 protected:
+    void InvalidateEvents() {
+        event_epoch_->store(false);
+        event_epoch_ = std::make_shared<std::atomic<bool>>(true);
+    }
+    std::shared_ptr<std::atomic<bool>> event_epoch_ = std::make_shared<std::atomic<bool>>(true);
+    std::function<void()> on_receive_ready_;
     std::function<void(const cJSON* root)> on_incoming_json_;
     std::function<void(std::unique_ptr<AudioStreamPacket> packet)> on_incoming_audio_;
     std::function<void()> on_audio_channel_opened_;
@@ -96,4 +118,3 @@ protected:
 };
 
 #endif // PROTOCOL_H
-

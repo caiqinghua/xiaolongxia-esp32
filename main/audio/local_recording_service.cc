@@ -1,6 +1,7 @@
 #include "audio/local_recording_service.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <sstream>
@@ -136,7 +137,74 @@ LocalRecordingService& LocalRecordingService::GetInstance() {
     return instance;
 }
 
+bool LocalRecordingService::SetAssistantHandoff(std::function<bool(uint64_t, uint32_t)> callback) {
+    std::unique_lock<std::mutex> operation_lock(operation_mutex_, std::try_to_lock);
+    if (!operation_lock.owns_lock()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ != State::kClosed || failed_start_generation_ != 0) return false;
+    prepare_assistant_ = std::move(callback);
+    return true;
+}
+
+bool LocalRecordingService::SetPlaybackHandoff(std::function<bool(uint64_t, uint32_t)> callback) {
+    std::unique_lock<std::mutex> operation_lock(operation_mutex_, std::try_to_lock);
+    if (!operation_lock.owns_lock()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ != State::kClosed || (failed_start_generation_ && prepare_playback_)) return false;
+    if (playback_cleanup_pending_ && !callback) return false;
+    prepare_playback_ = std::move(callback);
+    return true;
+}
+
+bool LocalRecordingService::RecoverFailedStart(AudioService& audio_service, uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> operation_lock(operation_mutex_, std::try_to_lock);
+    return operation_lock.owns_lock() && RecoverFailedStartLocked(audio_service, timeout_ms);
+}
+
+bool LocalRecordingService::RecoverFailedStartLocked(AudioService& audio_service, uint32_t timeout_ms) {
+    if (failed_start_generation_ == 0) return true;
+    auto* coordinator = audio_service.GetSessionCoordinator();
+    if (!coordinator) return false;
+    const auto transition = coordinator->BeginFaultCleanup(failed_start_generation_);
+    if (!transition) {
+        if (!coordinator->IsCurrent(failed_start_generation_)) {
+            failed_start_generation_ = 0;
+            playback_cleanup_pending_ = false;
+        }
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    if (playback_cleanup_pending_) {
+        if (!prepare_playback_ || !prepare_playback_(transition.generation, timeout_ms)) {
+            coordinator->Fail(transition, false);
+            failed_start_generation_ = transition.generation;
+            return false;
+        }
+        playback_cleanup_pending_ = false;
+    }
+    const auto remaining = static_cast<uint32_t>(std::max<int64_t>(0,
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count()));
+    const bool released = prepare_assistant_
+        ? prepare_assistant_(transition.generation, remaining)
+        : audio_service.QuiesceAssistant(remaining);
+    if (!released) {
+        coordinator->Fail(transition, false);
+        failed_start_generation_ = transition.generation;
+        return false;
+    }
+    if (!coordinator->Complete(transition)) return false;
+    failed_start_generation_ = 0;
+    audio_service.ResumeAssistantAudio();
+    ESP_LOGI(kTag, "Failed recording start resources released");
+    return true;
+}
+
 bool LocalRecordingService::Start(AudioService& audio_service) {
+    std::unique_lock<std::mutex> operation_lock(operation_mutex_, std::try_to_lock);
+    if (!operation_lock.owns_lock()) {
+        return false;
+    }
+    if (!RecoverFailedStartLocked(audio_service, kStopDrainTimeoutMs)) return false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ != State::kClosed) {
@@ -146,17 +214,50 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
         state_ = State::kOpening;
     }
 
+    // Check storage before reserving/preempting an existing assistant session.
+    auto& storage = SdCardStorage::GetInstance();
+    if (!storage.GetStatus().mounted) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_ = State::kClosed;
+        ESP_LOGE(kTag, "Local recording start failed because storage is unavailable");
+        return false;
+    }
+    auto* coordinator = audio_service.GetSessionCoordinator();
+    if (prepare_assistant_ && !coordinator) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_ = State::kClosed;
+        return false;
+    }
+    if (coordinator) {
+        pending_transition_ = coordinator->Begin(AudioSessionMode::kLocalRecording);
+        if (!pending_transition_) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            state_ = State::kClosed;
+            return false;
+        }
+    }
+
     bool started = false;
+    bool audio_start_attempted = false;
+    bool assistant_released = !prepare_assistant_;
+    playback_cleanup_pending_ = AudioSessionCoordinator::IsLocalPlayback(pending_transition_.interrupted_purpose);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kStopDrainTimeoutMs);
     do {
-        auto& storage = SdCardStorage::GetInstance();
-        auto storage_status = storage.GetStatus();
-        if (!storage_status.mounted) {
-            ESP_LOGE(
-                kTag,
-                "Local recording start failed because storage is unavailable, error_code=%lu",
-                static_cast<unsigned long>(storage_status.error_code)
-            );
-            break;
+        if (playback_cleanup_pending_) {
+            if (!prepare_playback_ || !prepare_playback_(pending_transition_.generation, kStopDrainTimeoutMs)) {
+                ESP_LOGW(kTag, "Recording start deferred until local playback resources are released");
+                break;
+            }
+            playback_cleanup_pending_ = false;
+        }
+        if (prepare_assistant_) {
+            const auto remaining = static_cast<uint32_t>(std::max<int64_t>(0,
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count()));
+            assistant_released = prepare_assistant_(pending_transition_.generation, remaining);
+            if (!assistant_released) {
+                ESP_LOGW(kTag, "Recording start deferred until assistant resources are released");
+                break;
+            }
         }
 
         LocalRecordingMetadata metadata = {};
@@ -167,6 +268,7 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             current_ = metadata;
+            writer_failed_ = false;
             current_highlights_.clear();
             if (!writer_.Open(current_.file_path.c_str(), kSampleRate, kChannels, kFrameSamples)) {
                 ESP_LOGE(kTag, "Failed to open local recording writer: %s", current_.file_path.c_str());
@@ -192,20 +294,43 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
             }
         );
         AudreamPowerManager::GetInstance().SetRecordingActive(true);
-        audio_service.EnableLocalRecording(true);
+        audio_start_attempted = true;
+        if (!audio_service.EnableLocalRecording(true)) {
+            break;
+        }
         started = true;
     } while (false);
 
     if (!started) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        writer_.Close();
-        current_ = {};
-        current_highlights_.clear();
-        started_at_us_ = 0;
-        paused_at_us_ = 0;
-        accumulated_paused_us_ = 0;
-        state_ = State::kClosed;
+        bool resume_assistant = false;
+        if (coordinator) {
+            const bool released = !playback_cleanup_pending_ && assistant_released &&
+                (!audio_start_attempted || audio_service.QuiesceAssistant(kStopDrainTimeoutMs));
+            if (coordinator->Fail(pending_transition_, released)) {
+                if (!released) failed_start_generation_ = pending_transition_.generation;
+                resume_assistant = released;
+            }
+            pending_transition_ = {};
+        }
+        audio_service.SetLocalRecordingPacketCallback(nullptr);
+        AudreamPowerManager::GetInstance().SetRecordingActive(false);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            writer_.Close();
+            current_ = {};
+            current_highlights_.clear();
+            started_at_us_ = 0;
+            paused_at_us_ = 0;
+            accumulated_paused_us_ = 0;
+            state_ = State::kClosed;
+        }
+        if (resume_assistant) audio_service.ResumeAssistantAudio();
         return false;
+    }
+
+    if (coordinator) {
+        coordinator->Complete(pending_transition_);
+        pending_transition_ = {};
     }
 
     const auto metadata = CurrentMetadata();
@@ -214,30 +339,49 @@ bool LocalRecordingService::Start(AudioService& audio_service) {
 }
 
 bool LocalRecordingService::Pause(AudioService& audio_service) {
+    std::unique_lock<std::mutex> operation_lock(operation_mutex_, std::try_to_lock);
+    if (!operation_lock.owns_lock()) {
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ == State::kPaused) {
             return true;
         }
-        if (state_ != State::kRecording) {
+        if (state_ != State::kRecording && state_ != State::kPausing) {
             ESP_LOGW(kTag, "Local recording pause ignored because recording is not active");
             return false;
         }
-        state_ = State::kPausing;
+        if (state_ == State::kRecording) {
+            if (auto* coordinator = audio_service.GetSessionCoordinator()) {
+                pending_transition_ = coordinator->Begin(AudioSessionMode::kRecordingPaused);
+                if (!pending_transition_) {
+                    return false;
+                }
+            }
+            state_ = State::kPausing;
+        }
+        if (paused_at_us_ == 0) {
+            paused_at_us_ = esp_timer_get_time();
+        }
     }
 
     AudreamPowerManager::GetInstance().SetRecordingCaptureActive(false);
     audio_service.EnableLocalRecording(false);
     if (!audio_service.WaitForLocalRecordingDrain(kStopDrainTimeoutMs)) {
-        ESP_LOGW(kTag, "Local recording pause continued before encoder queue fully drained");
+        ESP_LOGE(kTag, "Local recording pause timed out; writer and sleep blocker retained");
+        return false;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (state_ != State::kPausing) {
         return false;
     }
-    paused_at_us_ = esp_timer_get_time();
     state_ = State::kPaused;
+    if (auto* coordinator = audio_service.GetSessionCoordinator()) {
+        coordinator->Complete(pending_transition_);
+        pending_transition_ = {};
+    }
     ESP_LOGI(
         kTag,
         "Paused local recording: id=%s duration=%lu ms",
@@ -248,6 +392,10 @@ bool LocalRecordingService::Pause(AudioService& audio_service) {
 }
 
 bool LocalRecordingService::Resume(AudioService& audio_service) {
+    std::unique_lock<std::mutex> operation_lock(operation_mutex_, std::try_to_lock);
+    if (!operation_lock.owns_lock()) {
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ == State::kRecording) {
@@ -257,19 +405,41 @@ bool LocalRecordingService::Resume(AudioService& audio_service) {
             ESP_LOGW(kTag, "Local recording resume ignored because recording is not paused");
             return false;
         }
-        accumulated_paused_us_ += std::max<int64_t>(0, esp_timer_get_time() - paused_at_us_);
-        paused_at_us_ = 0;
         state_ = State::kResuming;
+        if (auto* coordinator = audio_service.GetSessionCoordinator()) {
+            pending_transition_ = coordinator->Begin(AudioSessionMode::kLocalRecording);
+            if (!pending_transition_) {
+                state_ = State::kPaused;
+                return false;
+            }
+        }
     }
 
     AudreamPowerManager::GetInstance().SetRecordingCaptureActive(true);
-    audio_service.EnableLocalRecording(true);
+    const bool enabled = audio_service.EnableLocalRecording(true);
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (state_ != State::kResuming) {
         return false;
     }
+    if (!enabled) {
+        state_ = State::kPaused;
+        if (auto* coordinator = audio_service.GetSessionCoordinator()) {
+            // The file is still open, so a failed resume must retain its lease.
+            coordinator->Fail(pending_transition_, false);
+            pending_transition_ = {};
+        }
+        AudreamPowerManager::GetInstance().SetRecordingCaptureActive(false);
+        ESP_LOGE(kTag, "Local recording resume failed; recording remains paused");
+        return false;
+    }
+    accumulated_paused_us_ += std::max<int64_t>(0, esp_timer_get_time() - paused_at_us_);
+    paused_at_us_ = 0;
     state_ = State::kRecording;
+    if (auto* coordinator = audio_service.GetSessionCoordinator()) {
+        coordinator->Complete(pending_transition_);
+        pending_transition_ = {};
+    }
     ESP_LOGI(
         kTag,
         "Resumed local recording: id=%s duration=%lu ms",
@@ -280,39 +450,58 @@ bool LocalRecordingService::Resume(AudioService& audio_service) {
 }
 
 LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) {
-    bool capture_was_active = false;
+    std::unique_lock<std::mutex> operation_lock(operation_mutex_, std::try_to_lock);
+    if (!operation_lock.owns_lock()) {
+        return {};
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ != State::kRecording && state_ != State::kPaused) {
+        if (state_ == State::kClosed) {
             return last_;
         }
-        capture_was_active = state_ == State::kRecording;
-        if (state_ == State::kPaused && paused_at_us_ > 0) {
-            accumulated_paused_us_ += std::max<int64_t>(
-                0,
-                esp_timer_get_time() - paused_at_us_
-            );
-            paused_at_us_ = 0;
+        if (state_ != State::kRecording && state_ != State::kPaused &&
+            state_ != State::kPausing && state_ != State::kStopping) {
+            return {};
+        }
+        if (paused_at_us_ == 0) {
+            paused_at_us_ = esp_timer_get_time();
+        }
+        // A timed-out pause still owns its transition until the drain completes.
+        if (state_ != State::kPausing && state_ != State::kStopping) {
+            if (auto* coordinator = audio_service.GetSessionCoordinator()) {
+                pending_transition_ = coordinator->Mode() == AudioSessionMode::kFault
+                    ? coordinator->BeginFaultCleanup() : coordinator->Begin(AudioSessionMode::kIdle);
+                if (!pending_transition_) {
+                    return {};
+                }
+            }
         }
         state_ = State::kStopping;
     }
 
-    if (capture_was_active) {
-        AudreamPowerManager::GetInstance().SetRecordingCaptureActive(false);
-        audio_service.EnableLocalRecording(false);
-        if (!audio_service.WaitForLocalRecordingDrain(kStopDrainTimeoutMs)) {
-            ESP_LOGW(kTag, "Local recording stop continued before encoder queue fully drained");
+    AudreamPowerManager::GetInstance().SetRecordingCaptureActive(false);
+    audio_service.EnableLocalRecording(false);
+    if (!audio_service.WaitForLocalRecordingDrain(kStopDrainTimeoutMs)) {
+        ESP_LOGE(kTag, "Local recording stop timed out; writer and sleep blocker retained");
+        return {};
+    }
+    if (auto* coordinator = audio_service.GetSessionCoordinator()) {
+        if (pending_transition_.target == AudioSessionMode::kRecordingPaused) {
+            coordinator->Complete(pending_transition_);
+            pending_transition_ = coordinator->Begin(AudioSessionMode::kIdle);
         }
     }
     audio_service.SetLocalRecordingPacketCallback(nullptr);
 
     std::lock_guard<std::mutex> lock(mutex_);
-    writer_.Close();
+    const bool writer_closed = writer_.Close();
+    writer_failed_ = writer_failed_ || !writer_closed;
 
     current_.duration_ms = CurrentDurationMsLocked(esp_timer_get_time());
     current_.size_bytes = FileSizeBytes(current_.file_path);
     current_.packet_count = writer_.PacketCount();
-    current_.valid = current_.size_bytes > 0 && current_.packet_count > 0;
+    current_.valid = !writer_failed_ && current_.size_bytes > 0 && current_.packet_count > 0;
+    if (!writer_closed) ESP_LOGE(kTag, "Local recording file finalization failed");
     auto& time_service = DeviceTimeService::GetInstance();
     if (!current_.time_synchronized && time_service.IsSynchronized()) {
         const uint64_t stopped_at_rtc_ms = esp_rtc_get_time_us() / 1000;
@@ -325,7 +514,10 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
             current_.time_synchronized = true;
         }
     }
-    WriteMetadataFile(current_);
+    if (!WriteMetadataFile(current_)) {
+        ESP_LOGE(kTag, "Recording metadata save failed; stop may be retried");
+        return {};
+    }
     SdCardStorage::GetInstance().SetRecordingMtime(
         current_.recording_id,
         current_.started_at_unix_ms
@@ -333,6 +525,10 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
     last_ = current_;
     last_highlights_ = current_highlights_;
     state_ = State::kClosed;
+    if (auto* coordinator = audio_service.GetSessionCoordinator()) {
+        coordinator->Complete(pending_transition_);
+        pending_transition_ = {};
+    }
     AudreamPowerManager::GetInstance().SetRecordingActive(false);
     AudreamPowerManager::GetInstance().NotifyUserActivity("recording_stopped", 120);
     ESP_LOGI(
@@ -347,6 +543,7 @@ LocalRecordingMetadata LocalRecordingService::Stop(AudioService& audio_service) 
     started_at_us_ = 0;
     paused_at_us_ = 0;
     accumulated_paused_us_ = 0;
+    audio_service.ResumeAssistantAudio();
     return last_;
 }
 
@@ -382,8 +579,14 @@ void LocalRecordingService::HandleOpusPacket(const uint8_t* data, size_t size) {
         return;
     }
     if (!writer_.WritePacket(data, size)) {
+        writer_failed_ = true;
         ESP_LOGE(kTag, "Failed to write local recording packet");
     }
+}
+
+LocalRecordingService::Snapshot LocalRecordingService::GetSnapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {state_, CurrentDurationMsLocked(esp_timer_get_time()), last_};
 }
 
 bool LocalRecordingService::IsRecording() const {
@@ -416,6 +619,14 @@ LocalRecordingMetadata LocalRecordingService::LastMetadata() const {
     return last_;
 }
 
+void LocalRecordingService::ForgetDeletedRecording(const std::string& recording_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ == State::kClosed && last_.recording_id == recording_id) {
+        last_ = {};
+        last_highlights_.clear();
+    }
+}
+
 uint32_t LocalRecordingService::CurrentDurationMsLocked(int64_t now_us) const {
     if (started_at_us_ <= 0 || now_us <= started_at_us_) {
         return 0;
@@ -436,7 +647,8 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
         return false;
     }
     const std::string metadata_path = metadata.file_path + ".json";
-    FILE* file = fopen(metadata_path.c_str(), "w");
+    const std::string temporary_path = metadata_path + ".tmp";
+    FILE* file = fopen(temporary_path.c_str(), "w");
     if (file == nullptr) {
         ESP_LOGE(kTag, "Failed to open recording metadata file: %s", metadata_path.c_str());
         return false;
@@ -457,6 +669,7 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
         << "\"rtc_epoch_seq\":" << metadata.rtc_epoch_seq << ","
         << "\"duration_ms\":" << metadata.duration_ms << ","
         << "\"size_bytes\":" << metadata.size_bytes << ","
+        << "\"recording_complete\":" << (metadata.valid ? "true" : "false") << ","
         << "\"started_at_unix_ms\":" << metadata.started_at_unix_ms << ","
         << "\"started_at_uptime_ms\":" << metadata.started_at_uptime_ms << ","
         << "\"started_at_rtc_ms\":" << metadata.started_at_rtc_ms << ","
@@ -483,7 +696,12 @@ bool LocalRecordingService::WriteMetadataFile(const LocalRecordingMetadata& meta
     stream << "]}\n";
 
     const std::string content = stream.str();
-    std::fwrite(content.data(), 1, content.size(), file);
-    fclose(file);
+    const bool written = std::fwrite(content.data(), 1, content.size(), file) == content.size();
+    const bool closed = fclose(file) == 0;
+    if (!written || !closed || std::rename(temporary_path.c_str(), metadata_path.c_str()) != 0) {
+        std::remove(temporary_path.c_str());
+        ESP_LOGE(kTag, "Failed to commit recording metadata: %s", metadata_path.c_str());
+        return false;
+    }
     return true;
 }

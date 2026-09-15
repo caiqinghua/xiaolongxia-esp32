@@ -1,5 +1,7 @@
 #include "blufi.h"
+#include "watch/watch_wifi_gate.h"
 #include "audream_device_control.h"
+#include "wifi_credential_fields.h"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -22,6 +24,17 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "wifi_manager.h"
+#if CONFIG_AUDREAM_WATCH_ANCS
+#include "watch/watch_ancs_client.h"
+#endif
+#if CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS
+#include "watch/watch_android_gatt_server.h"
+#endif
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+#include "watch/watch_pairing_gatt_server.h"
+#include "watch/watch_blufi_send.h"
+#include "watch/watch_blufi_scope.h"
+#endif
 
 #define BLUFI_DEVICE_NAME "Audream Watch"
 
@@ -157,6 +170,7 @@ void StartAudreamBluFiAdvertising() {
 
 struct AudreamCustomRequest {
     std::vector<uint8_t> data;
+    Blufi::ControlTicket peer;
 };
 
 const char* FormatAudreamCustomOpcode(
@@ -200,13 +214,16 @@ void AppendLengthPrefixedString(std::vector<uint8_t>& output, const std::string&
 }
 
 esp_err_t SendAudreamDeviceEvent(uint8_t event, const std::vector<uint8_t>& payload) {
+    auto& blufi = Blufi::GetInstance();
+    const auto peer = blufi.CaptureControlPeer();
+    if (!peer) return ESP_ERR_INVALID_STATE;
     std::vector<uint8_t> event_payload;
     event_payload.reserve(3 + payload.size());
     event_payload.push_back(0x01);
     event_payload.push_back(0xF0);
     event_payload.push_back(event);
     event_payload.insert(event_payload.end(), payload.begin(), payload.end());
-    return esp_blufi_send_custom_data(event_payload.data(), event_payload.size());
+    return blufi.SendControlData(peer, event_payload.data(), event_payload.size());
 }
 
 QueueHandle_t g_audream_custom_queue = nullptr;
@@ -225,6 +242,11 @@ void AudreamCustomDataTask(void* arg) {
         std::unique_ptr<AudreamCustomRequest> request(raw_request);
         if (!request) {
             ESP_LOGE(BLUFI_TAG, "Audream custom data worker received a null request");
+            continue;
+        }
+
+        if (!Blufi::GetInstance().IsControlPeerCurrent(request->peer)) {
+            ESP_LOGW(BLUFI_TAG, "Discarded custom request from an expired or unauthorized BLE connection");
             continue;
         }
 
@@ -257,7 +279,8 @@ void AudreamCustomDataTask(void* arg) {
                 request->data.data(),
                 request->data.size()
             );
-        esp_err_t result = esp_blufi_send_custom_data(
+        esp_err_t result = Blufi::GetInstance().SendControlData(
+            request->peer,
             response.data(),
             response.size()
         );
@@ -309,6 +332,11 @@ bool EnsureAudreamCustomDataWorker() {
 }
 
 void QueueAudreamCustomData(const uint8_t* data, uint32_t length) {
+    const auto peer = Blufi::GetInstance().CaptureControlPeer();
+    if (!peer) {
+        ESP_LOGW(BLUFI_TAG, "Rejected custom request without an admitted BLE connection");
+        return;
+    }
     if (data == nullptr || length == 0) {
         ESP_LOGW(BLUFI_TAG, "Ignored empty Audream custom data request");
         return;
@@ -323,6 +351,7 @@ void QueueAudreamCustomData(const uint8_t* data, uint32_t length) {
         return;
     }
     request->data.assign(data, data + length);
+    request->peer = peer;
 
     if (xQueueSend(g_audream_custom_queue, &request, pdMS_TO_TICKS(100)) != pdTRUE) {
         const uint32_t active_started_at_ms = g_audream_active_started_at_ms.load(
@@ -345,6 +374,46 @@ void QueueAudreamCustomData(const uint8_t* data, uint32_t length) {
 }
 
 } // namespace
+
+static uint64_t ReadControlAuthorization(uint16_t connection, const uint8_t* address) {
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    const uint64_t lease = WatchAncsClient::Get().ControlPeerLease(connection, address);
+    return lease && lease == audream_blufi_operation_lease() ? lease : 0;
+#else
+    (void)connection;
+    (void)address;
+    return 0;
+#endif
+}
+
+Blufi::ControlTicket Blufi::CaptureControlPeer() const {
+    return control_session_.Capture(ReadControlAuthorization);
+}
+
+bool Blufi::IsControlPeerCurrent(const ControlTicket& ticket) const {
+    return control_session_.IsCurrent(ticket, ReadControlAuthorization);
+}
+
+esp_err_t Blufi::SendControlData(const ControlTicket& ticket, const uint8_t* data, size_t length) {
+    if (!data || !length || length > UINT32_MAX) return ESP_ERR_INVALID_ARG;
+    if (!IsControlPeerCurrent(ticket)) return ESP_ERR_INVALID_STATE;
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    return audream_blufi_send_custom_data_for_lease(ticket.authorization,
+        const_cast<uint8_t*>(data), static_cast<uint32_t>(length));
+#else
+    return esp_blufi_send_custom_data(const_cast<uint8_t*>(data), static_cast<uint32_t>(length));
+#endif
+}
+
+esp_err_t Blufi::SendWifiReport(const ControlTicket& peer, wifi_mode_t mode,
+    esp_blufi_sta_conn_state_t state, uint8_t softap_connections, esp_blufi_extra_info_t* info) {
+    if (!IsControlPeerCurrent(peer)) return ESP_ERR_INVALID_STATE;
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    return audream_blufi_send_wifi_conn_report_for_lease(peer.authorization, mode, state, softap_connections, info);
+#else
+    return esp_blufi_send_wifi_conn_report(mode, state, softap_connections, info);
+#endif
+}
 
 static wifi_mode_t GetWifiModeWithFallback(const WifiManager& wifi) {
     if (wifi.IsConfigMode()) {
@@ -369,10 +438,7 @@ Blufi::Blufi()
       m_ble_is_connected(false),
       m_sta_connected(false),
       m_sta_got_ip(false),
-      m_provisioned(false),
-      m_deinited(false),
-      m_sta_ssid_len(0),
-      m_sta_is_connecting(false) {
+      m_sta_ssid_len(0) {
     memset(&m_sta_config, 0, sizeof(m_sta_config));
     memset(m_sta_bssid, 0, sizeof(m_sta_bssid));
     memset(m_sta_ssid, 0, sizeof(m_sta_ssid));
@@ -436,31 +502,67 @@ esp_err_t Blufi::SendRecordingStoppedEvent(
 }
 
 esp_err_t Blufi::init(bool enable_wifi_provisioning) {
-    esp_err_t ret = ESP_FAIL;
-    control_only_mode_ = !enable_wifi_provisioning;
-    m_provisioned = false;
+    return init(enable_wifi_provisioning ? BlufiRole::kWifiProvisioning : BlufiRole::kControlOnly);
+}
 
-    if (enable_wifi_provisioning) {
+esp_err_t Blufi::init(BlufiRole role) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (control_lease_ && role != BlufiRole::kControlOnly) return ESP_ERR_INVALID_STATE;
+    if (role != BlufiRole::kControlOnly &&
+        (!GetWatchWifiGate().Enabled() || GetWatchWifiGate().TransferActive())) return ESP_ERR_INVALID_STATE;
+    if (shutdown_failed_) {
+        ESP_LOGE(BLUFI_TAG, "BLUFI restart rejected after incomplete shutdown");
+        return ESP_ERR_INVALID_STATE;
+    }
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    if (session_.IsActive() && profile_startup_.Failed(esp_timer_get_time() / 1000)) return ESP_FAIL;
+#endif
+    if (session_.IsActive() && session_.Role() == role) {
+        return ESP_OK;
+    }
+    esp_err_t ret = ESP_FAIL;
+    if (role != BlufiRole::kControlOnly) {
         auto& wifi_manager = WifiManager::GetInstance();
-        if (!wifi_manager.IsInitialized() || !wifi_manager.IsConfigMode()) {
-            start_wifi_scan();
-        } else {
+        if (wifi_manager.IsInitialized() && wifi_manager.IsConfigMode()) {
             ESP_LOGE(BLUFI_TAG,
                      "Blufi and WiFi hotspot network configuration cannot "
                      "be used simultaneously.");
-            return ret;
+            return ESP_ERR_INVALID_STATE;
         }
-    } else {
-        ESP_LOGI(BLUFI_TAG, "Starting BLUFI in Audream control-only mode");
+        // Provisioning owns scanning; WifiStation must not consume its results.
+        if (wifi_manager.IsInitialized()) {
+            if (!GetWatchWifiGate().Run([&]() { wifi_manager.StopStation(); return true; })) return ESP_ERR_INVALID_STATE;
+        }
     }
+
+    const bool already_active = session_.IsActive();
+    session_.Activate(role);
+    {
+        std::lock_guard<std::mutex> credentials_lock(credentials_mutex_);
+        m_sta_config = {};
+        m_ssid_valid = false;
+        m_password_valid = true;
+    }
+    ESP_LOGI(BLUFI_TAG, "BLUFI role changed: provisioning=%d control=%d reuse_stack=%d",
+             session_.AllowsProvisioning(), session_.KeepsControl(), already_active);
+    if (already_active) {
+        return ESP_OK;
+    }
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    profile_startup_.Begin(esp_timer_get_time() / 1000);
+#endif
 
 #if CONFIG_BT_CONTROLLER_ENABLED || !CONFIG_BT_NIMBLE_ENABLED
     ret = _controller_init();
     if (ret) {
         ESP_LOGE(BLUFI_TAG, "BLUFI controller init failed: %s", esp_err_to_name(ret));
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+        profile_startup_.Fail();
+        if (_controller_deinit() != ESP_OK) shutdown_failed_ = true;
+#else
         _controller_deinit();
-        inited_ = false;
-        m_deinited = true;
+#endif
+        session_.Deactivate();
         return ret;
     }
 #endif
@@ -468,36 +570,68 @@ esp_err_t Blufi::init(bool enable_wifi_provisioning) {
     ret = _host_and_cb_init();
     if (ret) {
         ESP_LOGE(BLUFI_TAG, "BLUFI host and cb init failed: %s", esp_err_to_name(ret));
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+        profile_startup_.Fail();
+        session_.Deactivate();
+        control_session_.Reset();
+        // Never stop the controller while a partially started host still owns it.
+        if (AbortSecureHostStart() != ESP_OK) {
+            shutdown_failed_ = true;
+            ESP_LOGE(BLUFI_TAG, "Secure BLE startup cleanup failed; restart requires reboot");
+            return ret;
+        }
+#endif
 #if CONFIG_BT_CONTROLLER_ENABLED || !CONFIG_BT_NIMBLE_ENABLED
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+        if (_controller_deinit() != ESP_OK) shutdown_failed_ = true;
+#else
         _controller_deinit();
 #endif
-        inited_ = false;
-        m_deinited = true;
+#endif
+        session_.Deactivate();
         return ret;
     }
 
-    inited_ = true;
-    m_deinited = false;
     ESP_LOGI(BLUFI_TAG, "BLUFI VERSION %04x", esp_blufi_get_version());
     return ESP_OK;
 }
 
 esp_err_t Blufi::deinit() {
-    esp_err_t ret = ESP_OK;
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    return DeinitLocked();
+}
 
-    if (inited_) {
-        if (m_deinited) {
-            return ESP_OK;
-        }
-        m_deinited = true;
+void Blufi::DeinitCompletedProvisioning(BlufiSessionState::Ticket ticket) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (session_.IsCurrent(ticket) && session_.IsProvisioned() && !session_.KeepsControl()) {
+        DeinitLocked();
+    }
+}
+
+esp_err_t Blufi::DeinitLocked() {
+    if (control_lease_) return ESP_ERR_INVALID_STATE;
+    esp_err_t ret = ESP_OK;
+    if (shutdown_failed_) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (session_.IsActive()) {
+        session_.Deactivate();
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+        profile_startup_.Stop();
+#endif
+        control_session_.Reset();
+        m_ble_is_connected = false;
         ret = _host_deinit();
         if (ret) {
             ESP_LOGE(BLUFI_TAG, "Host deinit failed: %s", esp_err_to_name(ret));
+            shutdown_failed_ = true;
+            return ret;
         }
 #if CONFIG_BT_CONTROLLER_ENABLED || !CONFIG_BT_NIMBLE_ENABLED
         ret = _controller_deinit();
         if (ret) {
             ESP_LOGE(BLUFI_TAG, "Controller deinit failed: %s", esp_err_to_name(ret));
+            shutdown_failed_ = true;
         }
 #endif
     }
@@ -505,7 +639,29 @@ esp_err_t Blufi::deinit() {
 }
 
 bool Blufi::IsActive() const {
-    return inited_ && !m_deinited;
+    return session_.IsActive();
+}
+bool Blufi::IsControlReady() const {
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    return profile_startup_.Ready(esp_timer_get_time() / 1000) && session_.IsActive() && !session_.AllowsProvisioning();
+#else
+    return session_.IsActive() && !session_.AllowsProvisioning();
+#endif
+}
+
+void Blufi::HandleProfileInitialized(bool success) {
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    const auto now_ms = esp_timer_get_time() / 1000;
+    if (!profile_startup_.Complete(success, now_ms)) {
+        if (profile_startup_.Failed(now_ms)) ESP_LOGE(BLUFI_TAG, "BLUFI profile initialization failed or timed out");
+        return;
+    }
+    if (!session_.IsActive()) return;
+#else
+    (void)success;
+#endif
+    ESP_LOGI(BLUFI_TAG, "BLUFI init finish");
+    StartAudreamBluFiAdvertising();
 }
 
 esp_err_t Blufi::SendRecordingStatusEvent(
@@ -548,6 +704,15 @@ esp_err_t Blufi::_host_init() {
 }
 
 esp_err_t Blufi::_host_deinit() {
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    WatchPairingGattServer::Get().HostStopping();
+#endif
+#if CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS
+    WatchAndroidGattServer::Get().HostStopping();
+#endif
+#if CONFIG_AUDREAM_WATCH_ANCS
+    WatchAncsClient::Get().HostStopping();
+#endif
     esp_err_t ret = esp_blufi_profile_deinit();
     if (ret != ESP_OK)
         return ret;
@@ -557,16 +722,37 @@ esp_err_t Blufi::_host_deinit() {
         ESP_LOGE(BLUFI_TAG, "%s disable bluedroid failed: %s", __func__, esp_err_to_name(ret));
         return ESP_FAIL;
     }
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_INITIALIZED) return ESP_FAIL;
+#endif
     ret = esp_bluedroid_deinit();
     if (ret) {
         ESP_LOGE(BLUFI_TAG, "%s deinit bluedroid failed: %s", __func__, esp_err_to_name(ret));
         return ESP_FAIL;
     }
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_UNINITIALIZED) return ESP_FAIL;
+#endif
+#if CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS
+    WatchAndroidGattServer::Get().HostStopped();
+#endif
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    WatchPairingGattServer::Get().HostStopped();
+#endif
+#if CONFIG_AUDREAM_WATCH_ANCS
+    WatchAncsClient::Get().HostStopped();
+#endif
     return ESP_OK;
 }
 
 esp_err_t Blufi::_gap_register_callback() {
+#if CONFIG_AUDREAM_WATCH_ANCS
+    esp_err_t rc = esp_ble_gap_register_callback([](esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
+        if (!WatchAncsClient::Get().GapEvent(event, param)) esp_blufi_gap_event_handler(event, param);
+    });
+#else
     esp_err_t rc = esp_ble_gap_register_callback(esp_blufi_gap_event_handler);
+#endif
     if (rc) {
         return rc;
     }
@@ -592,6 +778,28 @@ esp_err_t Blufi::_host_and_cb_init() {
         ESP_LOGE(BLUFI_TAG, "%s blufi register failed, error code = %x", __func__, ret);
         return ret;
     }
+#if CONFIG_AUDREAM_WATCH_ANCS
+    if (!WatchAncsClient::Get().HostStarted()) {
+        ESP_LOGE(BLUFI_TAG, "Watch notification client initialization failed");
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+        return ESP_FAIL;
+#endif
+    }
+#endif
+#if CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS
+    if (!WatchAndroidGattServer::Get().HostStarted()) {
+        ESP_LOGE(BLUFI_TAG, "Watch Android notification service initialization failed");
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+        return ESP_FAIL;
+#endif
+    }
+#endif
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    if (!WatchPairingGattServer::Get().HostStarted()) {
+        ESP_LOGE(BLUFI_TAG, "Watch device pairing service initialization failed");
+        return ESP_FAIL;
+    }
+#endif
     ret = _gap_register_callback();
     if (ret) {
         ESP_LOGE(BLUFI_TAG, "%s gap register failed, error code = %x", __func__, ret);
@@ -599,6 +807,33 @@ esp_err_t Blufi::_host_and_cb_init() {
     }
     return ESP_OK;
 }
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+esp_err_t Blufi::AbortSecureHostStart() {
+    WatchPairingGattServer::Get().HostStopping();
+#if CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS
+    WatchAndroidGattServer::Get().HostStopping();
+#endif
+    WatchAncsClient::Get().HostStopping();
+    // The profile init request has not been accepted on this failure path.
+    // Do not enqueue profile deinit for an uninitialized profile.
+    auto status = esp_bluedroid_get_status();
+    if (status == ESP_BLUEDROID_STATUS_ENABLED) {
+        if (esp_bluedroid_disable() != ESP_OK) return ESP_FAIL;
+        status = esp_bluedroid_get_status();
+    }
+    if (status == ESP_BLUEDROID_STATUS_INITIALIZED) {
+        if (esp_bluedroid_deinit() != ESP_OK) return ESP_FAIL;
+        status = esp_bluedroid_get_status();
+    }
+    if (status != ESP_BLUEDROID_STATUS_UNINITIALIZED) return ESP_FAIL;
+    WatchPairingGattServer::Get().HostStopped();
+#if CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS
+    WatchAndroidGattServer::Get().HostStopped();
+#endif
+    WatchAncsClient::Get().HostStopped();
+    return ESP_OK;
+}
+#endif
 #endif /* CONFIG_BT_BLUEDROID_ENABLED */
 
 #ifdef CONFIG_BT_NIMBLE_ENABLED
@@ -704,6 +939,27 @@ esp_err_t Blufi::_controller_init() {
 }
 
 esp_err_t Blufi::_controller_deinit() {
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    // Never tear down the radio beneath a host that still owns it.
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_UNINITIALIZED) return ESP_ERR_INVALID_STATE;
+    auto status = esp_bt_controller_get_status();
+    if (status == ESP_BT_CONTROLLER_STATUS_IDLE) return ESP_OK;
+    if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        const auto ret = esp_bt_controller_disable();
+        if (ret != ESP_OK) {
+            ESP_LOGE(BLUFI_TAG, "Controller disable failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        status = esp_bt_controller_get_status();
+    }
+    if (status != ESP_BT_CONTROLLER_STATUS_INITED) return ESP_ERR_INVALID_STATE;
+    const auto ret = esp_bt_controller_deinit();
+    if (ret != ESP_OK) {
+        ESP_LOGE(BLUFI_TAG, "Controller deinit failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    return esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE ? ESP_OK : ESP_FAIL;
+#else
     esp_err_t ret = esp_bt_controller_disable();
     if (ret) {
         ESP_LOGE(BLUFI_TAG, "%s disable controller failed: %s", __func__, esp_err_to_name(ret));
@@ -713,6 +969,7 @@ esp_err_t Blufi::_controller_deinit() {
         ESP_LOGE(BLUFI_TAG, "%s deinit controller failed: %s", __func__, esp_err_to_name(ret));
     }
     return ret;
+#endif
 }
 #endif
 
@@ -904,74 +1161,118 @@ int Blufi::_get_softap_conn_num() {
     return 0;
 }
 
+void Blufi::SuspendWifiProvisioning() {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (session_.IsActive()) session_.Activate(BlufiRole::kControlOnly);
+    std::lock_guard<std::mutex> scan_lock(scan_mutex_);
+    scan_ticket_ = 0;
+    m_scan_in_progress = false;
+    m_ap_records.clear();
+    // Saved SSIDs and the persistent BLE control connection remain intact.
+}
+
+bool Blufi::RunWithoutWifiProvisioning(const std::function<bool()>& operation) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    return !session_.AllowsProvisioning() && operation && operation();
+}
+
+uint64_t Blufi::AcquireControlLease() {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (control_lease_ || shutdown_failed_ || !IsControlReady() ||
+        session_.Role() != BlufiRole::kControlOnly || next_control_lease_ == UINT64_MAX) return 0;
+    control_lease_ = ++next_control_lease_;
+    return control_lease_;
+}
+
+bool Blufi::ReleaseControlLease(uint64_t lease) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (!lease || lease != control_lease_) return false;
+    control_lease_ = 0;
+    return true;
+}
+
 void Blufi::start_wifi_scan() {
-    ESP_LOGI(BLUFI_TAG, "Starting dedicated WiFi scan");
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    // BTC must not wait for an owner that is awaiting host shutdown on BTC.
+    std::unique_lock<std::mutex> lock(lifecycle_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        ESP_LOGW(BLUFI_TAG, "WiFi scan rejected while the BLE lifecycle is busy");
+        return;
+    }
+#else
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+#endif
+    GetWatchWifiGate().Run([this]() {
+        StartWifiScanAllowed();
+        return true;
+    });
+}
 
-    // Check if a scan is already in progress
+void Blufi::StartWifiScanAllowed() {
+    const auto peer = CaptureControlPeer();
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    if (!peer) return;
+#endif
+    if (!session_.AllowsProvisioning() || session_.IsConnecting()) {
+        return;
+    }
+    auto& wifi = WifiManager::GetInstance();
+    if (!wifi.IsInitialized()) {
+        WifiManagerConfig config;
+        config.ssid_prefix = session_.KeepsControl() ? "Audream" : "Xiaozhi";
+        if (!wifi.Initialize(config)) {
+            ESP_LOGE(BLUFI_TAG, "WiFi scan rejected: initialization failed");
+            return;
+        }
+    }
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_err_t result = esp_wifi_get_mode(&mode);
+    if (result != ESP_OK || mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) {
+        ESP_LOGW(BLUFI_TAG, "WiFi scan rejected: access point active or mode unavailable");
+        return;
+    }
+    wifi.StopStation();
+    if (mode == WIFI_MODE_NULL) {
+        result = esp_wifi_set_mode(WIFI_MODE_STA);
+    }
+    if (result == ESP_OK) {
+        result = esp_wifi_start();
+    }
+    if (result != ESP_OK) {
+        ESP_LOGE(BLUFI_TAG, "WiFi scan startup failed: %s", esp_err_to_name(result));
+        return;
+    }
+    std::lock_guard<std::mutex> lock(scan_mutex_);
     if (m_scan_in_progress) {
-        ESP_LOGW(BLUFI_TAG, "Scan already in progress, skipping");
         return;
     }
-
+    // Register once for both STA and provisioning scans; never change AP mode.
+    if (scan_event_instance_ == nullptr) {
+        result = esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
+            &Blufi::_wifi_scan_event_handler, this, &scan_event_instance_);
+        if (result != ESP_OK) {
+            ESP_LOGE(BLUFI_TAG, "WiFi scan callback registration failed: %s", esp_err_to_name(result));
+            return;
+        }
+    }
+    scan_ticket_ = session_.Snapshot();
+    scan_peer_ = peer;
     m_scan_in_progress = true;
-
-    // Get current WiFi mode
-    wifi_mode_t current_mode;
-    esp_err_t err = esp_wifi_get_mode(&current_mode);
-
-    if (current_mode == WIFI_MODE_AP) {
-        // If in AP mode, temporarily switch to APSTA to allow scanning
-        ESP_LOGI(BLUFI_TAG, "WiFi in AP mode");
-        err = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (err != ESP_OK) {
-            ESP_LOGE(BLUFI_TAG, "Failed to set WiFi mode to STA: %s", esp_err_to_name(err));
-            m_scan_in_progress = false;
-            return;
-        }
-        // Need to restart WiFi for mode change to take effect
-        err = esp_wifi_start();
-        if (err != ESP_OK) {
-            ESP_LOGE(BLUFI_TAG, "Failed to start WiFi after mode switch: %s", esp_err_to_name(err));
-            m_scan_in_progress = false;
-            return;
-        }
-        // Register scan event handler
-        esp_event_handler_instance_t scan_event_instance;
-        esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                            &Blufi::_wifi_scan_event_handler, this,
-                                            &scan_event_instance);
-
-        // Start scan
-        err = esp_wifi_scan_start(NULL, false);
-        if (err != ESP_OK) {
-            ESP_LOGE(BLUFI_TAG, "Failed to start WiFi scan: %s", esp_err_to_name(err));
-            m_scan_in_progress = false;
-            return;
-        }
-    } else if (current_mode == WIFI_MODE_STA) {
-        // Start scan
-        err = esp_wifi_scan_start(NULL, false);
-        if (err != ESP_OK) {
-            ESP_LOGE(BLUFI_TAG, "Failed to start WiFi scan: %s", esp_err_to_name(err));
-            m_scan_in_progress = false;
-            return;
-        }
-    } else {
-        ESP_LOGE(BLUFI_TAG, "Unexpected WiFi mode: %d", current_mode);
+    result = esp_wifi_scan_start(nullptr, false);
+    if (result != ESP_OK) {
         m_scan_in_progress = false;
-        return;
+        ESP_LOGE(BLUFI_TAG, "WiFi scan failed: %s", esp_err_to_name(result));
     }
-
-    ESP_LOGI(BLUFI_TAG, "WiFi scan started");
 }
 
 void Blufi::_send_wifi_list() {
-    if (m_ap_records.empty()) {
-        ESP_LOGW(BLUFI_TAG, "No AP records available to send");
+    std::lock_guard<std::mutex> lock(scan_mutex_);
+    if (!session_.AllowsProvisioning() || !session_.IsCurrent(scan_ticket_) || !IsControlPeerCurrent(scan_peer_)) {
+        m_ap_records.clear();
         return;
     }
 
-    ESP_LOGI(BLUFI_TAG, "Sending WiFi list with %d APs", m_ap_records.size());
+    ESP_LOGI(BLUFI_TAG, "Sending WiFi list with %u APs", static_cast<unsigned>(m_ap_records.size()));
 
     std::vector<esp_blufi_ap_record_t> blufi_ap_list;
     for (const auto& ap : m_ap_records) {
@@ -982,10 +1283,13 @@ void Blufi::_send_wifi_list() {
         blufi_ap_list.push_back(blufi_ap);
     }
 
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    audream_blufi_send_wifi_list_for_lease(scan_peer_.authorization, blufi_ap_list.size(), blufi_ap_list.data());
+#else
     esp_blufi_send_wifi_list(blufi_ap_list.size(), blufi_ap_list.data());
+#endif
 
     m_ap_records.clear();
-    start_wifi_scan();
 }
 
 void Blufi::_wifi_scan_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id,
@@ -993,37 +1297,159 @@ void Blufi::_wifi_scan_event_handler(void* arg, esp_event_base_t event_base, int
     Blufi* self = static_cast<Blufi*>(arg);
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
-        ESP_LOGI(BLUFI_TAG, "WiFi scan done");
+        {
+            std::lock_guard<std::mutex> lock(self->scan_mutex_);
+            if (!self->m_scan_in_progress) {
+                return;
+            }
+            self->m_scan_in_progress = false;
+            if (!self->session_.IsCurrent(self->scan_ticket_)) {
+                return;
+            }
+            uint16_t ap_num = 0;
+            esp_wifi_scan_get_ap_num(&ap_num);
+            ap_num = std::min<uint16_t>(ap_num, 32);
+            self->m_ap_records.resize(ap_num);
+            if (ap_num != 0 && esp_wifi_scan_get_ap_records(&ap_num, self->m_ap_records.data()) != ESP_OK) {
+                ap_num = 0;
+            }
+            self->m_ap_records.resize(ap_num);
+        }
+        self->_send_wifi_list();
+    }
+}
 
-        uint16_t ap_num = 0;
-        esp_wifi_scan_get_ap_num(&ap_num);
+struct Blufi::ConnectionRequest {
+    Blufi* owner;
+    BlufiSessionState::Ticket ticket = 0;
+    std::string ssid;
+    std::string password;
+    ControlTicket peer;
+};
 
-        if (ap_num == 0) {
-            ESP_LOGW(BLUFI_TAG, "No APs found");
-            self->m_ap_records.clear();
-        } else {
-            if (static_cast<Blufi*>(arg)->m_scan_should_save_ssid == true) {
-                self->m_ap_records.resize(ap_num);
-                esp_wifi_scan_get_ap_records(&ap_num, self->m_ap_records.data());
-
-                ESP_LOGI(BLUFI_TAG, "Found %d APs", ap_num);
-                for (const auto& ap : self->m_ap_records) {
-                    ESP_LOGI(BLUFI_TAG, "  SSID: %s, RSSI: %d, Authmode: %d", (char*)ap.ssid,
-                             ap.rssi, ap.authmode);
-                }
+void Blufi::ConnectToAccessPoint(ConnectionRequest& request) {
+    auto& wifi = WifiManager::GetInstance();
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (!session_.IsCurrent(request.ticket) || !IsControlPeerCurrent(request.peer)) {
+            session_.CompleteConnection(request.ticket, false);
+            return;
+        }
+        if (!wifi.IsInitialized()) {
+            WifiManagerConfig config;
+            config.ssid_prefix = session_.KeepsControl() ? "Audream" : "Xiaozhi";
+            if (!GetWatchWifiGate().Run([&]() { return wifi.Initialize(config); })) {
+                session_.CompleteConnection(request.ticket, false);
+                SendWifiReport(request.peer, WIFI_MODE_STA, ESP_BLUFI_STA_CONN_FAIL, 0, nullptr);
+                ESP_LOGE(BLUFI_TAG, "Failed to initialize WiFi for provisioning");
+                return;
             }
         }
-        self->m_scan_in_progress = false;
+        wifi_mode_t current_mode = WIFI_MODE_NULL;
+        if (esp_wifi_get_mode(&current_mode) != ESP_OK ||
+            current_mode == WIFI_MODE_AP || current_mode == WIFI_MODE_APSTA) {
+            session_.CompleteConnection(request.ticket, false);
+            SendWifiReport(request.peer, WIFI_MODE_STA, ESP_BLUFI_STA_CONN_FAIL, 0, nullptr);
+            ESP_LOGW(BLUFI_TAG, "WiFi provisioning rejected: access point active or mode unavailable");
+            return;
+        }
+        if (!GetWatchWifiGate().Run([&]() {
+            if (!IsControlPeerCurrent(request.peer)) return false;
+            SsidManager::GetInstance().AddSsid(request.ssid, request.password);
+            {
+                std::lock_guard<std::mutex> scan_lock(scan_mutex_);
+                m_scan_in_progress = false;
+                scan_ticket_ = 0;
+            }
+            esp_wifi_scan_stop();
+            if (wifi.IsConfigMode()) wifi.StopConfigAp();
+            wifi.StopStation();
+            wifi.StartStation();
+            return true;
+        })) {
+            session_.CompleteConnection(request.ticket, false);
+            SendWifiReport(request.peer, WIFI_MODE_STA, ESP_BLUFI_STA_CONN_FAIL, 0, nullptr);
+            return;
+        }
+    }
+
+    constexpr int kConnectTimeoutMs = 10000;
+    int waited_ms = 0;
+    while (waited_ms < kConnectTimeoutMs && GetWatchWifiGate().Enabled() && session_.IsCurrent(request.ticket) &&
+           IsControlPeerCurrent(request.peer) &&
+           (!wifi.IsConnected() || wifi.GetSsid() != request.ssid)) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        waited_ms += 200;
+    }
+
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (!session_.IsCurrent(request.ticket) || !IsControlPeerCurrent(request.peer)) {
+        session_.CompleteConnection(request.ticket, false);
+        ESP_LOGI(BLUFI_TAG, "Discarded stale WiFi provisioning result");
+        return;
+    }
+    // Auto-reconnect to another saved SSID is not success for this request.
+    const bool connected = GetWatchWifiGate().Enabled() && wifi.IsConnected() && wifi.GetSsid() == request.ssid;
+    if (!connected) {
+        GetWatchWifiGate().Run([&]() { wifi.StopStation(); return true; });
+    }
+    if (!session_.CompleteConnection(request.ticket, connected)) {
+        return;
+    }
+    esp_blufi_extra_info_t info{};
+    info.sta_ssid = reinterpret_cast<uint8_t*>(request.ssid.data());
+    info.sta_ssid_len = request.ssid.size();
+    wifi_ap_record_t ap_info{};
+    if (connected && esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        std::memcpy(info.sta_bssid, ap_info.bssid, sizeof(info.sta_bssid));
+        info.sta_bssid_set = true;
+    }
+    SendWifiReport(request.peer, GetWifiModeWithFallback(wifi),
+        connected ? ESP_BLUFI_STA_CONN_SUCCESS : ESP_BLUFI_STA_CONN_FAIL,
+        _get_softap_conn_num(), &info);
+    ESP_LOGI(BLUFI_TAG, "WiFi provisioning finished: connected=%d keep_control=%d",
+             connected, session_.KeepsControl());
+    if (connected && !session_.KeepsControl()) {
+        if (m_ble_is_connected) {
+            esp_blufi_disconnect();
+        } else {
+            DeinitLocked();
+        }
+    }
+}
+
+void Blufi::DisconnectStation(const ConnectionRequest& request) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (!session_.IsCurrent(request.ticket) || !IsControlPeerCurrent(request.peer)) {
+        return;
+    }
+    auto& wifi = WifiManager::GetInstance();
+    if (wifi.IsInitialized()) {
+        GetWatchWifiGate().Run([&]() { wifi.StopStation(); return true; });
     }
 }
 
 void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* param) {
-    if (control_only_mode_) {
+    const auto peer = CaptureControlPeer();
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    switch (event) {
+        case ESP_BLUFI_EVENT_INIT_FINISH:
+        case ESP_BLUFI_EVENT_DEINIT_FINISH:
+        case ESP_BLUFI_EVENT_BLE_CONNECT:
+        case ESP_BLUFI_EVENT_BLE_DISCONNECT:
+            break;
+        default:
+            if (!peer) {
+                ESP_LOGW(BLUFI_TAG, "Rejected BLUFI event without secure control authorization: event=%d", event);
+                return;
+            }
+    }
+#endif
+    if (!session_.AllowsProvisioning() || !GetWatchWifiGate().Enabled() || GetWatchWifiGate().TransferActive()) {
         switch (event) {
             case ESP_BLUFI_EVENT_SET_WIFI_OPMODE:
             case ESP_BLUFI_EVENT_REQ_CONNECT_TO_AP:
             case ESP_BLUFI_EVENT_REQ_DISCONNECT_FROM_AP:
-            case ESP_BLUFI_EVENT_GET_WIFI_STATUS:
             case ESP_BLUFI_EVENT_RECV_STA_BSSID:
             case ESP_BLUFI_EVENT_RECV_STA_SSID:
             case ESP_BLUFI_EVENT_RECV_STA_PASSWD:
@@ -1037,169 +1463,164 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
 
     switch (event) {
         case ESP_BLUFI_EVENT_INIT_FINISH:
-            ESP_LOGI(BLUFI_TAG, "BLUFI init finish");
-            StartAudreamBluFiAdvertising();
+            HandleProfileInitialized(param && param->init_finish.state == ESP_BLUFI_INIT_OK);
             break;
         case ESP_BLUFI_EVENT_DEINIT_FINISH:
+            control_session_.Reset();
             ESP_LOGI(BLUFI_TAG, "BLUFI deinit finish");
             break;
         case ESP_BLUFI_EVENT_BLE_CONNECT:
+            control_session_.Connected(param->connect.conn_id, param->connect.remote_bda);
             ESP_LOGI(BLUFI_TAG, "BLUFI ble connect");
             m_ble_is_connected = true;
+            session_.InvalidateRequests();
+            {
+                std::lock_guard<std::mutex> lock(credentials_mutex_);
+                m_sta_config = {};
+                m_ssid_valid = false;
+                m_password_valid = true;
+            }
             esp_blufi_adv_stop();
             _security_init();
             break;
         case ESP_BLUFI_EVENT_BLE_DISCONNECT:
+            control_session_.Reset();
             ESP_LOGI(BLUFI_TAG, "BLUFI ble disconnect");
             m_ble_is_connected = false;
+            session_.InvalidateRequests();
             _security_deinit();
-            if (control_only_mode_ || !m_provisioned) {
+            if (!session_.IsActive()) {
+                break;
+            }
+            if (session_.KeepsControl() || !session_.IsProvisioned()) {
                 StartAudreamBluFiAdvertising();
             } else {
                 esp_blufi_adv_stop();
-                if (!m_deinited) {
-                    xTaskCreate(
+                struct ShutdownRequest {
+                    Blufi* owner;
+                    BlufiSessionState::Ticket ticket;
+                };
+                auto* request = new (std::nothrow) ShutdownRequest{this, session_.Snapshot()};
+                if (request != nullptr) {
+                    if (xTaskCreate(
                         [](void* ctx) {
-                            static_cast<Blufi*>(ctx)->deinit();
+                            std::unique_ptr<ShutdownRequest> request(static_cast<ShutdownRequest*>(ctx));
+                            request->owner->DeinitCompletedProvisioning(request->ticket);
+                            request.reset();
                             vTaskDelete(nullptr);
                         },
-                        "blufi_deinit", 4096, this, 5, nullptr);
+                        "blufi_deinit", 4096, request, 5, nullptr) != pdPASS) {
+                        delete request;
+                        ESP_LOGE(BLUFI_TAG, "Failed to schedule BLUFI shutdown");
+                    }
+                } else {
+                    ESP_LOGE(BLUFI_TAG, "Failed to allocate BLUFI shutdown request");
                 }
             }
             break;
         case ESP_BLUFI_EVENT_SET_WIFI_OPMODE: {
             ESP_LOGI(BLUFI_TAG, "BLUFI Set WIFI opmode %d", param->wifi_mode.op_mode);
             auto& wifi_manager = WifiManager::GetInstance();
-            if (!wifi_manager.IsInitialized() && !wifi_manager.Initialize()) {
+            WifiManagerConfig config;
+            config.ssid_prefix = session_.KeepsControl() ? "Audream" : "Xiaozhi";
+            if (!wifi_manager.IsInitialized() &&
+                !GetWatchWifiGate().Run([&]() { return wifi_manager.Initialize(config); })) {
                 ESP_LOGE(BLUFI_TAG, "Failed to initialize WifiManager for opmode change");
+                break;
+            }
+            wifi_mode_t current_mode = WIFI_MODE_NULL;
+            if (esp_wifi_get_mode(&current_mode) != ESP_OK ||
+                current_mode == WIFI_MODE_AP || current_mode == WIFI_MODE_APSTA) {
+                ESP_LOGW(BLUFI_TAG, "WiFi mode change rejected: access point active or mode unavailable");
                 break;
             }
             switch (param->wifi_mode.op_mode) {
                 case WIFI_MODE_STA:
-                    wifi_manager.StartStation();
+                    // Do not auto-connect before the phone supplies credentials.
+                    // WifiStation would otherwise consume the BLUFI scan results.
+                    if (session_.IsConnecting() || wifi_manager.IsConfigMode()) {
+                        ESP_LOGW(BLUFI_TAG, "WiFi mode change rejected while network is busy");
+                        break;
+                    }
+                    if (!GetWatchWifiGate().Run([&]() {
+                        wifi_manager.StopStation();
+                        return esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK && esp_wifi_start() == ESP_OK;
+                    })) {
+                        ESP_LOGE(BLUFI_TAG, "Failed to prepare WiFi station for provisioning");
+                    }
                     break;
                 case WIFI_MODE_AP:
-                    wifi_manager.StartConfigAp();
-                    break;
                 case WIFI_MODE_APSTA:
-                    ESP_LOGW(BLUFI_TAG, "APSTA mode not supported, starting station only");
-                    wifi_manager.StartStation();
+                    ESP_LOGW(BLUFI_TAG, "AP mode changes are not permitted during BLUFI provisioning");
                     break;
                 default:
-                    wifi_manager.StopStation();
-                    wifi_manager.StopConfigAp();
+                    ESP_LOGW(BLUFI_TAG, "Unsupported WiFi provisioning mode");
                     break;
             }
             break;
         }
         case ESP_BLUFI_EVENT_REQ_CONNECT_TO_AP: {
-            ESP_LOGI(BLUFI_TAG, "BLUFI request wifi connect to AP via esp-wifi-connect");
-            std::string ssid(reinterpret_cast<const char*>(m_sta_config.sta.ssid));
-            std::string password(reinterpret_cast<const char*>(m_sta_config.sta.password));
-
-            SsidManager::GetInstance().AddSsid(ssid, password);
-            m_scan_should_save_ssid = false;
-
-            m_sta_ssid_len = static_cast<int>(std::min(ssid.size(), sizeof(m_sta_ssid)));
-            memcpy(m_sta_ssid, ssid.c_str(), m_sta_ssid_len);
-            memset(m_sta_bssid, 0, sizeof(m_sta_bssid));
-            m_sta_connected = false;
-            m_sta_got_ip = false;
-            m_sta_is_connecting = true;
+            auto request = std::unique_ptr<ConnectionRequest>(new (std::nothrow) ConnectionRequest{this, 0, {}, {}, peer});
+            if (!request) {
+                ESP_LOGE(BLUFI_TAG, "Failed to allocate WiFi provisioning request");
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lock(credentials_mutex_);
+                if (!m_ssid_valid || !m_password_valid) {
+                    ESP_LOGW(BLUFI_TAG, "WiFi provisioning rejected: invalid credentials");
+                    SendWifiReport(peer, WIFI_MODE_STA, ESP_BLUFI_STA_CONN_FAIL, 0, nullptr);
+                    break;
+                }
+                request->ssid = ReadWifiCredentialField(m_sta_config.sta.ssid);
+                request->password = ReadWifiCredentialField(m_sta_config.sta.password);
+            }
+            request->ticket = session_.BeginConnection();
+            if (request->ticket == 0) {
+                ESP_LOGW(BLUFI_TAG, "WiFi provisioning request ignored: inactive or already connecting");
+                break;
+            }
+            m_sta_ssid_len = request->ssid.size();
+            std::memcpy(m_sta_ssid, request->ssid.data(), m_sta_ssid_len);
             m_sta_conn_info = {};
             m_sta_conn_info.sta_ssid = m_sta_ssid;
             m_sta_conn_info.sta_ssid_len = m_sta_ssid_len;
-
-            auto& wifi_manager = WifiManager::GetInstance();
-
-            if (wifi_manager.IsInitialized()) {
-                if (wifi_manager.IsConfigMode()) {
-                    wifi_manager.StopConfigAp();
-                }
-                wifi_manager.StopStation();
-            }
-
-            if (!wifi_manager.IsInitialized() && !wifi_manager.Initialize()) {
-                ESP_LOGE(BLUFI_TAG, "Failed to initialize WifiManager");
-                break;
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(500));
-
-            wifi_manager.StartStation();
-
-            xTaskCreate(
-                [](void* ctx) {
-                    auto* self = static_cast<Blufi*>(ctx);
-                    auto& wifi = WifiManager::GetInstance();
-                    constexpr int kConnectTimeoutMs = 10000;
-                    constexpr TickType_t kDelayTick = pdMS_TO_TICKS(200);
-                    int waited_ms = 0;
-
-                    while (waited_ms < kConnectTimeoutMs && !wifi.IsConnected()) {
-                        vTaskDelay(kDelayTick);
-                        waited_ms += 200;
-                    }
-
-                    wifi_mode_t mode = GetWifiModeWithFallback(wifi);
-                    const int softap_conn_num = _get_softap_conn_num();
-
-                    if (wifi.IsConnected()) {
-                        self->m_sta_is_connecting = false;
-                        self->m_sta_connected = true;
-                        self->m_sta_got_ip = true;
-                        self->m_provisioned = true;
-
-                        auto current_ssid = wifi.GetSsid();
-                        if (!current_ssid.empty()) {
-                            self->m_sta_ssid_len = static_cast<int>(
-                                std::min(current_ssid.size(), sizeof(self->m_sta_ssid)));
-                            memcpy(self->m_sta_ssid, current_ssid.c_str(), self->m_sta_ssid_len);
-                        }
-
-                        wifi_ap_record_t ap_info{};
-                        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-                            memcpy(self->m_sta_bssid, ap_info.bssid, sizeof(self->m_sta_bssid));
-                        }
-
-                        esp_blufi_extra_info_t info = {};
-                        memcpy(info.sta_bssid, self->m_sta_bssid, sizeof(self->m_sta_bssid));
-                        info.sta_bssid_set = true;
-                        info.sta_ssid = self->m_sta_ssid;
-                        info.sta_ssid_len = self->m_sta_ssid_len;
-                        esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_SUCCESS,
-                                                        softap_conn_num, &info);
-                        ESP_LOGI(BLUFI_TAG, "connected to WiFi");
-
-                        if (self->m_ble_is_connected) {
-                            esp_blufi_disconnect();
-                        }
-                    } else {
-                        self->m_sta_is_connecting = false;
-                        self->m_sta_connected = false;
-                        self->m_sta_got_ip = false;
-
-                        esp_blufi_extra_info_t info = {};
-                        info.sta_ssid = self->m_sta_ssid;
-                        info.sta_ssid_len = self->m_sta_ssid_len;
-                        esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_FAIL,
-                                                        softap_conn_num, &info);
-                        ESP_LOGE(BLUFI_TAG, "Failed to connect to WiFi via esp-wifi-connect");
-                    }
+            const auto ticket = request->ticket;
+            auto* context = request.release();
+            if (xTaskCreate([](void* ctx) {
+                    std::unique_ptr<ConnectionRequest> request(static_cast<ConnectionRequest*>(ctx));
+                    request->owner->ConnectToAccessPoint(*request);
+                    request.reset();
                     vTaskDelete(nullptr);
-                },
-                "blufi_wifi_conn", 4096, this, 5, nullptr);
+                }, "blufi_wifi_conn", 4096, context, 5, nullptr) != pdPASS) {
+                delete context;
+                session_.CompleteConnection(ticket, false);
+                SendWifiReport(peer, WIFI_MODE_STA, ESP_BLUFI_STA_CONN_FAIL, 0, nullptr);
+                ESP_LOGE(BLUFI_TAG, "Failed to start WiFi provisioning task");
+            }
             break;
         }
-        case ESP_BLUFI_EVENT_REQ_DISCONNECT_FROM_AP:
+        case ESP_BLUFI_EVENT_REQ_DISCONNECT_FROM_AP: {
             ESP_LOGI(BLUFI_TAG, "BLUFI request wifi disconnect from AP");
-            if (WifiManager::GetInstance().IsInitialized()) {
-                WifiManager::GetInstance().StopStation();
-            }
-            m_sta_is_connecting = false;
+            session_.InvalidateRequests();
             m_sta_connected = false;
             m_sta_got_ip = false;
+            auto* request = new (std::nothrow) ConnectionRequest{this, session_.Snapshot(), {}, {}, peer};
+            if (request == nullptr) {
+                ESP_LOGE(BLUFI_TAG, "Failed to allocate WiFi disconnect request");
+                break;
+            }
+            if (xTaskCreate([](void* ctx) {
+                    std::unique_ptr<ConnectionRequest> request(static_cast<ConnectionRequest*>(ctx));
+                    request->owner->DisconnectStation(*request);
+                    request.reset();
+                    vTaskDelete(nullptr);
+                }, "blufi_wifi_stop", 4096, request, 5, nullptr) != pdPASS) {
+                delete request;
+                ESP_LOGE(BLUFI_TAG, "Failed to schedule WiFi disconnect");
+            }
             break;
+        }
         case ESP_BLUFI_EVENT_RECV_CUSTOM_DATA: {
             char opcode_buffer[8] = {};
             ESP_LOGI(
@@ -1243,41 +1664,42 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
                 memcpy(info.sta_bssid, m_sta_bssid, 6);
                 info.sta_ssid = m_sta_ssid;
                 info.sta_ssid_len = m_sta_ssid_len;
-                esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_SUCCESS, softap_conn_num,
+                SendWifiReport(peer, mode, ESP_BLUFI_STA_CONN_SUCCESS, softap_conn_num,
                                                 &info);
-            } else if (m_sta_is_connecting) {
-                esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONNECTING, softap_conn_num,
+            } else if (session_.IsConnecting()) {
+                SendWifiReport(peer, mode, ESP_BLUFI_STA_CONNECTING, softap_conn_num,
                                                 &m_sta_conn_info);
             } else {
-                esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_FAIL, softap_conn_num,
+                SendWifiReport(peer, mode, ESP_BLUFI_STA_CONN_FAIL, softap_conn_num,
                                                 &m_sta_conn_info);
             }
             ESP_LOGI(BLUFI_TAG, "BLUFI get wifi status");
             break;
         }
-        case ESP_BLUFI_EVENT_RECV_STA_BSSID:
+        case ESP_BLUFI_EVENT_RECV_STA_BSSID: {
+            std::lock_guard<std::mutex> lock(credentials_mutex_);
             memcpy(m_sta_config.sta.bssid, param->sta_bssid.bssid, 6);
             m_sta_config.sta.bssid_set = true;
             ESP_LOGI(BLUFI_TAG, "Recv STA BSSID");
             break;
-        case ESP_BLUFI_EVENT_RECV_STA_SSID:
-            strncpy((char*)m_sta_config.sta.ssid, (char*)param->sta_ssid.ssid,
-                    param->sta_ssid.ssid_len);
-            m_sta_config.sta.ssid[param->sta_ssid.ssid_len] = '\0';
-            ESP_LOGI(BLUFI_TAG, "Recv STA SSID: %s", m_sta_config.sta.ssid);
+        }
+        case ESP_BLUFI_EVENT_RECV_STA_SSID: {
+            std::lock_guard<std::mutex> lock(credentials_mutex_);
+            m_ssid_valid = CopyWifiCredentialField(m_sta_config.sta.ssid,
+                param->sta_ssid.ssid, param->sta_ssid.ssid_len, false);
+            ESP_LOGI(BLUFI_TAG, "Received WiFi SSID: bytes=%u valid=%d",
+                     static_cast<unsigned>(param->sta_ssid.ssid_len), m_ssid_valid);
             break;
-        case ESP_BLUFI_EVENT_RECV_STA_PASSWD:
-            strncpy((char*)m_sta_config.sta.password, (char*)param->sta_passwd.passwd,
-                    param->sta_passwd.passwd_len);
-            m_sta_config.sta.password[param->sta_passwd.passwd_len] = '\0';
-            ESP_LOGI(BLUFI_TAG, "Recv STA PASSWORD : %s", m_sta_config.sta.password);
+        }
+        case ESP_BLUFI_EVENT_RECV_STA_PASSWD: {
+            std::lock_guard<std::mutex> lock(credentials_mutex_);
+            m_password_valid = CopyWifiCredentialField(m_sta_config.sta.password,
+                param->sta_passwd.passwd, param->sta_passwd.passwd_len, true);
+            ESP_LOGI(BLUFI_TAG, "Received WiFi password: valid=%d", m_password_valid);
             break;
+        }
         case ESP_BLUFI_EVENT_GET_WIFI_LIST: {
-            ESP_LOGI(BLUFI_TAG, "BLUFI get wifi list");
-            while (m_scan_in_progress) {
-                vTaskDelay(pdMS_TO_TICKS(500));
-            }
-            _send_wifi_list();
+            start_wifi_scan();
             break;
         }
         default:

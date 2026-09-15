@@ -1,5 +1,7 @@
 #include "backlight.h"
 #include "settings.h"
+#include "board.h"
+#include "watch/watch_level_settings.h"
 
 #include <esp_log.h>
 #include <driver/ledc.h>
@@ -30,6 +32,12 @@ Backlight::~Backlight() {
 }
 
 void Backlight::RestoreBrightness() {
+    if (Board::GetInstance().GetRuntimeProfile() == BoardRuntimeProfile::kWatchAssistantRecorder) {
+        const int saved = ReadWatchLevel(WatchLevel::kBrightness);
+        if (saved < 0) ESP_LOGE(TAG, "Watch brightness could not be restored; using a visible fallback");
+        SetBrightness(saved < 0 ? 75 : saved);
+        return;
+    }
     // Load brightness from settings
     Settings settings("display");  
     int saved_brightness = settings.GetInt("brightness", 75);
@@ -118,4 +126,3 @@ void PwmBacklight::SetBrightnessImpl(uint8_t brightness) {
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty_cycle);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
-

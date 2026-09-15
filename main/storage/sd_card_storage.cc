@@ -1018,54 +1018,33 @@ bool SdCardStorage::GetRecordingFilePath(
 }
 
 bool SdCardStorage::DeleteRecording(const std::string& recording_id) {
+    // Preserve the existing BLE contract; watch UI consumes the detailed outcome.
+    return DeleteRecordingChecked(recording_id).audio_removed;
+}
+
+RecordingDeleteResult SdCardStorage::DeleteRecordingChecked(const std::string& recording_id,
+    uint64_t expected_bytes, bool metadata_only) {
     ScopedStorageBusy storage_busy;
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!IsSafeRecordingID(recording_id) || !GetStatus().mounted) {
-        return false;
+        return {};
     }
-
-    const std::string audio_path = BuildRecordingPath(recording_id);
-    struct stat audio_stat = {};
-    if (stat(audio_path.c_str(), &audio_stat) != 0 || !S_ISREG(audio_stat.st_mode)) {
-        return false;
-    }
-    if (unlink(audio_path.c_str()) != 0) {
-        ESP_LOGE(
-            kTag,
-            "Failed to delete recording audio file: path=%s error=%s",
-            audio_path.c_str(),
-            std::strerror(errno)
-        );
-        return false;
-    }
-
-    const std::string metadata_path = audio_path + ".json";
-    struct stat metadata_stat = {};
-    const bool metadata_exists = stat(metadata_path.c_str(), &metadata_stat) == 0;
-    if (metadata_exists && unlink(metadata_path.c_str()) != 0) {
-        ESP_LOGW(
-            kTag,
-            "Recording audio was deleted but metadata deletion failed: path=%s error=%s",
-            metadata_path.c_str(),
-            std::strerror(errno)
-        );
-    }
-
-    const uint64_t deleted_bytes = static_cast<uint64_t>(audio_stat.st_size) +
-        (metadata_exists ? static_cast<uint64_t>(metadata_stat.st_size) : 0);
+    RecordingDeleteIo io;
+    const auto result = DeleteRecordingFiles(BuildRecordingPath(recording_id), expected_bytes, metadata_only, io);
+    const auto deleted_bytes = result.removed_bytes;
     cached_status_.recording_bytes =
         deleted_bytes >= cached_status_.recording_bytes
             ? 0
             : cached_status_.recording_bytes - deleted_bytes;
-    cached_status_.free_bytes = std::min(
-        cached_status_.total_bytes,
-        cached_status_.free_bytes + deleted_bytes
-    );
+    const auto free = std::min(cached_status_.free_bytes, cached_status_.total_bytes);
+    cached_status_.free_bytes = free + std::min(deleted_bytes, cached_status_.total_bytes - free);
     cached_status_.estimated_remaining_minutes = static_cast<uint32_t>(
         cached_status_.free_bytes / kEstimatedOpusBytesPerMinute
     );
-    ESP_LOGI(kTag, "Deleted synchronized recording: %s", recording_id.c_str());
-    return true;
+    ESP_LOGI(kTag, "Recording deletion: id=%s status=%d audio_removed=%d removed_bytes=%llu",
+        recording_id.c_str(), static_cast<int>(result.status), result.audio_removed,
+        static_cast<unsigned long long>(deleted_bytes));
+    return result;
 }
 
 bool SdCardStorage::ReadRecordingChunk(

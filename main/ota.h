@@ -7,6 +7,8 @@
 #include <esp_err.h>
 #include "board.h"
 
+namespace firmware_release { class Verified; struct CheckResult; struct InstallResult; }
+
 class Ota {
 public:
     Ota();
@@ -22,7 +24,13 @@ public:
     bool HasServerTime() { return has_server_time_; }
     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
     static bool Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback);
-    void MarkCurrentVersionValid();
+    static bool UpgradeSigned(const std::string& manifest_url, std::function<void(int, size_t)> callback);
+    static firmware_release::CheckResult CheckSignedRelease(std::function<bool()> cancelled = {});
+    static bool UpgradeSignedEnvelope(const std::string& envelope, std::function<void(int, size_t)> callback,
+                                     std::function<bool()> cancelled = {}, std::function<bool()> before_commit = {});
+    static firmware_release::InstallResult InstallSignedEnvelope(const std::string& envelope,
+        std::function<void(int, size_t)> callback, std::function<bool()> cancelled = {}, std::function<bool()> before_commit = {});
+    static bool MarkCurrentVersionValid();
 
     const std::string& GetFirmwareVersion() const { return firmware_version_; }
     const std::string& GetCurrentVersion() const { return current_version_; }
@@ -32,6 +40,12 @@ public:
     std::string GetCheckVersionUrl();
 
 private:
+    static firmware_release::CheckResult ReadSignedRelease(const std::string& url, bool allow_no_update,
+                                                           const std::function<bool()>& cancelled);
+    static bool UpgradeImage(const std::string& url, std::function<void(int, size_t)> callback,
+                             const firmware_release::Verified* release,
+                             const std::function<bool()>& cancelled = {}, const std::function<bool()>& before_commit = {},
+                             bool* resources_released = nullptr);
     std::string activation_message_;
     std::string activation_code_;
     bool has_new_version_ = false;

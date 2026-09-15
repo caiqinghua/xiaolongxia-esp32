@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "recording_file_deletion.h"
 
 enum class StorageStatusErrorCode : uint32_t {
     kNone = 0,
@@ -64,6 +65,8 @@ public:
         uint32_t& total_size
     );
     bool DeleteRecording(const std::string& recording_id);
+    RecordingDeleteResult DeleteRecordingChecked(const std::string& recording_id,
+        uint64_t expected_bytes = 0, bool metadata_only = false);
     bool ReadRecordingChunk(
         const std::string& recording_id,
         uint32_t offset,

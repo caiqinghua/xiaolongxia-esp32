@@ -1,264 +1,328 @@
 #include "afe_wake_word.h"
-#include "audio_service.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <esp_opus_enc.h>
+#include <freertos/idf_additions.h>
+#include <algorithm>
+#include <chrono>
 #include <sstream>
 
-#define DETECTION_RUNNING_EVENT 1
-
-#define TAG "AfeWakeWord"
-
-AfeWakeWord::AfeWakeWord()
-    : afe_data_(nullptr),
-      wake_word_pcm_(),
-      wake_word_opus_() {
-
-    event_group_ = xEventGroupCreate();
+namespace {
+constexpr auto TAG = "AfeWakeWord";
+constexpr size_t kPrerollSamples = 32000;
+constexpr int kFrameSamples = 960;
+constexpr uint32_t kDrainMs = 3000;
 }
 
-AfeWakeWord::~AfeWakeWord() {
-    if (afe_data_ != nullptr) {
-        afe_iface_->destroy(afe_data_);
+bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models) {
+    std::lock_guard<std::timed_mutex> lifecycle(lifecycle_mutex_);
+    if (afe_data_) return codec_ == codec;
+    if (!codec || codec->input_channels() <= (codec->input_reference() ? 1 : 0) ||
+        codec->input_channels() > 4) return false;
+    // ESP-SR's model list is process-wide and shared with the speech processor.
+    if (!models) models = esp_srmodel_init("model");
+    if (!models) return false;
+    std::string format(codec->input_channels() - (codec->input_reference() ? 1 : 0), 'M');
+    if (codec->input_reference()) format.push_back('R');
+    auto* config = afe_config_init(format.c_str(), models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+    if (!config) return false;
+    wake_words_.clear();
+    for (auto* name : {config->wakenet_model_name, config->wakenet_model_name_2}) {
+        std::vector<std::string> words;
+        const char* text = name ? esp_srmodel_get_wake_words(models, name) : nullptr;
+        if (text) {
+            std::stringstream stream(text);
+            std::string word;
+            while (std::getline(stream, word, ';')) words.push_back(word);
+        }
+        wake_words_.push_back(std::move(words));
     }
-
-    if (wake_word_encode_task_stack_ != nullptr) {
-        heap_caps_free(wake_word_encode_task_stack_);
-    }
-
-    if (wake_word_encode_task_buffer_ != nullptr) {
-        heap_caps_free(wake_word_encode_task_buffer_);
-    }
-
-    if (models_ != nullptr) {
-        esp_srmodel_deinit(models_);
-    }
-
-    vEventGroupDelete(event_group_);
-}
-
-bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
-    codec_ = codec;
-    int ref_num = codec_->input_reference() ? 1 : 0;
-
-    if (models_list == nullptr) {
-        models_ = esp_srmodel_init("model");
-    } else {
-        models_ = models_list;
-    }
-
-    if (models_ == nullptr || models_->num == -1) {
-        ESP_LOGE(TAG, "Failed to initialize wakenet model");
+    if (wake_words_[0].empty()) {
+        afe_config_free(config);
+        ESP_LOGE(TAG, "No configured wake-word model is available");
         return false;
     }
-    for (int i = 0; i < models_->num; i++) {
-        ESP_LOGI(TAG, "Model %d: %s", i, models_->model_name[i]);
-        if (strstr(models_->model_name[i], ESP_WN_PREFIX) != NULL) {
-            wakenet_model_ = models_->model_name[i];
-            auto words = esp_srmodel_get_wake_words(models_, wakenet_model_);
-            // split by ";" to get all wake words
-            std::stringstream ss(words);
-            std::string word;
-            while (std::getline(ss, word, ';')) {
-                wake_words_.push_back(word);
-            }
-        }
+    config->aec_init = codec->input_reference();
+    config->aec_mode = AEC_MODE_SR_HIGH_PERF;
+    config->afe_perferred_core = 1;
+    config->afe_perferred_priority = 1;
+    config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    afe_iface_ = esp_afe_handle_from_config(config);
+    if (afe_iface_) afe_data_ = afe_iface_->create_from_config(config);
+    afe_config_free(config);
+    if (afe_data_ && (afe_iface_->get_feed_chunksize(afe_data_) <= 0 ||
+        afe_iface_->get_feed_chunksize(afe_data_) > static_cast<int>(kPrerollSamples) ||
+        afe_iface_->get_fetch_chunksize(afe_data_) <= 0 ||
+        afe_iface_->get_fetch_chunksize(afe_data_) > static_cast<int>(kPrerollSamples))) {
+        afe_iface_->destroy(afe_data_);
+        afe_data_ = nullptr;
     }
-
-    std::string input_format;
-    for (int i = 0; i < codec_->input_channels() - ref_num; i++) {
-        input_format.push_back('M');
+    if (!afe_data_) return false;
+    codec_ = codec;
+    worker_exited_ = false;
+    // One owned worker serializes fetch and preroll encoding. The SDK owns its
+    // PSRAM stack; it is never freed while the task is still alive.
+    if (xTaskCreateWithCaps([](void* arg) {
+            static_cast<AfeWakeWord*>(arg)->Worker();
+            vTaskDeleteWithCaps(nullptr);
+        }, "wake_word", 24576, this, 5, nullptr, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        worker_exited_ = true;
+        afe_iface_->destroy(afe_data_);
+        afe_data_ = nullptr;
+        codec_ = nullptr;
+        ESP_LOGE(TAG, "Wake-word worker creation failed");
+        return false;
     }
-    for (int i = 0; i < ref_num; i++) {
-        input_format.push_back('R');
-    }
-    afe_config_t* afe_config = afe_config_init(input_format.c_str(), models_, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
-    afe_config->aec_init = codec_->input_reference();
-    afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;
-    afe_config->afe_perferred_core = 1;
-    afe_config->afe_perferred_priority = 1;  // Higher priority for AFE processing
-    afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
-
-    afe_iface_ = esp_afe_handle_from_config(afe_config);
-    afe_data_ = afe_iface_->create_from_config(afe_config);
-
-    // Increase task priority to ensure timely fetch() calls
-    xTaskCreate([](void* arg) {
-        auto this_ = (AfeWakeWord*)arg;
-        this_->AudioDetectionTask();
-        vTaskDelete(NULL);
-    }, "audio_detection", 4096, this, 5, nullptr);  // Increased priority from 3 to 5
-
     return true;
 }
 
-void AfeWakeWord::OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) {
-    wake_word_detected_callback_ = callback;
+AfeWakeWord::~AfeWakeWord() {
+    {
+        std::unique_lock<std::mutex> lock(state_mutex_);
+        shutdown_ = true;
+        running_ = false;
+        ++generation_;
+        state_cv_.notify_all();
+        state_cv_.wait(lock, [this]() { return worker_exited_; });
+    }
+    std::lock_guard<std::timed_mutex> input(input_mutex_);
+    if (afe_data_) afe_iface_->destroy(afe_data_);
 }
 
-void AfeWakeWord::Start() {
-    xEventGroupSetBits(event_group_, DETECTION_RUNNING_EVENT);
+void AfeWakeWord::OnWakeWordDetected(std::function<void(const std::string&)> callback) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    callback_ = std::move(callback);
+}
+
+void AfeWakeWord::Start() { (void)StartChecked(); }
+
+bool AfeWakeWord::StartChecked() {
+    std::lock_guard<std::timed_mutex> lifecycle(lifecycle_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!afe_data_ || worker_exited_ || stopping_ || shutdown_) return false;
+        if (running_) return true;
+    }
+    if (!Halt(kDrainMs, true)) return false;
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    running_ = true;
+    state_cv_.notify_all();
+    return true;
 }
 
 void AfeWakeWord::Stop() {
-    xEventGroupClearBits(event_group_, DETECTION_RUNNING_EVENT);
+    std::lock_guard<std::timed_mutex> lifecycle(lifecycle_mutex_);
+    if (!Halt(kDrainMs, false)) ESP_LOGE(TAG, "Wake-word stop failed; restart remains inhibited");
+}
 
-    std::lock_guard<std::mutex> lock(input_buffer_mutex_);
-    if (afe_data_ != nullptr) {
-        afe_iface_->reset_buffer(afe_data_);
+bool AfeWakeWord::StopAndDrain(uint32_t timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    std::unique_lock<std::timed_mutex> lifecycle(lifecycle_mutex_, std::defer_lock);
+    if (!lifecycle.try_lock_until(deadline)) return false;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now()).count();
+    return Halt(static_cast<uint32_t>(std::max<int64_t>(0, remaining)), true);
+}
+
+bool AfeWakeWord::Halt(uint32_t timeout_ms, bool discard_pcm) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    {
+        std::unique_lock<std::mutex> lock(state_mutex_);
+        running_ = false;
+        stopping_ = true;
+        ++generation_;
+        encode_requested_ = false;
+        encode_done_ = true;
+        encode_pcm_.clear();
+        opus_.clear();
+        if (discard_pcm) { pcm_.clear(); pcm_samples_ = 0; }
+        state_cv_.notify_all();
+        if (!state_cv_.wait_until(lock, deadline, [this]() { return !worker_active_; })) return false;
+    }
+    std::unique_lock<std::timed_mutex> input(input_mutex_, std::defer_lock);
+    if (!input.try_lock_until(deadline)) return false;
+    if (afe_data_ && afe_iface_->reset_buffer(afe_data_) < 0) {
+        ESP_LOGE(TAG, "Wake-word buffer reset failed; restart remains inhibited");
+        return false;
     }
     input_buffer_.clear();
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    stopping_ = false;
+    return true;
 }
 
 void AfeWakeWord::Feed(const std::vector<int16_t>& data) {
-    if (afe_data_ == nullptr) {
-        return;
+    std::lock_guard<std::timed_mutex> input(input_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!running_ || stopping_ || shutdown_) return;
     }
-
-    std::lock_guard<std::mutex> lock(input_buffer_mutex_);
-    // Check running state inside lock to avoid TOCTOU race with Stop()
-    if (!(xEventGroupGetBits(event_group_) & DETECTION_RUNNING_EVENT)) {
-        return;
-    }
+    const size_t channels = codec_->input_channels();
+    if (data.size() % channels != 0 || data.size() > kPrerollSamples * channels) return;
+    const size_t chunk = GetFeedSize() * channels;
     input_buffer_.insert(input_buffer_.end(), data.begin(), data.end());
-    size_t chunk_size = afe_iface_->get_feed_chunksize(afe_data_) * codec_->input_channels();
-    while (input_buffer_.size() >= chunk_size) {
+    while (input_buffer_.size() >= chunk) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!running_ || stopping_ || shutdown_) break;
+        }
         afe_iface_->feed(afe_data_, input_buffer_.data());
-        input_buffer_.erase(input_buffer_.begin(), input_buffer_.begin() + chunk_size);
+        input_buffer_.erase(input_buffer_.begin(), input_buffer_.begin() + chunk);
     }
 }
 
 size_t AfeWakeWord::GetFeedSize() {
-    if (afe_data_ == nullptr) {
-        return 0;
-    }
-    return afe_iface_->get_feed_chunksize(afe_data_);
+    return afe_data_ ? afe_iface_->get_feed_chunksize(afe_data_) : 0;
 }
 
-void AfeWakeWord::AudioDetectionTask() {
-    auto fetch_size = afe_iface_->get_fetch_chunksize(afe_data_);
-    auto feed_size = afe_iface_->get_feed_chunksize(afe_data_);
-    ESP_LOGI(TAG, "Audio detection task started, feed size: %d fetch size: %d",
-        feed_size, fetch_size);
+void AfeWakeWord::StorePcmLocked(const int16_t* data, size_t samples) {
+    pcm_.emplace_back(data, data + samples);
+    pcm_samples_ += samples;
+    while (pcm_samples_ > kPrerollSamples) {
+        const size_t drop = std::min(pcm_.front().size(), pcm_samples_ - kPrerollSamples);
+        if (drop == pcm_.front().size()) pcm_.pop_front();
+        else pcm_.front().erase(pcm_.front().begin(), pcm_.front().begin() + drop);
+        pcm_samples_ -= drop;
+    }
+}
 
+void AfeWakeWord::Worker() {
+    std::unique_lock<std::mutex> lock(state_mutex_);
     while (true) {
-        xEventGroupWaitBits(event_group_, DETECTION_RUNNING_EVENT, pdFALSE, pdTRUE, portMAX_DELAY);
-
-        auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
-        if (res == nullptr || res->ret_value == ESP_FAIL) {
-            continue;;
-        }
-
-        // Store the wake word data for voice recognition, like who is speaking
-        StoreWakeWordData(res->data, res->data_size / sizeof(int16_t));
-
-        if (res->wakeup_state == WAKENET_DETECTED) {
-            Stop();
-            last_detected_wake_word_ = wake_words_[res->wakenet_model_index - 1];
-
-            if (wake_word_detected_callback_) {
-                wake_word_detected_callback_(last_detected_wake_word_);
+        state_cv_.wait(lock, [this]() { return running_ || encode_requested_ || shutdown_; });
+        if (shutdown_) break;
+        worker_active_ = true;
+        const auto generation = generation_;
+        if (encode_requested_) {
+            encode_requested_ = false;
+            encoding_ = true;
+            auto pcm = std::move(encode_pcm_);
+            lock.unlock();
+            Encode(std::move(pcm), generation);
+            lock.lock();
+            encoding_ = false;
+            if (generation == generation_) encode_done_ = true;
+        } else {
+            lock.unlock();
+            auto* result = afe_iface_->fetch_with_delay(afe_data_, pdMS_TO_TICKS(100));
+            lock.lock();
+            if (running_ && generation == generation_ && !shutdown_ && result &&
+                result->ret_value != ESP_FAIL && result->data && result->data_size > 0 &&
+                result->data_size % sizeof(int16_t) == 0 &&
+                result->data_size / sizeof(int16_t) <= kPrerollSamples) {
+                StorePcmLocked(result->data, result->data_size / sizeof(int16_t));
+                const int64_t model = static_cast<int64_t>(result->wakenet_model_index) - 1;
+                const int64_t word = static_cast<int64_t>(result->wake_word_index) - 1;
+                if (result->wakeup_state == WAKENET_DETECTED && model >= 0 && word >= 0 &&
+                    static_cast<size_t>(model) < wake_words_.size() &&
+                    static_cast<size_t>(word) < wake_words_[model].size() &&
+                    !wake_words_[model][word].empty()) {
+                    running_ = false;
+                    last_detected_wake_word_ = wake_words_[model][word];
+                    const auto detected = last_detected_wake_word_;
+                    const auto callback = callback_;
+                    lock.unlock();
+                    // StopAndDrain waits for this callback as well as fetch/encode.
+                    if (callback) callback(detected);
+                    lock.lock();
+                }
             }
         }
+        worker_active_ = false;
+        state_cv_.notify_all();
     }
-}
-
-void AfeWakeWord::StoreWakeWordData(const int16_t* data, size_t samples) {
-    // store audio data to wake_word_pcm_
-    wake_word_pcm_.emplace_back(std::vector<int16_t>(data, data + samples));
-    // keep about 2 seconds of data, detect duration is 30ms (sample_rate == 16000, chunksize == 512)
-    while (wake_word_pcm_.size() > 2000 / 30) {
-        wake_word_pcm_.pop_front();
-    }
+    worker_exited_ = true;
+    state_cv_.notify_all();
 }
 
 void AfeWakeWord::EncodeWakeWordData() {
-    const size_t stack_size = 4096 * 6;
-    wake_word_opus_.clear();
-    if (wake_word_encode_task_stack_ == nullptr) {
-        wake_word_encode_task_stack_ = (StackType_t*)heap_caps_malloc(stack_size, MALLOC_CAP_SPIRAM);
-        assert(wake_word_encode_task_stack_ != nullptr);
-    }
-    if (wake_word_encode_task_buffer_ == nullptr) {
-        wake_word_encode_task_buffer_ = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-        assert(wake_word_encode_task_buffer_ != nullptr);
-    }
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!afe_data_ || worker_exited_ || shutdown_ || stopping_ || encoding_ || encode_requested_ ||
+        pcm_samples_ == 0) return;
+    running_ = false;
+    ++generation_;
+    opus_.clear();
+    encode_pcm_.clear();
+    encode_pcm_.reserve(pcm_samples_);
+    for (const auto& pcm : pcm_) encode_pcm_.insert(encode_pcm_.end(), pcm.begin(), pcm.end());
+    pcm_.clear();
+    pcm_samples_ = 0;
+    encode_done_ = encode_pcm_.empty();
+    encode_requested_ = !encode_done_;
+    state_cv_.notify_all();
+}
 
-    wake_word_encode_task_ = xTaskCreateStatic([](void* arg) {
-        auto this_ = (AfeWakeWord*)arg;
-        {
-            auto start_time = esp_timer_get_time();
-            // Create encoder
-            esp_opus_enc_config_t opus_enc_cfg = AS_OPUS_ENC_CONFIG();
-            void* encoder_handle = nullptr;
-            auto ret = esp_opus_enc_open(&opus_enc_cfg, sizeof(esp_opus_enc_config_t), &encoder_handle);
-            if (encoder_handle == nullptr) {
-                ESP_LOGE(TAG, "Failed to create audio encoder, error code: %d", ret);
-                std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
-                this_->wake_word_opus_.push_back(std::vector<uint8_t>());
-                this_->wake_word_cv_.notify_all();
-                return;
-            }
-            
-            // Get frame size
-            int frame_size = 0;
-            int outbuf_size = 0;
-            esp_opus_enc_get_frame_size(encoder_handle, &frame_size, &outbuf_size);
-            frame_size = frame_size / sizeof(int16_t);
-            
-            // Encode all PCM data
-            int packets = 0;
-            std::vector<int16_t> in_buffer;
+bool AfeWakeWord::IsCurrent(uint64_t generation) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return generation == generation_ && !stopping_ && !shutdown_;
+}
+
+void AfeWakeWord::Encode(std::vector<int16_t> pcm, uint64_t generation) {
+    if (!IsCurrent(generation)) return;
+    esp_opus_enc_config_t config = {};
+    config.sample_rate = 16000;
+    config.channel = 1;
+    config.bits_per_sample = 16;
+    config.bitrate = ESP_OPUS_BITRATE_AUTO;
+    config.frame_duration = ESP_OPUS_ENC_FRAME_DURATION_60_MS;
+    config.application_mode = ESP_OPUS_ENC_APPLICATION_AUDIO;
+    config.enable_dtx = true;
+    config.enable_vbr = true;
+    void* encoder = nullptr;
+    const auto opened = esp_opus_enc_open(&config, sizeof(config), &encoder);
+    if (opened != ESP_AUDIO_ERR_OK || !encoder) {
+        if (encoder) esp_opus_enc_close(encoder);
+        ESP_LOGE(TAG, "Wake-word encoder creation failed");
+        return;
+    }
+    int frame_bytes = 0, buffer_bytes = 0;
+    const auto sized = esp_opus_enc_get_frame_size(encoder, &frame_bytes, &buffer_bytes);
+    if (sized == ESP_AUDIO_ERR_OK && frame_bytes == kFrameSamples * sizeof(int16_t) &&
+        buffer_bytes > 0 && buffer_bytes <= 4096) {
+        for (size_t offset = 0; offset + kFrameSamples <= pcm.size() && IsCurrent(generation);
+            offset += kFrameSamples) {
+            std::vector<uint8_t> packet(buffer_bytes);
             esp_audio_enc_in_frame_t in = {};
+            in.buffer = reinterpret_cast<uint8_t*>(pcm.data() + offset);
+            in.len = frame_bytes;
             esp_audio_enc_out_frame_t out = {};
-            
-            for (auto& pcm: this_->wake_word_pcm_) {
-                if (in_buffer.empty()) {
-                    in_buffer = std::move(pcm);
-                } else {
-                    in_buffer.reserve(in_buffer.size() + pcm.size());
-                    in_buffer.insert(in_buffer.end(), pcm.begin(), pcm.end());
-                }
-                
-                while (in_buffer.size() >= frame_size) {
-                    std::vector<uint8_t> opus_buf(outbuf_size);
-                    in.buffer = (uint8_t *)(in_buffer.data());
-                    in.len = (uint32_t)(frame_size * sizeof(int16_t));
-                    out.buffer = opus_buf.data();
-                    out.len = outbuf_size;
-                    out.encoded_bytes = 0;
-                    
-                    ret = esp_opus_enc_process(encoder_handle, &in, &out);
-                    if (ret == ESP_AUDIO_ERR_OK) {
-                        std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
-                        this_->wake_word_opus_.emplace_back(opus_buf.data(), opus_buf.data() + out.encoded_bytes);
-                        this_->wake_word_cv_.notify_all();
-                        packets++;
-                    } else {
-                        ESP_LOGE(TAG, "Failed to encode audio, error code: %d", ret);
-                    }
-                    
-                    in_buffer.erase(in_buffer.begin(), in_buffer.begin() + frame_size);
-                }
+            out.buffer = packet.data();
+            out.len = buffer_bytes;
+            if (esp_opus_enc_process(encoder, &in, &out) != ESP_AUDIO_ERR_OK ||
+                out.encoded_bytes <= 0 || out.encoded_bytes > packet.size()) {
+                ESP_LOGE(TAG, "Wake-word encoding failed or returned an invalid packet");
+                break;
             }
-            this_->wake_word_pcm_.clear();
-            // Close encoder
-            esp_opus_enc_close(encoder_handle);
-            auto end_time = esp_timer_get_time();
-            ESP_LOGI(TAG, "Encode wake word opus %d packets in %ld ms", packets, (long)((end_time - start_time) / 1000));
-
-            std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
-            this_->wake_word_opus_.push_back(std::vector<uint8_t>());
-            this_->wake_word_cv_.notify_all();
+            packet.resize(out.encoded_bytes);
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (generation != generation_ || stopping_ || shutdown_) break;
+            opus_.push_back(std::move(packet));
+            state_cv_.notify_all();
         }
-        vTaskDelete(NULL);
-    }, "encode_wake_word", stack_size, this, 2, wake_word_encode_task_stack_, wake_word_encode_task_buffer_);
+    } else {
+        ESP_LOGE(TAG, "Wake-word encoder returned an invalid frame configuration");
+    }
+    esp_opus_enc_close(encoder);
 }
 
 bool AfeWakeWord::GetWakeWordOpus(std::vector<uint8_t>& opus) {
-    std::unique_lock<std::mutex> lock(wake_word_mutex_);
-    wake_word_cv_.wait(lock, [this]() {
-        return !wake_word_opus_.empty();
-    });
-    opus.swap(wake_word_opus_.front());
-    wake_word_opus_.pop_front();
-    return !opus.empty();
+    std::unique_lock<std::mutex> lock(state_mutex_);
+    const auto generation = generation_;
+    opus.clear();
+    if (!state_cv_.wait_for(lock, std::chrono::milliseconds(kDrainMs), [this, generation]() {
+            return !opus_.empty() || encode_done_ || generation != generation_ || shutdown_;
+        })) {
+        ++generation_;
+        encode_requested_ = false;
+        encode_done_ = true;
+        encode_pcm_.clear();
+        opus_.clear();
+        state_cv_.notify_all();
+        ESP_LOGE(TAG, "Wake-word preroll timed out and was discarded");
+        return false;
+    }
+    if (generation != generation_ || shutdown_ || opus_.empty()) return false;
+    opus = std::move(opus_.front());
+    opus_.pop_front();
+    return true;
 }

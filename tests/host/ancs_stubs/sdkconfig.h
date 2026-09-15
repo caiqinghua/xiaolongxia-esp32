@@ -1,0 +1,6 @@
+#pragma once
+// Public SDK header tests only; no ESP-IDF target configuration is generated.
+#define CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_ENABLE 1
+#ifndef CONFIG_AUDREAM_NOTIFICATION_SERVER_PUBLIC_KEY_B64
+#define CONFIG_AUDREAM_NOTIFICATION_SERVER_PUBLIC_KEY_B64 ""
+#endif

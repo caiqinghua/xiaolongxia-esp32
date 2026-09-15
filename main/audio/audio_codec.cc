@@ -1,6 +1,7 @@
 #include "audio_codec.h"
 #include "board.h"
 #include "settings.h"
+#include "watch/watch_level_settings.h"
 
 #include <esp_log.h>
 #include <cstring>
@@ -27,6 +28,13 @@ bool AudioCodec::InputData(std::vector<int16_t>& data) {
 }
 
 void AudioCodec::Start() {
+    if (Board::GetInstance().GetRuntimeProfile() == BoardRuntimeProfile::kWatchAssistantRecorder) {
+        const int saved = ReadWatchLevel(WatchLevel::kVolume);
+        output_volume_ = saved < 0 ? 0 : saved;
+        if (saved < 0) ESP_LOGE(TAG, "Watch speaker volume could not be restored; keeping output muted");
+        ESP_LOGI(TAG, "Audio codec started");
+        return;
+    }
     Settings settings("audio", false);
     output_volume_ = settings.GetInt("output_volume", output_volume_);
     if (output_volume_ <= 0) {

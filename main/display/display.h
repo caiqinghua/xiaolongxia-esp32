@@ -14,6 +14,11 @@
 
 #include <string>
 #include <chrono>
+#include <functional>
+#include <cstdint>
+
+struct WatchViewRequest;
+struct WatchViewState;
 
 class Theme {
 public:
@@ -40,6 +45,9 @@ public:
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
+    virtual bool SetupWatchUI(std::function<void(const WatchViewRequest&)>) { return false; }
+    virtual void UpdateWatchState(const WatchViewState&) {}
+    virtual void CompleteWatchRequest(uint64_t, bool) {}
     virtual void SetupUI() { 
         setup_ui_called_ = true;
     }

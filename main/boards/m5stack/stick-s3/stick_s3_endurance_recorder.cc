@@ -196,7 +196,14 @@ bool StickS3EnduranceRecorder::Start(AudioService& audio_service, int start_batt
     );
     recording_ = true;
     AudreamPowerManager::GetInstance().SetRecordingActive(true);
-    audio_service.EnableLocalRecording(true);
+    if (!audio_service.EnableLocalRecording(true)) {
+        audio_service.SetLocalRecordingPacketCallback(nullptr);
+        writer_.Close();
+        recording_ = false;
+        AudreamPowerManager::GetInstance().SetRecordingActive(false);
+        ESP_LOGE(kTag, "Endurance recording input could not start");
+        return false;
+    }
     ESP_LOGI(
         kTag,
         "Endurance recording started: session=%s segment_bytes=%llu sample_rate=%lu start_battery_percent=%d",
@@ -224,7 +231,10 @@ bool StickS3EnduranceRecorder::Stop(
     AudreamPowerManager::GetInstance().SetRecordingCaptureActive(false);
     audio_service.EnableLocalRecording(false);
     if (!audio_service.WaitForLocalRecordingDrain(kDrainTimeoutMs)) {
-        ESP_LOGW(kTag, "Endurance recording stopped before the encoder queue fully drained");
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = false;
+        ESP_LOGE(kTag, "Endurance recording drain timed out; writer and sleep blocker retained");
+        return false;
     }
     audio_service.SetLocalRecordingPacketCallback(nullptr);
 
@@ -236,6 +246,7 @@ bool StickS3EnduranceRecorder::Stop(
     FinalizeCurrentSegmentLocked();
     const bool metadata_written = WriteSessionMetadataLocked(elapsed_ms, reason);
     AudreamPowerManager::GetInstance().SetRecordingActive(false);
+    audio_service.ResumeAssistantAudio();
     ESP_LOGI(
         kTag,
         "Endurance recording stopped: session=%s elapsed_ms=%llu encoded_ms=%llu segments=%u overwritten=%u start_battery_percent=%d end_battery_percent=%d consumed_percent=%d reason=%s metadata=%d",

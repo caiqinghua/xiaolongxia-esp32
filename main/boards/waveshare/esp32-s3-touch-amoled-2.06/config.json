@@ -8,6 +8,8 @@
                 "CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING=y",
                 "CONFIG_USE_WECHAT_MESSAGE_STYLE=n",
                 "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=n",
+                "CONFIG_SR_WN_WN9_XIAOLONGXIAOLONG_TTS=y",
                 "CONFIG_PM_ENABLE=y",
                 "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y",
                 "CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y",

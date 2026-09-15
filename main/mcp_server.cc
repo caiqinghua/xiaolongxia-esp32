@@ -22,6 +22,29 @@
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
 
+#if CONFIG_AUDREAM_WATCH_UI
+#include "watch/watch_time_mcp.h"
+#include "watch/watch_time_runtime.h"
+#include "audio/local_recording_service.h"
+#include "storage/temporary_ap_transfer_service.h"
+#include "system/audream_power_manager.h"
+
+namespace {
+std::string RunWatchTimeTool(WatchTimeTool tool, int seconds = 0, const WatchAlarmToolRequest* alarm = nullptr) {
+    auto& power = AudreamPowerManager::GetInstance();
+    if (LocalRecordingService::GetInstance().GetSnapshot().state != LocalRecordingService::State::kClosed ||
+        TemporaryAPTransferService::GetInstance().IsActive() || !power.BeginStorageRead())
+        return R"({"ok":false,"error":"Watch resources are unavailable"})";
+    struct Reservation {
+        AudreamPowerManager& power;
+        ~Reservation() { power.EndStorageRead(); }
+    } reservation{power};
+    if (alarm) return ExecuteWatchAlarmTool(GetWatchTimeService(), *alarm, ReadWatchClock(), true);
+    return ExecuteWatchTimeTool(GetWatchTimeService(), tool, ReadWatchClock(), true, seconds);
+}
+}
+#endif
+
 #define TAG "MCP"
 
 McpServer::McpServer() {
@@ -42,6 +65,31 @@ void McpServer::AddCommonTools() {
     // Backup the original tools list and restore it after adding the common tools.
     auto original_tools = std::move(tools_);
     auto& board = Board::GetInstance();
+
+#if CONFIG_AUDREAM_WATCH_UI
+    if (board.GetRuntimeProfile() == BoardRuntimeProfile::kWatchAssistantRecorder) {
+        AddTool("self.watch.get_status", "Read the watch clock, timer and five alarm slots with state tokens.", PropertyList(),
+            [](const PropertyList&) -> ReturnValue { return RunWatchTimeTool(WatchTimeTool::kStatus); });
+        AddTool("self.watch.start_timer", "Start a countdown, replacing the current timer. The result confirms persistence.",
+            PropertyList({Property("seconds", kPropertyTypeInteger, 1, 604800)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                return RunWatchTimeTool(WatchTimeTool::kStartTimer, properties["seconds"].value<int>());
+            });
+        AddTool("self.watch.cancel_timer", "Cancel the current countdown and save the resulting state.", PropertyList(),
+            [](const PropertyList&) -> ReturnValue { return RunWatchTimeTool(WatchTimeTool::kCancelTimer); });
+        AddTool("self.watch.set_alarm", "Update one alarm using its state token from get_status. Weekday bits: Sunday=1 through Saturday=64; zero means next occurrence.",
+            PropertyList({Property("index", kPropertyTypeInteger, 0, 4),
+                Property("hour", kPropertyTypeInteger, 0, 23), Property("minute", kPropertyTypeInteger, 0, 59),
+                Property("weekdays", kPropertyTypeInteger, 0, 127), Property("enabled", kPropertyTypeBoolean),
+                Property("expected_state", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                WatchAlarmToolRequest alarm{properties["index"].value<int>(), properties["hour"].value<int>(),
+                    properties["minute"].value<int>(), properties["weekdays"].value<int>(),
+                    properties["enabled"].value<bool>(), properties["expected_state"].value<std::string>()};
+                return RunWatchTimeTool(WatchTimeTool::kStatus, 0, &alarm);
+            });
+    }
+#endif
 
     // Do not add custom tools here.
     // Custom tools must be added in the board's InitializeTools function.
@@ -316,7 +364,8 @@ void McpServer::AddUserOnlyTools() {
 
     // Assets download url
     auto& assets = Assets::GetInstance();
-    if (assets.partition_valid()) {
+    if (Board::GetInstance().GetRuntimeProfile() != BoardRuntimeProfile::kWatchAssistantRecorder &&
+        assets.partition_valid()) {
         AddUserOnlyTool("self.assets.set_download_url", "Set the download url for the assets",
             PropertyList({
                 Property("url", kPropertyTypeString)
@@ -562,6 +611,20 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
     }
 
     PropertyList arguments = (*tool_iter)->properties();
+    if (tool_name.rfind("self.watch.", 0) == 0 && tool_arguments) {
+        if (!cJSON_IsObject(tool_arguments)) {
+            ReplyError(id, "Watch tool arguments must be an object");
+            return;
+        }
+        const cJSON* value = nullptr;
+        cJSON_ArrayForEach(value, tool_arguments) {
+            if (!value->string || std::none_of(arguments.begin(), arguments.end(),
+                [value](const Property& property) { return property.name() == value->string; })) {
+                ReplyError(id, "Unknown watch tool argument");
+                return;
+            }
+        }
+    }
     try {
         for (auto& argument : arguments) {
             bool found = false;
@@ -571,6 +634,10 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
                     argument.set_value<bool>(value->valueint == 1);
                     found = true;
                 } else if (argument.type() == kPropertyTypeInteger && cJSON_IsNumber(value)) {
+                    if (tool_name.rfind("self.watch.", 0) == 0 && value->valuedouble != value->valueint) {
+                        ReplyError(id, "Watch integer arguments must be exact integers");
+                        return;
+                    }
                     argument.set_value<int>(value->valueint);
                     found = true;
                 } else if (argument.type() == kPropertyTypeString && cJSON_IsString(value)) {
@@ -593,7 +660,7 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
 
     // Use main thread to call the tool
     auto& app = Application::GetInstance();
-    app.Schedule([this, id, tool_iter, arguments = std::move(arguments)]() {
+    app.ScheduleProtocol([this, id, tool_iter, arguments = std::move(arguments)]() {
         try {
             ReplyResult(id, (*tool_iter)->Call(arguments));
         } catch (const std::exception& e) {

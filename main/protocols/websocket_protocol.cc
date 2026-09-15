@@ -1,4 +1,6 @@
 #include "websocket_protocol.h"
+#include "assistant_wire_format.h"
+#include "assistant_receive_queue.h"
 #include "board.h"
 #include "system_info.h"
 #include "application.h"
@@ -8,17 +10,38 @@
 #include <cstring>
 #include <cJSON.h>
 #include <esp_log.h>
-#include <arpa/inet.h>
+#include <esp_timer.h>
 #include "assets/lang_config.h"
 
 #define TAG "WS"
 
-WebsocketProtocol::WebsocketProtocol() {
-    event_group_handle_ = xEventGroupCreate();
-}
+struct WebsocketProtocol::ReceiveSession {
+    AssistantReceiveQueue queue;
+    EventGroupHandle_t event_group = xEventGroupCreate();
+    const std::function<void()> notify;
+
+    ReceiveSession(int version, std::function<void()> callback)
+#if CONFIG_AUDREAM_WATCH_UI
+        : queue(version, true), notify(std::move(callback)) {}
+#else
+        : queue(version), notify(std::move(callback)) {}
+#endif
+    ~ReceiveSession() { if (event_group) vEventGroupDelete(event_group); }
+    void Wake() {
+        xEventGroupSetBits(event_group, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
+        if (notify) notify();
+    }
+};
+
+WebsocketProtocol::WebsocketProtocol() = default;
 
 WebsocketProtocol::~WebsocketProtocol() {
-    vEventGroupDelete(event_group_handle_);
+    on_audio_channel_closed_ = nullptr;
+    CloseAudioChannel(false);
+    // Destruction is a final join, never permission to free a live transport.
+    // Normal handoffs must first finish CloseAudioChannelWithin successfully.
+    websocket_.reset();
+    receive_session_.reset();
 }
 
 bool WebsocketProtocol::Start() {
@@ -26,45 +49,65 @@ bool WebsocketProtocol::Start() {
     return true;
 }
 
+bool WebsocketProtocol::CloudAuthorizationReady() const {
+    return !cloud_authorization_required_ || (cloud_authorization_ &&
+        cloud_authorization_->Usable(static_cast<uint64_t>(esp_timer_get_time() / 1000)));
+}
+
+bool WebsocketProtocol::SetCloudAuthorization(const watch_voice::Bootstrap& bootstrap, const std::string& device_id) {
+    if (websocket_ || receive_session_ || closing_) return false;
+    cloud_authorization_required_ = true;
+    cloud_authorization_.reset();
+    cloud_device_id_.clear();
+    if (!watch_voice::ValidDeviceId(device_id) || !watch_voice::ValidAccessToken(bootstrap.access_token) ||
+        (!bootstrap.settings.SupportsManualRuntime() && !bootstrap.settings.SupportsWakeRuntime()) ||
+        !assistant_wire::IsSupportedVersion(bootstrap.protocol_version) ||
+        bootstrap.settings.revision == 0 || bootstrap.settings.applied_revision > bootstrap.settings.revision ||
+        !watch_voice::ValidWebSocketUrl(bootstrap.websocket_url) ||
+        !bootstrap.Usable(static_cast<uint64_t>(esp_timer_get_time() / 1000))) return false;
+    cloud_authorization_ = bootstrap;
+    cloud_device_id_ = device_id;
+    return true;
+}
+
+void WebsocketProtocol::ClearCloudAuthorization() {
+    cloud_authorization_required_ = true;
+    cloud_authorization_.reset();
+    cloud_device_id_.clear();
+    CloseAudioChannel(false);
+}
+
 bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+    if (!packet || !IsAudioChannelOpened() || !receive_session_->queue.CanSendAudio()) {
         return false;
     }
 
-    if (version_ == 2) {
-        std::string serialized;
-        serialized.resize(sizeof(BinaryProtocol2) + packet->payload.size());
-        auto bp2 = (BinaryProtocol2*)serialized.data();
-        bp2->version = htons(version_);
-        bp2->type = 0;
-        bp2->reserved = 0;
-        bp2->timestamp = htonl(packet->timestamp);
-        bp2->payload_size = htonl(packet->payload.size());
-        memcpy(bp2->payload, packet->payload.data(), packet->payload.size());
-
-        return websocket_->Send(serialized.data(), serialized.size(), true);
-    } else if (version_ == 3) {
-        std::string serialized;
-        serialized.resize(sizeof(BinaryProtocol3) + packet->payload.size());
-        auto bp3 = (BinaryProtocol3*)serialized.data();
-        bp3->type = 0;
-        bp3->reserved = 0;
-        bp3->payload_size = htons(packet->payload.size());
-        memcpy(bp3->payload, packet->payload.data(), packet->payload.size());
-
-        return websocket_->Send(serialized.data(), serialized.size(), true);
-    } else {
+    if (version_ == 1 && !packet->payload.empty() &&
+        packet->payload.size() <= assistant_wire::kMaxAudioBytes) {
         return websocket_->Send(packet->payload.data(), packet->payload.size(), true);
     }
+    std::string serialized;
+    if (!assistant_wire::EncodeAudio(version_, packet->payload.data(), packet->payload.size(),
+                                     packet->timestamp, serialized)) return false;
+    return websocket_->Send(serialized.data(), serialized.size(), true);
 }
 
 bool WebsocketProtocol::SendText(const std::string& text) {
-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+    if (closing_ || !CloudAuthorizationReady() || text.empty() || text.size() > assistant_wire::kMaxJsonBytes ||
+        websocket_ == nullptr || !websocket_->IsConnected()) {
         return false;
     }
 
-    if (!websocket_->Send(text)) {
-        ESP_LOGE(TAG, "Failed to send text: %s", text.c_str());
+    std::string message = text;
+    bool new_turn = false;
+    if (receive_session_ && !receive_session_->queue.PrepareControl(message, new_turn)) {
+        SetError(Lang::Strings::SERVER_ERROR);
+        CloseAudioChannel(false);
+        return false;
+    }
+    if (new_turn) InvalidateEvents();
+    if (!websocket_->Send(message)) {
+        ESP_LOGE(TAG, "Failed to send text message (%u bytes)", static_cast<unsigned>(text.size()));
         SetError(Lang::Strings::SERVER_ERROR);
         return false;
     }
@@ -73,41 +116,115 @@ bool WebsocketProtocol::SendText(const std::string& text) {
 }
 
 bool WebsocketProtocol::IsAudioChannelOpened() const {
-    return websocket_ != nullptr && websocket_->IsConnected() && !error_occurred_ && !IsTimeout();
+    return !closing_ && CloudAuthorizationReady() && receive_session_ && receive_session_->queue.Ready() && websocket_ &&
+        !error_occurred_ && !receive_session_->queue.TimedOut();
+}
+
+bool WebsocketProtocol::SupportsConversationTurns() const {
+    if (!IsAudioChannelOpened()) return false;
+    const auto hello = receive_session_->queue.Hello();
+    return hello && hello->turns;
+}
+
+bool WebsocketProtocol::SuspendIncomingTurn() {
+    if (!SupportsConversationTurns() || !receive_session_->queue.SuspendTurn()) return false;
+    InvalidateEvents();
+    return true;
 }
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
     (void)send_goodbye;  // Websocket doesn't need to send goodbye message
+#if CONFIG_AUDREAM_WATCH_UI
+    if (!CloseAudioChannelWithin(0)) {
+        ESP_LOGI(TAG, "Assistant transport shutdown is pending");
+    }
+#else
+    InvalidateEvents();
+    const bool had_session = receive_session_ != nullptr;
+    if (receive_session_) receive_session_->queue.Retire();
     websocket_.reset();
+    receive_session_.reset();
+    if (had_session && on_audio_channel_closed_) on_audio_channel_closed_();
+#endif
+}
+
+bool WebsocketProtocol::CloseAudioChannelWithin(uint32_t timeout_ms) {
+    if (!websocket_ && !receive_session_) return true;
+#if CONFIG_AUDREAM_WATCH_UI
+    if (!closing_) {
+        closing_ = true;
+        InvalidateEvents();
+        if (receive_session_) receive_session_->queue.Retire();
+    }
+    if (websocket_ && !websocket_->DisconnectWithin(timeout_ms)) return false;
+    const bool had_session = receive_session_ != nullptr;
+    websocket_.reset();
+    receive_session_.reset();
+    closing_ = false;
+    if (had_session && on_audio_channel_closed_) on_audio_channel_closed_();
+    return true;
+#else
+    (void)timeout_ms;
+    return false;
+#endif
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
-    Settings settings("websocket", false);
-    std::string url = settings.GetString("url");
-
-    // Check if WebSocket URL is configured in NVS server config
-    if (url.empty()) {
-        std::string nvs_ws_url = ServerConfig::GetWebSocketUrl();
-        if (!nvs_ws_url.empty()) {
-            ESP_LOGI(TAG, "Using NVS configured WebSocket URL: %s", nvs_ws_url.c_str());
-            url = nvs_ws_url;
-        }
+#if CONFIG_AUDREAM_WATCH_UI
+    if (!CloseAudioChannelWithin(0)) {
+        ESP_LOGW(TAG, "Assistant connection rejected while the previous transport is stopping");
+        return false;
     }
-
-    std::string token = settings.GetString("token");
-    int version = settings.GetInt("version");
-    if (version != 0) {
-        version_ = version;
+#else
+    CloseAudioChannel(false);
+#endif
+    InvalidateEvents();
+    server_sample_rate_ = 24000;
+    server_frame_duration_ = 60;
+    session_id_.clear();
+    std::string url;
+    std::string token;
+    if (cloud_authorization_required_) {
+        if (!CloudAuthorizationReady()) {
+            cloud_authorization_.reset();
+            ESP_LOGW(TAG, "Fresh device authorization is required before connecting");
+            return false;
+        }
+        url = cloud_authorization_->websocket_url;
+        token = cloud_authorization_->access_token;
+        version_ = cloud_authorization_->protocol_version;
+    } else {
+        Settings settings("websocket", false);
+        url = settings.GetString("url");
+        if (url.empty()) url = ServerConfig::GetWebSocketUrl();
+        token = settings.GetString("token");
+        const int version = settings.GetInt("version");
+        version_ = version == 0 ? 1 : version;
+    }
+    if (!assistant_wire::IsSupportedVersion(version_)) {
+        ESP_LOGE(TAG, "Unsupported WebSocket protocol version: %d", version_);
+        return false;
     }
 
     error_occurred_ = false;
 
     auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        ESP_LOGE(TAG, "Network interface is unavailable");
+        return false;
+    }
     websocket_ = network->CreateWebSocket(1);
     if (websocket_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create websocket");
         return false;
     }
+    auto session = std::make_shared<ReceiveSession>(version_, on_receive_ready_);
+    if (session->event_group == nullptr) {
+        websocket_.reset();
+        ESP_LOGE(TAG, "Failed to allocate receive event group");
+        return false;
+    }
+    receive_session_ = session;
 
     if (!token.empty()) {
         // If token not has a space, add "Bearer " prefix
@@ -117,92 +234,48 @@ bool WebsocketProtocol::OpenAudioChannel() {
         websocket_->SetHeader("Authorization", token.c_str());
     }
     websocket_->SetHeader("Protocol-Version", std::to_string(version_).c_str());
-    websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+    websocket_->SetHeader("Device-Id", cloud_authorization_required_ ? cloud_device_id_.c_str() : SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
 
-    websocket_->OnData([this](const char* data, size_t len, bool binary) {
-        if (binary) {
-            if (on_incoming_audio_ != nullptr) {
-                if (version_ == 2) {
-                    BinaryProtocol2* bp2 = (BinaryProtocol2*)data;
-                    bp2->version = ntohs(bp2->version);
-                    bp2->type = ntohs(bp2->type);
-                    bp2->timestamp = ntohl(bp2->timestamp);
-                    bp2->payload_size = ntohl(bp2->payload_size);
-                    auto payload = (uint8_t*)bp2->payload;
-                    on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
-                        .sample_rate = server_sample_rate_,
-                        .frame_duration = server_frame_duration_,
-                        .timestamp = bp2->timestamp,
-                        .payload = std::vector<uint8_t>(payload, payload + bp2->payload_size)
-                    }));
-                } else if (version_ == 3) {
-                    BinaryProtocol3* bp3 = (BinaryProtocol3*)data;
-                    bp3->type = bp3->type;
-                    bp3->payload_size = ntohs(bp3->payload_size);
-                    auto payload = (uint8_t*)bp3->payload;
-                    on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
-                        .sample_rate = server_sample_rate_,
-                        .frame_duration = server_frame_duration_,
-                        .timestamp = 0,
-                        .payload = std::vector<uint8_t>(payload, payload + bp3->payload_size)
-                    }));
-                } else {
-                    on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
-                        .sample_rate = server_sample_rate_,
-                        .frame_duration = server_frame_duration_,
-                        .timestamp = 0,
-                        .payload = std::vector<uint8_t>((uint8_t*)data, (uint8_t*)data + len)
-                    }));
-                }
-            }
-        } else {
-            // Parse JSON data
-            auto root = cJSON_Parse(data);
-            auto type = cJSON_GetObjectItem(root, "type");
-            if (cJSON_IsString(type)) {
-                if (strcmp(type->valuestring, "hello") == 0) {
-                    ParseServerHello(root);
-                } else {
-                    if (on_incoming_json_ != nullptr) {
-                        on_incoming_json_(root);
-                    }
-                }
-            } else {
-                ESP_LOGE(TAG, "Missing message type, data: %s", data);
-            }
-            cJSON_Delete(root);
-        }
-        last_incoming_time_ = std::chrono::steady_clock::now();
+    websocket_->OnData([session](const char* data, size_t len, bool binary) {
+        if (session->queue.Receive(data, len, binary)) session->Wake();
     });
 
-    websocket_->OnDisconnected([this]() {
-        ESP_LOGI(TAG, "Websocket disconnected");
-        if (on_audio_channel_closed_ != nullptr) {
-            on_audio_channel_closed_();
-        }
+    websocket_->OnDisconnected([session]() {
+        if (session->queue.Disconnect()) session->Wake();
     });
 
     ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
     if (!websocket_->Connect(url.c_str())) {
         ESP_LOGE(TAG, "Failed to connect to websocket server, code=%d", websocket_->GetLastError());
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        CloseAudioChannel(false);
         return false;
     }
 
     // Send hello message to describe the client
     auto message = GetHelloMessage();
     if (!SendText(message)) {
+        CloseAudioChannel(false);
         return false;
     }
 
     // Wait for server hello
-    EventBits_t bits = xEventGroupWaitBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
-    if (!(bits & WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT)) {
+    EventBits_t bits = xEventGroupWaitBits(session->event_group, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
+    if (!(bits & WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT) || !IsAudioChannelOpened()) {
         ESP_LOGE(TAG, "Failed to receive server hello");
         SetError(Lang::Strings::SERVER_TIMEOUT);
+        CloseAudioChannel(false);
         return false;
     }
+    auto hello = session->queue.Hello();
+    if (!hello) {
+        CloseAudioChannel(false);
+        return false;
+    }
+    server_sample_rate_ = hello->sample_rate;
+    server_frame_duration_ = hello->frame_duration;
+    session_id_ = std::move(hello->session_id);
 
     if (on_audio_channel_opened_ != nullptr) {
         on_audio_channel_opened_();
@@ -221,6 +294,9 @@ std::string WebsocketProtocol::GetHelloMessage() {
     cJSON_AddBoolToObject(features, "aec", true);
 #endif
     cJSON_AddBoolToObject(features, "mcp", true);
+#if CONFIG_AUDREAM_WATCH_UI
+    cJSON_AddBoolToObject(features, "audream_turns", true);
+#endif
     cJSON_AddItemToObject(root, "features", features);
     cJSON_AddStringToObject(root, "transport", "websocket");
     cJSON* audio_params = cJSON_CreateObject();
@@ -236,30 +312,50 @@ std::string WebsocketProtocol::GetHelloMessage() {
     return message;
 }
 
-void WebsocketProtocol::ParseServerHello(const cJSON* root) {
-    auto transport = cJSON_GetObjectItem(root, "transport");
-    if (transport == nullptr || strcmp(transport->valuestring, "websocket") != 0) {
-        ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
+void WebsocketProtocol::Poll() {
+    if (closing_) {
+        (void)CloseAudioChannelWithin(0);
         return;
     }
-
-    auto session_id = cJSON_GetObjectItem(root, "session_id");
-    if (cJSON_IsString(session_id)) {
-        session_id_ = session_id->valuestring;
-        ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
+    if (!CloudAuthorizationReady()) {
+        cloud_authorization_.reset();
+        CloseAudioChannel(false);
+        return;
     }
-
-    auto audio_params = cJSON_GetObjectItem(root, "audio_params");
-    if (cJSON_IsObject(audio_params)) {
-        auto sample_rate = cJSON_GetObjectItem(audio_params, "sample_rate");
-        if (cJSON_IsNumber(sample_rate)) {
-            server_sample_rate_ = sample_rate->valueint;
+    const auto session = receive_session_;
+    if (!session) return;
+    auto event = session->queue.Pop();
+    if (!event) return;
+    if (event->kind == AssistantReceiveQueue::Kind::Disconnected ||
+        event->kind == AssistantReceiveQueue::Kind::Overflow ||
+        event->kind == AssistantReceiveQueue::Kind::ProtocolError) {
+        const bool overflow = event->kind == AssistantReceiveQueue::Kind::Overflow;
+        const bool protocol_error = event->kind == AssistantReceiveQueue::Kind::ProtocolError;
+        CloseAudioChannel(false);
+        if (overflow) {
+            ESP_LOGE(TAG, "Assistant receive queue overflow; ending the audio session");
+            SetError(Lang::Strings::SERVER_ERROR);
         }
-        auto frame_duration = cJSON_GetObjectItem(audio_params, "frame_duration");
-        if (cJSON_IsNumber(frame_duration)) {
-            server_frame_duration_ = frame_duration->valueint;
+        if (protocol_error) {
+            ESP_LOGE(TAG, "Assistant turn acknowledgement timed out; ending the audio session");
+            SetError(Lang::Strings::SERVER_TIMEOUT);
         }
+        return;
     }
-
-    xEventGroupSetBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
+    if (event->kind == AssistantReceiveQueue::Kind::Audio) {
+        if (on_incoming_audio_) {
+            on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
+                .sample_rate = server_sample_rate_,
+                .frame_duration = server_frame_duration_,
+                .timestamp = event->timestamp,
+                .payload = std::vector<uint8_t>(event->payload.begin(), event->payload.end())
+            }));
+        }
+    } else {
+        std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(
+            assistant_wire::ParseJson(event->payload.data(), event->payload.size()), cJSON_Delete);
+        if (root && on_incoming_json_) on_incoming_json_(root.get());
+    }
+    // Yield after one event so scheduled TTS state changes run before its audio.
+    if (session == receive_session_ && session->queue.HasEvents() && on_receive_ready_) on_receive_ready_();
 }

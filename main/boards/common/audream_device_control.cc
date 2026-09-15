@@ -259,6 +259,10 @@ AudreamDeviceControl& AudreamDeviceControl::GetInstance() {
     return instance;
 }
 
+void AudreamDeviceControl::SetTimeSynchronizedCallback(std::function<void()> callback) {
+    time_synchronized_callback_ = std::move(callback);
+}
+
 void AudreamDeviceControl::SetRecordingStatusAcknowledgedCallback(std::function<void()> callback) {
     recording_status_acknowledged_callback_ = std::move(callback);
 }
@@ -531,6 +535,7 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
             }
             const uint64_t unix_time_ms = ReadUInt64(&data[kRequestHeaderLength]);
             DeviceTimeService::GetInstance().SyncUnixTimeMs(unix_time_ms);
+            if (time_synchronized_callback_) time_synchronized_callback_();
             break;
         }
 
@@ -604,6 +609,10 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                 );
             }
             const auto metadata = recording.Stop(Application::GetInstance().GetAudioService());
+            if (recording.IsRecording()) {
+                return BuildPayloadResponse(opcode_value, request_id,
+                    static_cast<uint8_t>(Status::kIoError), {});
+            }
             BatteryTelemetryService::GetInstance().RecordEvent(
                 BatteryTelemetryEvent::kRecordingStopped
             );
@@ -652,17 +661,6 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     opcode_value,
                     request_id,
                     static_cast<uint8_t>(Status::kNotRecording),
-                    {}
-                );
-            }
-            if (
-                (is_pause && recording.IsPaused()) ||
-                (!is_pause && !recording.IsPaused())
-            ) {
-                return BuildPayloadResponse(
-                    opcode_value,
-                    request_id,
-                    static_cast<uint8_t>(Status::kSuccess),
                     {}
                 );
             }
@@ -850,9 +848,6 @@ std::vector<uint8_t> AudreamDeviceControl::HandleRequest(const uint8_t* data, si
                     {}
                 );
             }
-            BatteryTelemetryService::GetInstance().RecordEvent(
-                BatteryTelemetryEvent::kTransferStopped
-            );
             return BuildPayloadResponse(
                 opcode_value,
                 request_id,

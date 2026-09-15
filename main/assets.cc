@@ -1,4 +1,6 @@
 #include "assets.h"
+#include "audio/assistant_model_bundle.h"
+#include "firmware_release_identity.h"
 #include "board.h"
 #include "display.h"
 #include "application.h"
@@ -26,6 +28,7 @@ struct mmap_assets_table {
     uint16_t asset_width;         /*!< Width of the asset */
     uint16_t asset_height;        /*!< Height of the asset */
 };
+static_assert(sizeof(mmap_assets_table) == 44, "Asset table layout must match the bundle generator");
 
 Assets::Assets() {
 #if HAVE_LVGL
@@ -38,7 +41,7 @@ Assets::Assets() {
 }
 
 Assets::~Assets() {
-    UnApplyPartition();
+    if (!models_pinned_) UnApplyPartition();
 }
 
 bool Assets::FindPartition(Assets* assets) {
@@ -68,15 +71,49 @@ bool Assets::GetAssetData(const std::string& name, void*& ptr, size_t& size) {
     return strategy_ ? strategy_->GetAssetData(this, name, ptr, size) : false;
 }
 
-bool Assets::LoadSrmodelsFromIndex(Assets* assets, cJSON* root) {
+bool Assets::LoadAssistantModels(srmodel_list_t*& models) {
+    models = nullptr;
+    if (!LoadSrmodelsFromIndex(this, nullptr, false)) return false;
+    models = models_list_;
+    return models != nullptr;
+}
+
+bool Assets::BeginTrialHealth(bool models_ready, int64_t now_ms, uint32_t wake_feeds) {
+    return strategy_ && strategy_->BeginTrialHealth(models_ready && models_pinned_ && models_list_, now_ms, wake_feeds);
+}
+
+bool Assets::PollTrialHealth(int64_t now_ms, bool healthy, uint32_t wake_feeds) {
+    return strategy_ && strategy_->PollTrialHealth(now_ms, healthy, wake_feeds);
+}
+
+bool Assets::UpdatesReady() const { return strategy_ && strategy_->UpdatesReady(); }
+std::string Assets::CurrentVersion() const { return strategy_ ? strategy_->CurrentVersion() : std::string{}; }
+
+std::unique_ptr<asset_storage::UpdateSession> Assets::BeginUpdate() {
+    return strategy_ ? strategy_->BeginUpdate() : nullptr;
+}
+
+bool Assets::LoadSrmodelsFromIndex(Assets* assets, cJSON* root, bool publish) {
+    // Model memory is borrowed by AFE and must remain stable for its lifetime.
+    if (assets->models_list_) return true;
+    if (auto* existing = get_static_srmodels()) {
+        if (assets->strategy_ && assets->strategy_->TrialPending()) {
+            ESP_LOGE(TAG, "Cannot validate a trial asset using an unrelated cached model list");
+            return false;
+        }
+        assets->models_list_ = existing;
+        assets->models_pinned_ = true;
+        if (publish) Application::GetInstance().GetAudioService().SetModelsList(existing);
+        return true;
+    }
     void* ptr = nullptr;
     size_t size = 0;
     bool need_delete_root = false;
 
     // If root is not provided, parse index.json
     if (root == nullptr) {
-        if (!assets->GetAssetData("index.json", ptr, size)) {
-            ESP_LOGE(TAG, "The index.json file is not found");
+        if (!assets->GetAssetData("index.json", ptr, size) || size > 64 * 1024) {
+            ESP_LOGE(TAG, "The index.json file is missing or exceeds the size limit");
             return false;
         }
 
@@ -91,15 +128,13 @@ bool Assets::LoadSrmodelsFromIndex(Assets* assets, cJSON* root) {
     cJSON* srmodels = cJSON_GetObjectItem(root, "srmodels");
     if (cJSON_IsString(srmodels)) {
         std::string srmodels_file = srmodels->valuestring;
-        if (assets->GetAssetData(srmodels_file, ptr, size)) {
-            if (assets->models_list_ != nullptr) {
-                esp_srmodel_deinit(assets->models_list_);
-                assets->models_list_ = nullptr;
-            }
+        if (assets->GetAssetData(srmodels_file, ptr, size) &&
+            audream::ValidateAssistantModelBundle(ptr, size)) {
             assets->models_list_ = srmodel_load(static_cast<uint8_t*>(ptr));
             if (assets->models_list_ != nullptr) {
-                auto& app = Application::GetInstance();
-                app.GetAudioService().SetModelsList(assets->models_list_);
+                assets->models_pinned_ = true;
+                if (assets->strategy_) assets->strategy_->PinModels();
+                if (publish) Application::GetInstance().GetAudioService().SetModelsList(assets->models_list_);
                 if (need_delete_root) {
                     cJSON_Delete(root);
                 }
@@ -108,7 +143,7 @@ bool Assets::LoadSrmodelsFromIndex(Assets* assets, cJSON* root) {
                 ESP_LOGE(TAG, "Failed to load srmodels.bin");
             }
         } else {
-            ESP_LOGE(TAG, "The srmodels file %s is not found", srmodels_file.c_str());
+            ESP_LOGE(TAG, "The srmodels file %s is missing or invalid", srmodels_file.c_str());
         }
     }
 
@@ -119,83 +154,105 @@ bool Assets::LoadSrmodelsFromIndex(Assets* assets, cJSON* root) {
 }
 
 #if HAVE_LVGL
-uint32_t Assets::LvglStrategy::CalculateChecksum(const char* data, uint32_t length) {
-    uint32_t checksum = 0;
-    for (uint32_t i = 0; i < length; i++) {
-        checksum += data[i];
-    }
-    return checksum & 0xFFFF;
-}
-
 bool Assets::LvglStrategy::InitializePartition(Assets* assets) {
+    if (mapping_) return assets->partition_valid_;
     assets->partition_valid_ = false;
+    checksum_valid_ = false;
     assets_.clear();
 
     if (!Assets::FindPartition(assets)) {
         return false;
     }
 
-    int free_pages = spi_flash_mmap_get_free_pages(SPI_FLASH_MMAP_DATA);
-    uint32_t storage_size = free_pages * 64 * 1024;
-    ESP_LOGI(TAG, "The storage free size is %ld KB", storage_size / 1024);
-    ESP_LOGI(TAG, "The partition size is %ld KB", assets->partition_->size / 1024);
-    if (storage_size < assets->partition_->size) {
-        ESP_LOGE(TAG, "The free size %ld KB is less than assets partition required %ld KB", storage_size / 1024, assets->partition_->size / 1024);
+    std::optional<asset_storage::BootConfig> config;
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_SR_WN_WN9_XIAOLONGXIAOLONG_TTS
+    if (Board::GetInstance().GetRuntimeProfile() == BoardRuntimeProfile::kWatchAssistantRecorder) {
+        if (const auto* identity = firmware_release::CurrentIdentity()) {
+            config = asset_storage::BootConfig{
+                {identity->model, CONFIG_AUDREAM_ASSET_SR_ABI, "wn9_xiaolongxiaolong_tts", identity->sequence},
+                CONFIG_AUDREAM_ASSET_PUBLIC_KEY_HEX};
+            if (!asset_storage::IsValidConfig(*config)) config.reset();
+        }
+    }
+#endif
+    mapping_ = std::make_unique<asset_storage::Mapping>();
+    if (!mapping_->Open(assets->partition_, config ? &*config : nullptr)) {
+        ESP_LOGE(TAG, "Asset boot mapping failed; no model pointer is exposed");
         return false;
     }
-
-    esp_err_t err = esp_partition_mmap(assets->partition_, 0, assets->partition_->size, ESP_PARTITION_MMAP_DATA, (const void**)&mmap_root_, &mmap_handle_);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mmap assets partition: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    assets->partition_valid_ = true;
-
-    uint32_t stored_files = *(uint32_t*)(mmap_root_ + 0);
-    uint32_t stored_chksum = *(uint32_t*)(mmap_root_ + 4);
-    uint32_t stored_len = *(uint32_t*)(mmap_root_ + 8);
-
-    if (stored_len > assets->partition_->size - 12) {
-        ESP_LOGD(TAG, "The stored_len (0x%lx) is greater than the partition size (0x%lx) - 12", stored_len, assets->partition_->size);
-        return false;
-    }
-
-    auto start_time = esp_timer_get_time();
-    uint32_t calculated_checksum = CalculateChecksum(mmap_root_ + 12, stored_len);
-    auto end_time = esp_timer_get_time();
-    ESP_LOGI(TAG, "The checksum calculation time is %d ms", int((end_time - start_time) / 1000));
-
-    if (calculated_checksum != stored_chksum) {
-        ESP_LOGE(TAG, "The calculated checksum (0x%lx) does not match the stored checksum (0x%lx)", calculated_checksum, stored_chksum);
-        return false;
-    }
+    mmap_root_ = static_cast<const char*>(mapping_->Data());
+    const auto* header = reinterpret_cast<const uint8_t*>(mmap_root_);
+    const uint32_t stored_files = audream::ReadBundleU32(header);
+    const auto& selected = mapping_->Selected();
+    ESP_LOGI(TAG, "Asset boot mapping ready: slot=%u offset=%u bytes=%u sequence=%u trial=%d fault=%d",
+             static_cast<unsigned>(selected.slot), static_cast<unsigned>(selected.offset),
+             static_cast<unsigned>(selected.size), static_cast<unsigned>(selected.sequence),
+             selected.trial, mapping_->Faulted());
 
     checksum_valid_ = true;
 
     for (uint32_t i = 0; i < stored_files; i++) {
-        auto item = (const mmap_assets_table*)(mmap_root_ + 12 + i * sizeof(mmap_assets_table));
+        mmap_assets_table entry;
+        memcpy(&entry, mmap_root_ + 12 + i * sizeof(entry), sizeof(entry));
+        auto item = &entry;
         auto asset = Asset{
             .size = static_cast<size_t>(item->asset_size),
             .offset = static_cast<size_t>(12 + sizeof(mmap_assets_table) * stored_files + item->asset_offset)
         };
         assets_[item->asset_name] = asset;
     }
-    return checksum_valid_;
+    assets->partition_valid_ = true;
+    return true;
 }
 
 void Assets::LvglStrategy::UnApplyPartition(Assets* assets) {
-    if (mmap_handle_ != 0) {
-        esp_partition_munmap(mmap_handle_);
-        mmap_handle_ = 0;
-        mmap_root_ = nullptr;
+    if (assets->models_pinned_) {
+        ESP_LOGE(TAG, "Cannot unmap assets while audio models retain borrowed data");
+        return;
     }
+    mapping_.reset();
+    mmap_root_ = nullptr;
     checksum_valid_ = false;
     assets_.clear();
-    (void)assets; // Unused parameter
+    assets->partition_valid_ = false;
+}
+
+void Assets::LvglStrategy::PinModels() {
+    if (mapping_) mapping_->Pin();
+}
+
+bool Assets::LvglStrategy::TrialPending() const {
+    return mapping_ && mapping_->TrialPending();
+}
+
+bool Assets::LvglStrategy::UpdatesReady() const { return mapping_ && mapping_->UpdatesReady(); }
+std::string Assets::LvglStrategy::CurrentVersion() const { return mapping_ ? mapping_->Version() : std::string{}; }
+
+std::unique_ptr<asset_storage::UpdateSession> Assets::LvglStrategy::BeginUpdate() {
+    if (!mapping_ || Board::GetInstance().GetRuntimeProfile() != BoardRuntimeProfile::kWatchAssistantRecorder) return {};
+    return mapping_->BeginUpdate([]() -> std::unique_ptr<Http> {
+        auto* network = Board::GetInstance().GetNetwork();
+        return network ? network->CreateHttp(0) : nullptr;
+    }, [] { return esp_timer_get_time() / 1000; });
+}
+
+bool Assets::LvglStrategy::BeginTrialHealth(bool models_ready, int64_t now_ms, uint32_t wake_feeds) {
+    return mapping_ && mapping_->BeginTrialHealth(models_ready, now_ms, wake_feeds);
+}
+
+bool Assets::LvglStrategy::PollTrialHealth(int64_t now_ms, bool healthy, uint32_t wake_feeds) {
+    if (!mapping_) return false;
+    const bool pending = mapping_->TrialPending();
+    const bool active = mapping_->PollTrialHealth(now_ms, healthy, wake_feeds);
+    if (pending && !mapping_->TrialPending()) ESP_LOGI(TAG, "Asset trial confirmed after model initialization and sustained wake input");
+    else if (pending && !active && mapping_->Faulted()) ESP_LOGE(TAG, "Asset trial confirmation failed; reboot recovery remains required");
+    return active;
 }
 
 bool Assets::LvglStrategy::GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) {
+    ptr = nullptr;
+    size = 0;
+    if (!assets->partition_valid_ || !checksum_valid_) return false;
     auto asset = assets_.find(name);
     if (asset == assets_.end()) {
         return false;
@@ -424,6 +481,14 @@ bool Assets::EmoteStrategy::Apply(Assets* assets) {
 }
 
 bool Assets::Download(std::string url, std::function<void(int progress, size_t speed)> progress_callback) {
+    if (Board::GetInstance().GetRuntimeProfile() == BoardRuntimeProfile::kWatchAssistantRecorder) {
+        ESP_LOGE(TAG, "Watch asset updates require signed staging and rollback; in-place download is disabled");
+        return false;
+    }
+    if (models_pinned_) {
+        ESP_LOGE(TAG, "Asset replacement requires a restart before audio models are loaded");
+        return false;
+    }
     ESP_LOGI(TAG, "Downloading new version of assets from %s", url.c_str());
 
     // 取消当前资源分区的内存映射

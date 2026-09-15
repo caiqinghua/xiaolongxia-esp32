@@ -10,6 +10,8 @@ public:
     static AudreamDeviceControl& GetInstance();
 
     void SetRecordingStatusAcknowledgedCallback(std::function<void()> callback);
+    // Register during board initialization; the callback only enqueues work.
+    void SetTimeSynchronizedCallback(std::function<void()> callback);
     void SetRecordingPauseCallbacks(
         std::function<bool()> pause_callback,
         std::function<bool()> resume_callback
@@ -22,6 +24,7 @@ public:
 private:
     AudreamDeviceControl() = default;
     std::function<void()> recording_status_acknowledged_callback_;
+    std::function<void()> time_synchronized_callback_;
     std::function<bool()> recording_pause_callback_;
     std::function<bool()> recording_resume_callback_;
 

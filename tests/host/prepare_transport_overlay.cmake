@@ -1,0 +1,5 @@
+if(NOT DEFINED REPO_ROOT OR NOT DEFINED OUTPUT_DIR)
+    message(FATAL_ERROR "REPO_ROOT and OUTPUT_DIR are required")
+endif()
+include("${REPO_ROOT}/cmake/audream_transport_overlay.cmake")
+audream_prepare_transport_overlay("${REPO_ROOT}/managed_components/78__esp-ml307" "${OUTPUT_DIR}")

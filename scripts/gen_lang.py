@@ -50,7 +50,7 @@ def get_sound_files(directory):
         return []
     return [f for f in os.listdir(directory) if f.endswith('.ogg')]
 
-def generate_header(lang_code, output_path):
+def generate_header(lang_code, output_path, strings_only=False):
     # 从输出路径推导项目结构
     # output_path 通常是 main/assets/lang_config.h
     main_dir = os.path.dirname(output_path)  # main/assets
@@ -165,7 +165,7 @@ def generate_header(lang_code, output_path):
         lang_code=lang_code,
         lang_code_for_font=lang_code.replace('-', '_').lower(),
         strings="\n".join(sorted(strings)),
-        sounds="\n".join(sorted(sounds))
+        sounds="" if strings_only else "\n".join(sorted(sounds))
     )
 
     # 写入文件
@@ -177,10 +177,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate language configuration header file with en-US fallback")
     parser.add_argument("--language", required=True, help="Language code (e.g: zh-CN, en-US, ja-JP)")
     parser.add_argument("--output", required=True, help="Output header file path")
+    parser.add_argument("--strings-only", action="store_true", help="Omit embedded sound symbols for host UI tests")
     args = parser.parse_args()
 
     try:
-        generate_header(args.language, args.output)
+        generate_header(args.language, args.output, args.strings_only)
         print(f"Successfully generated language config file: {args.output}")
     except Exception as e:
         print(f"Error: {e}")

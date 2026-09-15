@@ -1,0 +1,652 @@
+diff --git a/esp_blufi.c b/esp_blufi.c
+--- a/esp_blufi.c
++++ b/esp_blufi.c
+@@ -36,1 +36,2 @@
+ #include <esp_gap_ble_api.h>
++#include "watch_blufi_security.h"
++#include "watch_blufi_btc_envelope.h"
++#include "watch_blufi_notify.h"
++#include "freertos/FreeRTOS.h"
+@@ -42,1 +43,12 @@
+ static uint16_t conn_id;
++typedef enum {
++    AUDREAM_START_IDLE, AUDREAM_START_REGISTERING, AUDREAM_START_CREATING,
++    AUDREAM_START_WRITE_CHAR, AUDREAM_START_READ_CHAR, AUDREAM_START_DESCRIPTOR,
++    AUDREAM_START_SERVICE, AUDREAM_START_READY, AUDREAM_START_FAILED
++} audream_startup_phase_t;
++typedef struct {
++    audream_startup_phase_t startup;
++    bool connected;
++    uint16_t connection;
++    uint16_t attribute;
++    uint8_t address[6];
++    uint64_t previous_lease;
++    uint64_t notify_lease;
++    uint64_t epoch;
++} audream_host_state_t;
++static portMUX_TYPE audream_host_mux = portMUX_INITIALIZER_UNLOCKED;
++static audream_host_state_t audream_host_state;
++
++static audream_host_state_t audream_host_snapshot(void)
++{
++    portENTER_CRITICAL(&audream_host_mux);
++    const audream_host_state_t state = audream_host_state;
++    portEXIT_CRITICAL(&audream_host_mux);
++    return state;
++}
++
++// Called only while holding audream_host_mux. No SDK calls inside this lock.
++static void audream_invalidate_subscription(void)
++{
++    audream_host_state.notify_lease = 0;
++    if (audream_host_state.epoch != UINT64_MAX) ++audream_host_state.epoch;
++}
++
++static void audream_host_connection(bool connected, uint16_t connection, const uint8_t* address, uint64_t previous)
++{
++    portENTER_CRITICAL(&audream_host_mux);
++    audream_invalidate_subscription();
++    audream_host_state.connected = connected;
++    audream_host_state.connection = connection;
++    memcpy(audream_host_state.address, address, sizeof(audream_host_state.address));
++    audream_host_state.previous_lease = previous;
++    portEXIT_CRITICAL(&audream_host_mux);
++}
++
++static void audream_host_attribute(uint16_t attribute)
++{
++    portENTER_CRITICAL(&audream_host_mux);
++    audream_invalidate_subscription();
++    audream_host_state.attribute = attribute;
++    portEXIT_CRITICAL(&audream_host_mux);
++}
++
++static uint64_t audream_snapshot_lease(audream_host_state_t state)
++{
++    if (!state.connected || state.startup != AUDREAM_START_READY || state.epoch == UINT64_MAX) return 0;
++    const uint64_t lease = audream_blufi_control_lease(BTC_GATT_GET_CONN_ID(state.connection), state.address);
++    const audream_host_state_t after = audream_host_snapshot();
++    return lease && lease != state.previous_lease && state.epoch == after.epoch ? lease : 0;
++}
++
++static uint64_t audream_current_control_lease(uint16_t requested_connection)
++{
++    const audream_host_state_t state = audream_host_snapshot();
++    return requested_connection == state.connection ? audream_snapshot_lease(state) : 0;
++}
++
++uint64_t audream_blufi_transport_lease(void)
++{
++    return audream_snapshot_lease(audream_host_snapshot());
++}
++
++static uint64_t audream_operation_control_lease(uint16_t connection)
++{
++    const uint64_t lease = audream_current_control_lease(connection);
++    return lease && lease == audream_blufi_operation_lease() ? lease : 0;
++}
++
++bool audream_blufi_is_notify_handle(uint16_t attribute)
++{
++    return attribute && attribute == audream_host_snapshot().attribute;
++}
++
++bool audream_blufi_notify_current(uint16_t connection, uint16_t attribute, uint64_t lease)
++{
++    return audream_blufi_notify_token(connection, attribute, lease) != 0;
++}
++
++uint64_t audream_blufi_notify_token(uint16_t connection, uint16_t attribute, uint64_t lease)
++{
++    const audream_host_state_t state = audream_host_snapshot();
++    if (!lease || connection != state.connection || !attribute || attribute != state.attribute ||
++        lease != state.notify_lease || lease != audream_snapshot_lease(state) ||
++        lease != audream_blufi_operation_lease()) return 0;
++    return state.epoch == audream_host_snapshot().epoch ? state.epoch : 0;
++}
++
++static tBTA_GATT_STATUS audream_host_subscribe(uint16_t connection, uint64_t lease, bool enable)
++{
++    const audream_host_state_t state = audream_host_snapshot();
++    if (!lease || connection != state.connection || lease != audream_snapshot_lease(state))
++        return GATT_INSUF_AUTHENTICATION;
++    portENTER_CRITICAL(&audream_host_mux);
++    tBTA_GATT_STATUS result = GATT_INSUF_AUTHENTICATION;
++    if (state.epoch == audream_host_state.epoch) {
++        audream_invalidate_subscription();
++        result = enable && audream_host_state.epoch == UINT64_MAX ? GATT_INSUF_RESOURCE : GATT_SUCCESS;
++        if (result == GATT_SUCCESS && enable) audream_host_state.notify_lease = lease;
++    }
++    portEXIT_CRITICAL(&audream_host_mux);
++    return result;
++}
++
++static bool audream_startup_transition(audream_startup_phase_t expected, audream_startup_phase_t next)
++{
++    portENTER_CRITICAL(&audream_host_mux);
++    const bool accepted = audream_host_state.startup == expected;
++    if (accepted) {
++        audream_host_state.startup = next;
++        audream_invalidate_subscription();
++    }
++    portEXIT_CRITICAL(&audream_host_mux);
++    return accepted;
++}
++
++static void audream_startup_reset(audream_startup_phase_t phase)
++{
++    portENTER_CRITICAL(&audream_host_mux);
++    audream_host_state.startup = phase;
++    audream_host_state.connected = false;
++    audream_host_state.attribute = 0;
++    audream_invalidate_subscription();
++    portEXIT_CRITICAL(&audream_host_mux);
++}
++
++static void audream_startup_complete(bool success)
++{
++    const audream_startup_phase_t phase = audream_host_snapshot().startup;
++    if (phase < AUDREAM_START_REGISTERING || phase > AUDREAM_START_SERVICE ||
++        (success && phase != AUDREAM_START_SERVICE)) return;
++    if (!audream_startup_transition(phase, success ? AUDREAM_START_READY : AUDREAM_START_FAILED)) return;
++    esp_blufi_cb_param_t param = {0};
++    btc_msg_t msg = {0};
++    msg.sig = BTC_SIG_API_CB;
++    msg.pid = BTC_PID_BLUFI;
++    msg.act = ESP_BLUFI_EVENT_INIT_FINISH;
++    param.init_finish.state = success ? ESP_BLUFI_INIT_OK : ESP_BLUFI_INIT_FAILED;
++    if (btc_transfer_context(&msg, &param, sizeof(param), NULL, NULL) != BT_STATUS_SUCCESS) {
++        audream_startup_transition(AUDREAM_START_READY, AUDREAM_START_FAILED);
++        BTC_TRACE_ERROR("BLUFI startup result queue rejected the event\n");
++    }
++}
++
+@@ -242,2 +242,3 @@
+ uint8_t esp_blufi_init(void)
+ {
++    audream_startup_reset(AUDREAM_START_REGISTERING);
+@@ -250,2 +270,11 @@
++static void audream_blufi_profile_impl(tBTA_GATTS_EVT event, tBTA_GATTS *p_data);
+ static void blufi_profile_cb(tBTA_GATTS_EVT event, tBTA_GATTS *p_data)
++{
++    const audream_blufi_scope_t previous = audream_blufi_scope_enter(audream_blufi_operation_lease());
++    audream_blufi_profile_impl(event, p_data);
++    audream_blufi_scope_leave(previous);
++}
++
++static void audream_blufi_profile_impl(tBTA_GATTS_EVT event, tBTA_GATTS *p_data)
+ {
+@@ -256,1 +256,3 @@
+     case BTA_GATTS_REG_EVT:
++        if (audream_host_snapshot().startup != AUDREAM_START_REGISTERING ||
++            p_data->reg_oper.uuid.uu.uuid16 != BLUFI_APP_UUID) return;
+@@ -260,2 +260,3 @@
+             BLUFI_TRACE_ERROR("BLUFI profile register failed\n");
++            audream_startup_complete(false);
+             return;
+@@ -264,1 +264,6 @@
++        if (!p_data->reg_oper.server_if) {
++            audream_startup_complete(false);
++            return;
++        }
++        if (!audream_startup_transition(AUDREAM_START_REGISTERING, AUDREAM_START_CREATING)) return;
+         blufi_env.gatt_if = p_data->reg_oper.server_if;
+@@ -301,10 +313,26 @@
+-    case BTA_GATTS_READ_EVT:
++    case BTA_GATTS_READ_EVT: {
++        const uint64_t lease = audream_operation_control_lease(p_data->req_data.conn_id);
++        const tGATT_READ_REQ *read = &p_data->req_data.p_data->read_req;
++        tBTA_GATT_STATUS status = GATT_SUCCESS;
+         memset(&rsp, 0, sizeof(tBTA_GATTS_API_RSP));
+-        rsp.attr_value.handle = p_data->req_data.p_data->read_req.handle;
++        rsp.attr_value.handle = read->handle;
++        if (!lease) status = GATT_INSUF_AUTHENTICATION;
++        else if (read->offset || read->is_long) status = GATT_INVALID_OFFSET;
++        else if (read->handle != blufi_env.handle_char_e2p && read->handle != blufi_env.handle_descr_e2p)
++            status = GATT_READ_NOT_PERMIT;
+         rsp.attr_value.len = 1;
+         rsp.attr_value.value[0] = 0x00;
++        if (status == GATT_SUCCESS && read->handle == blufi_env.handle_char_e2p) {
++            const uint8_t ready[] = {0x41, 0x44, 0x53, 0x43, 1, 7};
++            rsp.attr_value.len = sizeof(ready);
++            memcpy(rsp.attr_value.value, ready, sizeof(ready));
++        }
++        if (status == GATT_SUCCESS && read->handle == blufi_env.handle_descr_e2p) {
++            rsp.attr_value.len = 2;
++            rsp.attr_value.value[0] = audream_blufi_notify_current(p_data->req_data.conn_id, blufi_env.handle_char_e2p, lease) ? 1 : 0;
++        }
+         BTA_GATTS_SendRsp(p_data->req_data.conn_id, p_data->req_data.trans_id,
+-                          p_data->req_data.status, &rsp);
++                          status, status == GATT_SUCCESS ? &rsp : NULL);
+         break;
++    }
+     case BTA_GATTS_WRITE_EVT: {
++        const uint64_t lease = audream_operation_control_lease(p_data->req_data.conn_id);
++        const tGATT_WRITE_REQ *write = &p_data->req_data.p_data->write_req;
++        tBTA_GATT_STATUS admission = GATT_SUCCESS;
++        if (!lease) admission = GATT_INSUF_AUTHENTICATION;
++        else if (write->is_prep) admission = GATT_REQ_NOT_SUPPORTED;
++        else if (write->offset) admission = GATT_INVALID_OFFSET;
++        else if (write->handle == blufi_env.handle_descr_e2p) {
++            if (write->len != 2 || write->value[1] != 0 || write->value[0] > 1)
++                admission = GATT_INVALID_ATTR_LEN;
++            else {
++                admission = audream_host_subscribe(p_data->req_data.conn_id, lease, write->value[0] != 0);
++            }
++        } else if (write->handle != blufi_env.handle_char_p2e) admission = GATT_WRITE_NOT_PERMIT;
++        if (admission != GATT_SUCCESS || write->handle == blufi_env.handle_descr_e2p) {
++            if (write->need_rsp)
++                BTA_GATTS_SendRsp(p_data->req_data.conn_id, p_data->req_data.trans_id, admission, NULL);
++            break;
++        }
+@@ -371,17 +421,17 @@
+     case BTA_GATTS_EXEC_WRITE_EVT:
+-        BLUFI_TRACE_DEBUG("exec write exec %d\n", p_data->req_data.p_data->exec_write);
+-
+         BTA_GATTS_SendRsp(p_data->req_data.conn_id, p_data->req_data.trans_id,
+-                          GATT_SUCCESS, NULL);
++                          audream_operation_control_lease(p_data->req_data.conn_id)
++                              ? GATT_REQ_NOT_SUPPORTED : GATT_INSUF_AUTHENTICATION, NULL);
+-
+-        if (blufi_env.prepare_buf && p_data->req_data.p_data->exec_write == GATT_PREP_WRITE_EXEC) {
+-            btc_blufi_recv_handler(blufi_env.prepare_buf, blufi_env.prepare_len);
+-        }
+ 
+         if (blufi_env.prepare_buf) {
+             osi_free(blufi_env.prepare_buf);
+             blufi_env.prepare_buf = NULL;
+             blufi_env.prepare_len = 0;
+         }
+ 
+         break;
+@@ -396,2 +396,12 @@
+     case BTA_GATTS_CREATE_EVT:
++        if (audream_host_snapshot().startup != AUDREAM_START_CREATING) break;
++        // On failure the SDK does not initialize every create field.
++        if (p_data->create.status != BTA_GATT_OK) { audream_startup_complete(false); break; }
++        if (p_data->create.server_if != blufi_env.gatt_if) break;
++        if (!p_data->create.service_id) { audream_startup_complete(false); break; }
++        if (!audream_startup_transition(AUDREAM_START_CREATING, AUDREAM_START_WRITE_CHAR)) break;
+         blufi_env.handle_srvc = p_data->create.service_id;
+@@ -408,5 +462,1 @@
+-                                    #if CONFIG_BT_BLUFI_BLE_SMP_ENABLE
+                                     GATT_PERM_WRITE_ENC_MITM,
+-                                    #else
+-                                    GATT_PERM_WRITE,
+-                                    #endif
+@@ -416,1 +416,17 @@
+     case BTA_GATTS_ADD_CHAR_EVT:
++        if (p_data->add_result.server_if != blufi_env.gatt_if ||
++            p_data->add_result.service_id != blufi_env.handle_srvc) break;
++        if (audream_host_snapshot().startup != AUDREAM_START_WRITE_CHAR &&
++            audream_host_snapshot().startup != AUDREAM_START_READ_CHAR) break;
++        if (p_data->add_result.char_uuid.uu.uuid16 !=
++            (audream_host_snapshot().startup == AUDREAM_START_WRITE_CHAR ? BLUFI_CHAR_P2E_UUID : BLUFI_CHAR_E2P_UUID)) break;
++        if (p_data->add_result.status != BTA_GATT_OK || !p_data->add_result.attr_id) {
++            audream_startup_complete(false); break;
++        }
++        if (p_data->add_result.char_uuid.uu.uuid16 == BLUFI_CHAR_P2E_UUID) {
++            if (!audream_startup_transition(AUDREAM_START_WRITE_CHAR, AUDREAM_START_READ_CHAR)) break;
++        } else if (!audream_startup_transition(AUDREAM_START_READ_CHAR, AUDREAM_START_DESCRIPTOR)) break;
+@@ -423,1 +473,1 @@
+-                                        (GATT_PERM_READ),
++                                        (GATT_PERM_READ_ENC_MITM),
+@@ -429,1 +490,2 @@
+             blufi_env.handle_char_e2p = p_data->add_result.attr_id;
++            audream_host_attribute(p_data->add_result.attr_id);
+@@ -432,1 +492,1 @@
+-                                         (GATT_PERM_READ | GATT_PERM_WRITE),
++                                         (GATT_PERM_READ_ENC_MITM | GATT_PERM_WRITE_ENC_MITM),
+@@ -433,17 +433,18 @@
+     case BTA_GATTS_ADD_CHAR_DESCR_EVT: {
+-        /* call init finish */
+-        esp_blufi_cb_param_t param;
+-        btc_msg_t msg;
+-
++        if (audream_host_snapshot().startup != AUDREAM_START_DESCRIPTOR ||
++            p_data->add_result.server_if != blufi_env.gatt_if ||
++            p_data->add_result.service_id != blufi_env.handle_srvc ||
++            p_data->add_result.char_uuid.uu.uuid16 != 0x2902) break;
++        if (p_data->add_result.status != BTA_GATT_OK || !p_data->add_result.attr_id) {
++            audream_startup_complete(false); break;
++        }
++        if (!audream_startup_transition(AUDREAM_START_DESCRIPTOR, AUDREAM_START_SERVICE)) break;
+         blufi_env.handle_descr_e2p = p_data->add_result.attr_id;
+         //start the blufi service after created
+         BTA_GATTS_StartService(blufi_env.handle_srvc, BTA_GATT_TRANSPORT_LE);
+-
+-        msg.sig = BTC_SIG_API_CB;
+-        msg.pid = BTC_PID_BLUFI;
+-        msg.act = ESP_BLUFI_EVENT_INIT_FINISH;
+-        param.init_finish.state = ESP_BLUFI_INIT_OK;
+-
+-        btc_transfer_context(&msg, &param, sizeof(esp_blufi_cb_param_t), NULL, NULL);
+         break;
+     }
++    case BTA_GATTS_START_EVT:
++        if (p_data->srvc_oper.server_if == blufi_env.gatt_if &&
++            p_data->srvc_oper.service_id == blufi_env.handle_srvc &&
++            audream_host_snapshot().startup == AUDREAM_START_SERVICE)
++            audream_startup_complete(p_data->srvc_oper.status == BTA_GATT_OK);
++        break;
+@@ -450,1 +500,2 @@
+     case BTA_GATTS_CONNECT_EVT: {
++        const uint64_t previous_lease = audream_blufi_control_lease(
++            BTC_GATT_GET_CONN_ID(p_data->conn.conn_id), p_data->conn.remote_bda);
++        audream_host_connection(true, p_data->conn.conn_id, p_data->conn.remote_bda, previous_lease);
+@@ -473,1 +524,2 @@
+     case BTA_GATTS_DISCONNECT_EVT: {
++        audream_host_connection(false, p_data->conn.conn_id, p_data->conn.remote_bda, 0);
+@@ -516,2 +569,5 @@
+-    uint16_t conn_id = blufi_env.conn_id;
+-    uint16_t attr_id = blufi_env.handle_char_e2p;
++    const audream_host_state_t state = audream_host_snapshot();
++    const uint16_t conn_id = state.connection;
++    const uint16_t attr_id = state.attribute;
++    const uint64_t lease = audream_blufi_operation_lease();
++    if (!audream_blufi_notify_current(conn_id, attr_id, lease)) return;
++
+@@ -518,3 +583,2 @@
+-    bool rsp = false;
+-    BTA_GATTS_HandleValueIndication(conn_id, attr_id, pkts->pkt_len,
+-                                    pkts->pkt, rsp);
++    if (!audream_blufi_queue_notification(lease, conn_id, attr_id, pkts->pkt_len, pkts->pkt))
++        BTC_TRACE_WARNING("BLUFI notification queue rejected the packet\n");
+@@ -526,1 +581,2 @@
+ void esp_blufi_deinit(void)
+ {
++    audream_startup_reset(AUDREAM_START_IDLE);
++    const audream_host_state_t state = audream_host_snapshot();
++    audream_host_connection(false, state.connection, state.address, 0);
+@@ -563,4 +619,9 @@
+     struct blufi_hdr *hdr = (struct blufi_hdr *)arg;
++    const audream_host_state_t state = audream_host_snapshot();
++    const uint16_t connection = state.connection;
++    const uint64_t lease = audream_blufi_operation_lease();
++    if (!audream_blufi_notify_current(connection, state.attribute, lease)) return;
+ retry:
+-    if (blufi_env.is_connected == false) {
++    if (!audream_blufi_notify_current(connection, state.attribute, lease)) {
+@@ -570,1 +640,1 @@
+-    if (esp_ble_get_cur_sendable_packets_num(BTC_GATT_GET_CONN_ID(blufi_env.conn_id)) > 0) {
++    if (esp_ble_get_cur_sendable_packets_num(BTC_GATT_GET_CONN_ID(connection)) > 0) {
+diff --git a/esp_blufi_api.c b/esp_blufi_api.c
+--- a/esp_blufi_api.c
++++ b/esp_blufi_api.c
+@@ -12,1 +12,2 @@
+ #if (BLUFI_INCLUDED == TRUE)
++#include "watch_blufi_btc_envelope.h"
++#include "watch_blufi_send.h"
+@@ -26,2 +28,7 @@
+ esp_err_t esp_blufi_send_wifi_conn_report(wifi_mode_t opmode, esp_blufi_sta_conn_state_t sta_conn_state, uint8_t softap_conn_num, esp_blufi_extra_info_t *extra_info)
++{
++    return audream_blufi_send_wifi_conn_report_for_lease(audream_blufi_operation_lease(), opmode, sta_conn_state, softap_conn_num, extra_info);
++}
++
++esp_err_t audream_blufi_send_wifi_conn_report_for_lease(uint64_t lease, wifi_mode_t opmode, esp_blufi_sta_conn_state_t sta_conn_state, uint8_t softap_conn_num, esp_blufi_extra_info_t *extra_info)
+ {
+@@ -41,3 +48,3 @@
+-    return (btc_transfer_context(&msg, &arg, sizeof(btc_blufi_args_t), btc_blufi_call_deep_copy,
+-                btc_blufi_call_deep_free) == BT_STATUS_SUCCESS ? ESP_OK : ESP_FAIL);
++    return (audream_blufi_transfer_for_lease(&msg, &arg, sizeof(btc_blufi_args_t), btc_blufi_call_deep_copy,
++                btc_blufi_call_deep_free, lease) == BT_STATUS_SUCCESS ? ESP_OK : ESP_FAIL);
+ }
+@@ -45,2 +52,7 @@
+ esp_err_t esp_blufi_send_wifi_list(uint16_t apCount, esp_blufi_ap_record_t *list)
++{
++    return audream_blufi_send_wifi_list_for_lease(audream_blufi_operation_lease(), apCount, list);
++}
++
++esp_err_t audream_blufi_send_wifi_list_for_lease(uint64_t lease, uint16_t apCount, esp_blufi_ap_record_t *list)
+ {
+@@ -58,3 +70,3 @@
+-    return (btc_transfer_context(&msg, &arg, sizeof(btc_blufi_args_t), btc_blufi_call_deep_copy,
+-                btc_blufi_call_deep_free) == BT_STATUS_SUCCESS ? ESP_OK : ESP_FAIL);
++    return (audream_blufi_transfer_for_lease(&msg, &arg, sizeof(btc_blufi_args_t), btc_blufi_call_deep_copy,
++                btc_blufi_call_deep_free, lease) == BT_STATUS_SUCCESS ? ESP_OK : ESP_FAIL);
+ }
+@@ -112,2 +124,7 @@
+ esp_err_t esp_blufi_send_custom_data(uint8_t *data, uint32_t data_len)
++{
++    return audream_blufi_send_custom_data_for_lease(audream_blufi_operation_lease(), data, data_len);
++}
++
++esp_err_t audream_blufi_send_custom_data_for_lease(uint64_t lease, uint8_t *data, uint32_t data_len)
+ {
+@@ -130,3 +147,3 @@
+-    return (btc_transfer_context(&msg, &arg, sizeof(btc_blufi_args_t), btc_blufi_call_deep_copy,
+-                btc_blufi_call_deep_free) == BT_STATUS_SUCCESS ? ESP_OK : ESP_FAIL);
++    return (audream_blufi_transfer_for_lease(&msg, &arg, sizeof(btc_blufi_args_t), btc_blufi_call_deep_copy,
++                btc_blufi_call_deep_free, lease) == BT_STATUS_SUCCESS ? ESP_OK : ESP_FAIL);
+ }
+diff --git a/blufi_protocol.c b/blufi_protocol.c
+--- a/blufi_protocol.c
++++ b/blufi_protocol.c
+@@ -20,1 +20,2 @@
+ #if (BLUFI_INCLUDED == TRUE)
++#include "watch_blufi_btc_envelope.h"
+diff --git a/blufi_prf.c b/blufi_prf.c
+--- a/blufi_prf.c
++++ b/blufi_prf.c
+@@ -26,1 +26,2 @@
+ #if (BLUFI_INCLUDED == TRUE)
++#include "watch_blufi_btc_envelope.h"
+@@ -87,4 +88,41 @@
++static uint64_t audream_receive_lease;
++static uint8_t audream_fragment_type;
++
++static void audream_reset_fragments(void)
++{
++    if (blufi_env.aggr_buf) osi_free(blufi_env.aggr_buf);
++    blufi_env.aggr_buf = NULL;
++    blufi_env.offset = 0;
++    blufi_env.total_len = 0;
++    audream_fragment_type = 0;
++}
++
++static void audream_receive_error(esp_blufi_error_state_t state)
++{
++    audream_reset_fragments();
++    btc_blufi_report_error(state);
++}
++
++#define btc_blufi_report_error audream_receive_error
++static void audream_blufi_recv_impl(uint8_t *data, int len);
+ void btc_blufi_recv_handler(uint8_t *data, int len)
++{
++    const audream_blufi_scope_t previous = audream_blufi_scope_enter(audream_blufi_operation_lease());
++    audream_blufi_recv_impl(data, len);
++    audream_blufi_scope_leave(previous);
++}
++
++static void audream_blufi_recv_impl(uint8_t *data, int len)
+ {
+-    if (len < sizeof(struct blufi_hdr)) {
++    const uint64_t lease = audream_blufi_operation_lease();
++    if (lease != audream_receive_lease) {
++        audream_reset_fragments();
++        blufi_env.recv_seq = blufi_env.sec_mode = 0;
++        audream_receive_lease = lease;
++    }
++    if (!lease) return;
++    if (!data || len < (int)sizeof(struct blufi_hdr)) {
+@@ -124,2 +158,13 @@
+     blufi_env.recv_seq++;
++    if ((BLUFI_FC_IS_ENC(hdr->fc) && (!blufi_env.cbs || !blufi_env.cbs->decrypt_func)) ||
++        (BLUFI_FC_IS_CHECK(hdr->fc) && (!blufi_env.cbs || !blufi_env.cbs->checksum_func))) {
++        btc_blufi_report_error(ESP_BLUFI_DATA_FORMAT_ERROR);
++        return;
++    }
+@@ -154,2 +193,31 @@
++    if (lease != audream_blufi_transport_lease()) {
++        audream_reset_fragments();
++        return;
++    }
++    if (BLUFI_FC_IS_FRAG(hdr->fc)) {
++        if (hdr->data_len <= 2) {
++            btc_blufi_report_error(ESP_BLUFI_DATA_FORMAT_ERROR);
++            return;
++        }
++        const uint16_t remaining = hdr->data[0] | ((uint16_t)hdr->data[1] << 8);
++        if (remaining <= hdr->data_len - 2 ||
++            (blufi_env.offset && (hdr->type != audream_fragment_type ||
++                remaining != blufi_env.total_len - blufi_env.offset))) {
++            btc_blufi_report_error(ESP_BLUFI_DATA_FORMAT_ERROR);
++            return;
++        }
++        if (!blufi_env.offset) audream_fragment_type = hdr->type;
++    } else if (blufi_env.offset && hdr->type != audream_fragment_type) {
++        btc_blufi_report_error(ESP_BLUFI_DATA_FORMAT_ERROR);
++        return;
++    }
++
+     if (BLUFI_FC_IS_REQ_ACK(hdr->fc)) {
+@@ -202,3 +270,7 @@
+             memcpy(blufi_env.aggr_buf + blufi_env.offset, hdr->data, hdr->data_len);
++            if (lease != audream_blufi_transport_lease()) {
++                audream_reset_fragments();
++                return;
++            }
+ 
+             btc_blufi_protocol_handler(hdr->type, blufi_env.aggr_buf, blufi_env.total_len);
+@@ -208,2 +280,6 @@
+         } else {
++            if (lease != audream_blufi_transport_lease()) {
++                audream_reset_fragments();
++                return;
++            }
+             btc_blufi_protocol_handler(hdr->type, hdr->data, hdr->data_len);
+@@ -213,2 +289,3 @@
+ }
++#undef btc_blufi_report_error
++static void audream_blufi_send_impl(uint8_t type, uint8_t *data, int total_data_len);
+ void btc_blufi_send_encap(uint8_t type, uint8_t *data, int total_data_len)
++{
++    const audream_blufi_scope_t previous = audream_blufi_scope_enter(audream_blufi_operation_lease());
++    audream_blufi_send_impl(type, data, total_data_len);
++    audream_blufi_scope_leave(previous);
++}
++
++static void audream_blufi_send_impl(uint8_t type, uint8_t *data, int total_data_len)
+@@ -219,2 +309,5 @@
+     int ret;
++    const uint64_t lease = audream_blufi_operation_lease();
++    if (!lease || !data || total_data_len <= 0 || !blufi_env.frag_size) return;
+@@ -226,2 +319,3 @@
+     while (remain_len > 0) {
++        if (lease != audream_blufi_operation_lease()) return;
+         if (remain_len > blufi_env.frag_size) {
+@@ -602,4 +605,13 @@
++static void audream_blufi_cb_impl(btc_msg_t *msg);
+ void btc_blufi_cb_handler(btc_msg_t *msg)
++{
++    audream_blufi_dispatch_message(msg, audream_blufi_cb_impl, btc_blufi_cb_deep_free);
++}
++
++static void audream_blufi_cb_impl(btc_msg_t *msg)
+ {
+     esp_blufi_cb_param_t *param = (esp_blufi_cb_param_t *)msg->arg;
+@@ -878,4 +885,13 @@
++static void audream_blufi_call_impl(btc_msg_t *msg);
+ void btc_blufi_call_handler(btc_msg_t *msg)
++{
++    audream_blufi_dispatch_message(msg, audream_blufi_call_impl, btc_blufi_call_deep_free);
++}
++
++static void audream_blufi_call_impl(btc_msg_t *msg)
+ {
+     btc_blufi_args_t *arg = (btc_blufi_args_t *)msg->arg;
+diff --git a/bta_gatts_api.c b/bta_gatts_api.c
+--- a/bta_gatts_api.c
++++ b/bta_gatts_api.c
+@@ -35,1 +35,4 @@
+ #include "stack/l2c_api.h"
++#include "stack/btu.h"
++#include "watch_blufi_bta.h"
++#include "watch_blufi_scope.h"
+@@ -411,2 +414,33 @@
++bool audream_blufi_queue_notification(uint64_t lease, uint16_t connection, uint16_t attribute,
++    int length, const uint8_t* data)
++{
++    if (!lease || lease != audream_blufi_operation_lease() || !data || length <= 0 ||
++        length > BTA_GATT_MAX_ATTR_LEN || !audream_blufi_notify_current(connection, attribute, lease)) return false;
++    const uint64_t subscription = audream_blufi_notify_token(connection, attribute, lease);
++    if (!subscription) return false;
++    audream_blufi_bta_message_t* message = osi_malloc(sizeof(*message));
++    if (!message) return false;
++    memset(message, 0, sizeof(*message));
++    message->packet.hdr.event = BTA_GATTS_API_INDICATION_EVT;
++    message->packet.hdr.layer_specific = connection;
++    message->packet.hdr.offset = AUDREAM_BLUFI_BTA_TAG;
++    message->packet.hdr.len = sizeof(*message);
++    message->packet.attr_id = attribute;
++    message->packet.len = length;
++    memcpy(message->packet.value, data, length);
++    message->lease = lease;
++    message->subscription = subscription;
++    // BLUFI bypasses the public GATTS BTC API and owns only a BTU credit.
++    l2ble_update_att_acl_pkt_num(L2CA_ADD_BTU_NUM, NULL);
++    // ACKs may originate on BTU itself; never wait for that task's queue to drain.
++    if (!btu_task_post(SIG_BTU_BTA_MSG, message, 0)) {
++        l2ble_update_att_acl_pkt_num(L2CA_DECREASE_BTU_NUM, NULL);
++        osi_free(message);
++        return false;
++    }
++    return true;
++}
++
+ void BTA_GATTS_HandleValueIndication (UINT16 conn_id, UINT16 attr_id, UINT16 data_len,
+                                       UINT8 *p_data, BOOLEAN need_confirm)
+diff --git a/bta_gatts_act.c b/bta_gatts_act.c
+--- a/bta_gatts_act.c
++++ b/bta_gatts_act.c
+@@ -38,1 +38,2 @@
+ #include "l2c_int.h"
++#include "watch_blufi_bta.h"
+@@ -677,2 +678,13 @@
++    const bool audream_notification = audream_blufi_bta_tagged(&p_msg->api_indicate);
++    if (audream_notification) l2ble_update_att_acl_pkt_num(L2CA_DECREASE_BTU_NUM, NULL);
++    if (!audream_blufi_bta_admit(&p_msg->api_indicate)) {
++        if (!audream_notification && !p_msg->api_indicate.need_confirm)
++            l2ble_update_att_acl_pkt_num(L2CA_DECREASE_BTU_NUM, NULL);
++        return;
++    }
++
+     p_srvc_cb = bta_gatts_find_srvc_cb_by_attr_id (p_cb, p_msg->api_indicate.attr_id);
+@@ -683,1 +702,2 @@
++            if (audream_notification && !audream_blufi_bta_admit(&p_msg->api_indicate)) return;
+             p_rcb = bta_gatts_find_app_rcb_by_app_if(gatt_if);
+@@ -692,1 +704,1 @@
+-                l2ble_update_att_acl_pkt_num(L2CA_DECREASE_BTU_NUM, NULL);
++                if (!audream_notification) l2ble_update_att_acl_pkt_num(L2CA_DECREASE_BTU_NUM, NULL);
+diff --git a/l2c_link.c b/l2c_link.c
+--- a/l2c_link.c
++++ b/l2c_link.c
+@@ -391,1 +391,28 @@
+         p_lcb->link_state = LST_DISCONNECTING;
++#if (BLE_INCLUDED == TRUE)
++        if (p_lcb->transport == BT_TRANSPORT_LE) {
++            // A pending reconnect may retain this LCB and its fixed CCBs.
++            // No queued bytes from the completed physical link may survive.
++            l2ble_update_att_acl_pkt_num(L2CA_BUFF_FREE, NULL);
++#if (L2CAP_NUM_FIXED_CHNLS > 0)
++            for (int xx = 0; xx < L2CAP_NUM_FIXED_CHNLS; ++xx) {
++                tL2C_CCB *fixed = p_lcb->p_fixed_ccbs[xx];
++                if (fixed && fixed->xmit_hold_q) {
++                    BT_HDR *packet;
++                    while ((packet = fixed_queue_dequeue(fixed->xmit_hold_q, 0)) != NULL) {
++                        osi_free(packet);
++                    }
++                    fixed->cong_sent = FALSE;
++                }
++            }
++#endif
++            if (p_lcb->link_xmit_data_q) {
++                while (!list_is_empty(p_lcb->link_xmit_data_q)) {
++                    BT_HDR *packet = list_front(p_lcb->link_xmit_data_q);
++                    list_remove(p_lcb->link_xmit_data_q, packet);
++                    osi_free(packet);
++                }
++            }
++        }
++#endif

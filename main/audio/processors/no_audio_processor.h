@@ -4,6 +4,7 @@
 #include <vector>
 #include <functional>
 #include <atomic>
+#include <mutex>
 
 #include "audio_processor.h"
 #include "audio_codec.h"
@@ -11,12 +12,12 @@
 class NoAudioProcessor : public AudioProcessor {
 public:
     NoAudioProcessor() = default;
-    ~NoAudioProcessor() = default;
+    ~NoAudioProcessor();
 
-    void Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
+    bool Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
     void Feed(std::vector<int16_t>&& data) override;
-    void Start() override;
-    void Stop() override;
+    bool Start() override;
+    bool Stop(uint32_t timeout_ms = 3000) override;
     bool IsRunning() override;
     void OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) override;
     void OnVadStateChange(std::function<void(bool speaking)> callback) override;
@@ -30,6 +31,8 @@ private:
     std::function<void(std::vector<int16_t>&& data)> output_callback_;
     std::function<void(bool speaking)> vad_state_change_callback_;
     std::atomic<bool> is_running_ = false;
+    std::timed_mutex feed_mutex_;
+    bool stopping_ = false;
 };
 
-#endif 
+#endif

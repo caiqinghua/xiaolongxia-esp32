@@ -17,5 +17,8 @@ main/mmap_generate_emoji.h
 .cache
 *.pyc
 *.bin
+factory-identity.nvs.csv
+pairing-seed.*
+release-signing*.pem
 mmap_generate_*.h
 .clangd

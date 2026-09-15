@@ -1,62 +1,55 @@
-#ifndef AFE_WAKE_WORD_H
-#define AFE_WAKE_WORD_H
-
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/event_groups.h>
+#pragma once
 
 #include <esp_afe_sr_models.h>
-#include <esp_nsn_models.h>
-#include <model_path.h>
-
-#include <deque>
-#include <string>
-#include <vector>
-#include <functional>
-#include <mutex>
 #include <condition_variable>
-
-#include "audio_codec.h"
+#include <deque>
+#include <mutex>
 #include "wake_word.h"
 
 class AfeWakeWord : public WakeWord {
 public:
-    AfeWakeWord();
-    ~AfeWakeWord();
-
-    bool Initialize(AudioCodec* codec, srmodel_list_t* models_list);
-    void Feed(const std::vector<int16_t>& data);
-    void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback);
-    void Start();
-    void Stop();
-    size_t GetFeedSize();
-    void EncodeWakeWordData();
-    bool GetWakeWordOpus(std::vector<uint8_t>& opus);
-    const std::string& GetLastDetectedWakeWord() const { return last_detected_wake_word_; }
+    // The owner serializes initialization/destruction with public calls. Wake
+    // callbacks only enqueue events; they must not synchronously stop this worker.
+    AfeWakeWord() = default;
+    ~AfeWakeWord() override;
+    bool Initialize(AudioCodec* codec, srmodel_list_t* models) override;
+    void Feed(const std::vector<int16_t>& data) override;
+    void OnWakeWordDetected(std::function<void(const std::string&)> callback) override;
+    void Start() override;
+    void Stop() override;
+    bool SupportsBoundedHandoff() const override { return true; }
+    bool StartChecked() override;
+    bool StopAndDrain(uint32_t timeout_ms) override;
+    size_t GetFeedSize() override;
+    void EncodeWakeWordData() override;
+    bool GetWakeWordOpus(std::vector<uint8_t>& opus) override;
+    // Read after the detection callback and before rearming the detector.
+    const std::string& GetLastDetectedWakeWord() const override { return last_detected_wake_word_; }
 
 private:
-    srmodel_list_t *models_ = nullptr;
+    bool Halt(uint32_t timeout_ms, bool discard_pcm);
+    bool IsCurrent(uint64_t generation);
+    void Worker();
+    void Encode(std::vector<int16_t> pcm, uint64_t generation);
+    void StorePcmLocked(const int16_t* data, size_t samples);
+
+    AudioCodec* codec_ = nullptr;
     const esp_afe_sr_iface_t* afe_iface_ = nullptr;
     esp_afe_sr_data_t* afe_data_ = nullptr;
-    char* wakenet_model_ = NULL;
-    std::vector<std::string> wake_words_;
-    EventGroupHandle_t event_group_;
-    std::function<void(const std::string& wake_word)> wake_word_detected_callback_;
-    AudioCodec* codec_ = nullptr;
+    std::vector<std::vector<std::string>> wake_words_;
     std::string last_detected_wake_word_;
+    std::function<void(const std::string&)> callback_;
+    std::timed_mutex lifecycle_mutex_;
+    std::timed_mutex input_mutex_;
     std::vector<int16_t> input_buffer_;
-    std::mutex input_buffer_mutex_;
-
-    TaskHandle_t wake_word_encode_task_ = nullptr;
-    StaticTask_t* wake_word_encode_task_buffer_ = nullptr;
-    StackType_t* wake_word_encode_task_stack_ = nullptr;
-    std::deque<std::vector<int16_t>> wake_word_pcm_;
-    std::deque<std::vector<uint8_t>> wake_word_opus_;
-    std::mutex wake_word_mutex_;
-    std::condition_variable wake_word_cv_;
-
-    void StoreWakeWordData(const int16_t* data, size_t size);
-    void AudioDetectionTask();
+    std::mutex state_mutex_;
+    std::condition_variable state_cv_;
+    bool running_ = false, stopping_ = false, shutdown_ = false;
+    bool worker_active_ = false, worker_exited_ = true;
+    bool encode_requested_ = false, encoding_ = false, encode_done_ = true;
+    uint64_t generation_ = 0;
+    size_t pcm_samples_ = 0;
+    std::deque<std::vector<int16_t>> pcm_;
+    std::vector<int16_t> encode_pcm_;
+    std::deque<std::vector<uint8_t>> opus_;
 };
-
-#endif

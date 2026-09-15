@@ -1,0 +1,388 @@
+diff --git a/include/tcp.h b/include/tcp.h
+--- a/include/tcp.h
++++ b/include/tcp.h
+@@ -5,2 +5,3 @@
+ #include <string>
+ #include <functional>
++#include <atomic>
++#include <cstdint>
+@@ -15,1 +17,4 @@
+     virtual void Disconnect() = 0;
++    // Unsupported transports must not claim a deadline-bounded release.
++    virtual bool DisconnectWithin(uint32_t timeout_ms) { (void)timeout_ms; return false; }
+@@ -33,1 +34,1 @@
+-    bool connected_ = false;         // 是否可以正常读写数据
++    std::atomic<bool> connected_{false};
+diff --git a/include/web_socket.h b/include/web_socket.h
+--- a/include/web_socket.h
++++ b/include/web_socket.h
+@@ -10,1 +10,2 @@
+ #include <memory>
++#include <atomic>
++#include <cstdint>
+@@ -29,1 +31,2 @@
+     void Close();
++    bool DisconnectWithin(uint32_t timeout_ms);
+@@ -44,2 +45,2 @@
+-    bool handshake_completed_ = false;
+-    bool connected_ = false;
++    std::atomic<bool> handshake_completed_{false};
++    std::atomic<bool> connected_{false};
++    std::atomic<bool> receive_enabled_{false};
+@@ -65,1 +68,5 @@
+     void OnTcpData(const std::string& data);
++    void ParseBufferedData();
++    void RejectReceive();
++    static constexpr size_t kMaxHandshakeBytes = 8192;
++    static constexpr size_t kMaxMessageBytes = 65536;
+diff --git a/src/esp/esp_tcp.h b/src/esp/esp_tcp.h
+--- a/src/esp/esp_tcp.h
++++ b/src/esp/esp_tcp.h
+@@ -18,1 +18,2 @@
+     void Disconnect() override;
++    bool DisconnectWithin(uint32_t timeout_ms) override;
+@@ -27,1 +28,2 @@
+     int last_error_ = 0;
++    bool disconnect_notification_pending_ = false;
+diff --git a/src/esp/esp_ssl.h b/src/esp/esp_ssl.h
+--- a/src/esp/esp_ssl.h
++++ b/src/esp/esp_ssl.h
+@@ -19,1 +19,2 @@
+     void Disconnect() override;
++    bool DisconnectWithin(uint32_t timeout_ms) override;
+diff --git a/src/esp/esp_tcp.cc b/src/esp/esp_tcp.cc
+--- a/src/esp/esp_tcp.cc
++++ b/src/esp/esp_tcp.cc
+@@ -27,4 +27,2 @@
+-    // 确保先断开已有连接
+-    if (connected_) {
+-        Disconnect();
+-    }
++    // Join a previous receive task even after a passive disconnect.
++    Disconnect();
++    if (event_group_ == nullptr) {
++        last_error_ = ENOMEM;
++        return false;
++    }
+@@ -70,1 +68,1 @@
+-    xTaskCreate([](void* arg) {
++    const auto created = xTaskCreate([](void* arg) {
+@@ -77,1 +75,8 @@
+     }, "tcp_receive", 4096, this, 1, &receive_task_handle_);
++    if (created != pdPASS) {
++        receive_task_handle_ = nullptr;
++        connected_ = false;
++        close(tcp_fd_);
++        tcp_fd_ = -1;
++        ESP_LOGE(TAG, "Failed to create TCP receive task");
++        last_error_ = ENOMEM;
++        return false;
++    }
+@@ -82,10 +88,2 @@
+ void EspTcp::Disconnect() {
+-    // 如果已经断开，直接返回
+-    if (!connected_) {
+-        return;
+-    }
+-
+-    // 主动断开，需要等待接收任务退出
+     DoDisconnect(true);
+ }
+@@ -94,28 +92,27 @@
+ void EspTcp::DoDisconnect(bool wait_for_task) {
+-    connected_ = false;
+-
+-    if (tcp_fd_ != -1) {
+-        close(tcp_fd_);
+-        tcp_fd_ = -1;
+-
+-        // 只有主动断开时才需要等待接收任务退出
+-        // 被动断开时，当前就是接收任务，不需要等待
+-        if (wait_for_task) {
+-            auto bits = xEventGroupWaitBits(event_group_, ESP_TCP_EVENT_RECEIVE_TASK_EXIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+-            if (!(bits & ESP_TCP_EVENT_RECEIVE_TASK_EXIT)) {
+-                ESP_LOGE(TAG, "Failed to wait for receive task exit");
+-            }
+-        }
+-    }
+-
+-    // 断开连接时触发断开回调
+-    if (disconnect_callback_) {
++    if (wait_for_task) {
++        (void)DisconnectWithin(UINT32_MAX);
++        return;
++    }
++    if (connected_.exchange(false) && disconnect_callback_) {
+         disconnect_callback_();
+     }
+ }
++
++bool EspTcp::DisconnectWithin(uint32_t timeout_ms) {
++    if (connected_.exchange(false)) disconnect_notification_pending_ = true;
++    // Keep the descriptor and task handle until the receive task acknowledges.
++    if (tcp_fd_ >= 0) shutdown(tcp_fd_, SHUT_RDWR);
++    if (receive_task_handle_ != nullptr) {
++        if (xTaskGetCurrentTaskHandle() == receive_task_handle_) return false;
++        const auto ticks = timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
++        const auto bits = xEventGroupWaitBits(event_group_, ESP_TCP_EVENT_RECEIVE_TASK_EXIT,
++                                             pdFALSE, pdFALSE, ticks);
++        if (!(bits & ESP_TCP_EVENT_RECEIVE_TASK_EXIT)) return false;
++        receive_task_handle_ = nullptr;
++    }
++    if (tcp_fd_ >= 0) {
++        close(tcp_fd_);
++        tcp_fd_ = -1;
++    }
++    const bool notify = disconnect_notification_pending_;
++    disconnect_notification_pending_ = false;
++    if (notify && disconnect_callback_) disconnect_callback_();
++    return true;
++}
+diff --git a/src/esp/esp_ssl.cc b/src/esp/esp_ssl.cc
+--- a/src/esp/esp_ssl.cc
++++ b/src/esp/esp_ssl.cc
+@@ -5,1 +5,2 @@
+ #include <unistd.h>
++#include <sys/socket.h>
++#include <cerrno>
+@@ -24,1 +26,5 @@
+ bool EspSsl::Connect(const std::string& host, int port) {
++    if (event_group_ == nullptr) {
++        last_error_ = ENOMEM;
++        return false;
++    }
+@@ -32,1 +33,2 @@
+     cfg.crt_bundle_attach = esp_crt_bundle_attach;
++    cfg.timeout_ms = 10000;
+@@ -59,1 +61,1 @@
+-    xTaskCreate([](void* arg) {
++    const auto created = xTaskCreate([](void* arg) {
+@@ -66,1 +68,9 @@
+     }, "ssl_receive", 4096, this, 1, &receive_task_handle_);
++    if (created != pdPASS) {
++        receive_task_handle_ = nullptr;
++        connected_ = false;
++        esp_tls_conn_destroy(tls_client_);
++        tls_client_ = nullptr;
++        ESP_LOGE(TAG, "Failed to create TLS receive task");
++        last_error_ = ENOMEM;
++        return false;
++    }
+@@ -70,1 +80,5 @@
+ void EspSsl::Disconnect() {
++    (void)DisconnectWithin(UINT32_MAX);
++}
++
++bool EspSsl::DisconnectWithin(uint32_t timeout_ms) {
+@@ -74,21 +84,24 @@
+     // Close socket if it is open
+     if (tls_client_ != nullptr) {
+-        int sockfd;
+-        ESP_ERROR_CHECK(esp_tls_get_conn_sockfd(tls_client_, &sockfd));
+-        if (sockfd >= 0) {
+-            close(sockfd);
++        int sockfd = -1;
++        if (esp_tls_get_conn_sockfd(tls_client_, &sockfd) == ESP_OK && sockfd >= 0) {
++            // TLS owns the descriptor; only its destructor may close it.
++            shutdown(sockfd, SHUT_RDWR);
+         }
+     
+-        auto bits = xEventGroupWaitBits(event_group_, ESP_SSL_EVENT_RECEIVE_TASK_EXIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+-        if (!(bits & ESP_SSL_EVENT_RECEIVE_TASK_EXIT)) {
+-            ESP_LOGE(TAG, "Failed to wait for receive task exit");
++        if (receive_task_handle_ != nullptr) {
++            if (xTaskGetCurrentTaskHandle() == receive_task_handle_) return false;
++            const auto ticks = timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
++            const auto bits = xEventGroupWaitBits(event_group_, ESP_SSL_EVENT_RECEIVE_TASK_EXIT,
++                                                 pdFALSE, pdFALSE, ticks);
++            if (!(bits & ESP_SSL_EVENT_RECEIVE_TASK_EXIT)) return false;
++            receive_task_handle_ = nullptr;
+         }
+@@ -94,3 +112,4 @@
+         tls_client_ = nullptr;
+     }
++    return true;
+ }
+@@ -145,1 +159,2 @@
+         if (ret == ESP_TLS_ERR_SSL_WANT_READ) {
++            vTaskDelay(pdMS_TO_TICKS(1));
+             continue;
+diff --git a/src/web_socket.cc b/src/web_socket.cc
+--- a/src/web_socket.cc
++++ b/src/web_socket.cc
+@@ -56,3 +56,3 @@
+-    if (connected_) {
+-        tcp_->Disconnect();
+-    }
++    // Join the TCP/TLS task before destroying callback state or event groups,
++    // including connections whose peer has already closed the stream.
++    tcp_.reset();
+@@ -78,1 +78,5 @@
+ bool WebSocket::Connect(const char* uri) {
++    if (handshake_event_group_ == nullptr) {
++        ESP_LOGE(TAG, "Failed to allocate WebSocket handshake event group");
++        return false;
++    }
+@@ -146,1 +146,23 @@
+     connected_ = false;
++    handshake_completed_ = false;
++    receive_buffer_.clear();
++    current_message_.clear();
++    is_fragmented_ = false;
++    continuation_ = false;
++    if (!tcp_) return false;
++    receive_enabled_ = true;
++    xEventGroupClearBits(handshake_event_group_, HANDSHAKE_SUCCESS_BIT | HANDSHAKE_FAILED_BIT);
++    // Install callbacks before the receive task can observe any server bytes.
++    tcp_->OnStream([this](const std::string& data) {
++        this->OnTcpData(data);
++    });
++    tcp_->OnDisconnected([this]() {
++        receive_enabled_ = false;
++        const bool was_connected = connected_.exchange(false);
++        xEventGroupSetBits(handshake_event_group_, HANDSHAKE_FAILED_BIT);
++        if (was_connected && on_disconnected_) on_disconnected_();
++    });
+@@ -171,25 +193,0 @@
+-    // 清除事件位
+-    xEventGroupClearBits(handshake_event_group_, HANDSHAKE_SUCCESS_BIT | HANDSHAKE_FAILED_BIT);
+-    
+-    // 设置数据接收回调来处理握手和后续的WebSocket帧
+-    tcp_->OnStream([this](const std::string& data) {
+-        this->OnTcpData(data);
+-    });
+-
+-    // 设置断开连接回调
+-    tcp_->OnDisconnected([this]() {
+-        if (connected_) {
+-            connected_ = false;
+-            if (on_disconnected_) {
+-                on_disconnected_();
+-            }
+-        }
+-    });
+-
+@@ -207,2 +204,2 @@
+-    if (bits & HANDSHAKE_SUCCESS_BIT) {
++    if ((bits & HANDSHAKE_SUCCESS_BIT) && !(bits & HANDSHAKE_FAILED_BIT)) {
+-        connected_ = true;
+@@ -251,1 +260,8 @@
++bool WebSocket::DisconnectWithin(uint32_t timeout_ms) {
++    receive_enabled_ = false;
++    connected_ = false;
++    if (tcp_ && !tcp_->DisconnectWithin(timeout_ms)) return false;
++    tcp_.reset();
++    return true;
++}
++
+ void WebSocket::Ping() {
+@@ -291,3 +291,35 @@
+ void WebSocket::OnTcpData(const std::string& data) {
+-    // 将新数据追加到接收缓冲区
+-    receive_buffer_.append(data);
++    // Consume a TCP chunk incrementally; several valid messages may share it.
++    size_t offset = 0;
++    while (offset < data.size() && receive_enabled_) {
++        const size_t limit = handshake_completed_ ? kMaxMessageBytes + 10 : kMaxHandshakeBytes;
++        if (receive_buffer_.size() >= limit) {
++            RejectReceive();
++            return;
++        }
++        const size_t count = std::min(data.size() - offset,
++                                     std::min(size_t{1024}, limit - receive_buffer_.size()));
++        receive_buffer_.append(data.data() + offset, count);
++        offset += count;
++        ParseBufferedData();
++    }
++}
++
++void WebSocket::RejectReceive() {
++    // The receive task retires parsing; only the owner may join/destroy TCP.
++    if (!receive_enabled_.exchange(false)) return;
++    receive_buffer_.clear();
++    current_message_.clear();
++    is_fragmented_ = false;
++    const bool was_connected = connected_.exchange(false);
++    xEventGroupSetBits(handshake_event_group_, HANDSHAKE_FAILED_BIT);
++    ESP_LOGE(TAG, "Invalid or oversized WebSocket input; receive session retired");
++    if (on_error_) on_error_(-1);
++    if (was_connected && on_disconnected_) on_disconnected_();
++}
++
++void WebSocket::ParseBufferedData() {
+@@ -303,1 +333,1 @@
+-            if (handshake_response.find("HTTP/1.1 101") != std::string::npos) {
++            if (handshake_response.rfind("HTTP/1.1 101 ", 0) == 0) {
+                 handshake_completed_ = true;
++                connected_ = true;
+@@ -308,4 +338,2 @@
+             } else {
+-                ESP_LOGE(TAG, "WebSocket handshake failed");
+-                // 设置握手失败事件
+-                xEventGroupSetBits(handshake_event_group_, HANDSHAKE_FAILED_BIT);
++                RejectReceive();
+                 return;
+@@ -314,2 +342,2 @@
+-            // 握手响应未完整接收
++            if (receive_buffer_.size() >= kMaxHandshakeBytes) RejectReceive();
+             return;
+@@ -324,1 +352,1 @@
+-    while (buffer_offset < buffer_size) {
++    while (buffer_offset < buffer_size && receive_enabled_) {
+@@ -331,1 +359,17 @@
+         uint64_t payload_length = buffer[buffer_offset + 1] & 0x7F;
++        const uint8_t length_code = static_cast<uint8_t>(payload_length);
++        const bool control = (opcode & 0x08) != 0;
++        const bool known = opcode == 0 || opcode == 1 || opcode == 2 ||
++                           opcode == 8 || opcode == 9 || opcode == 10;
++        if ((buffer[buffer_offset] & 0x70) || mask || !known ||
++            (control && (!fin || length_code > 125)) ||
++            (opcode == 0 && !is_fragmented_) ||
++            ((opcode == 1 || opcode == 2) && is_fragmented_)) {
++            RejectReceive();
++            return;
++        }
+@@ -347,1 +391,13 @@
+         }
++        // Validate advertised sizes before waiting for or allocating payloads.
++        if ((length_code == 126 && payload_length < 126) ||
++            (length_code == 127 && payload_length < 65536) ||
++            payload_length > kMaxMessageBytes ||
++            (!control && payload_length > kMaxMessageBytes - current_message_.size()) ||
++            (opcode == 8 && payload_length == 1)) {
++            RejectReceive();
++            return;
++        }
+@@ -363,10 +419,2 @@
+-        // 解码有效载荷
+-        std::vector<char> payload(payload_length);
+-        if (payload_length > 0) {
+-            memcpy(payload.data(), buffer + buffer_offset + header_length, payload_length);
+-            if (mask) {
+-                for (size_t i = 0; i < payload_length; ++i) {
+-                    payload[i] ^= mask_key[i % 4];
+-                }
+-            }
+-        }
++        // Server frames are unmasked; borrow bytes until the callback returns.
++        const char* payload = reinterpret_cast<const char*>(buffer + buffer_offset + header_length);
+@@ -389,1 +437,1 @@
+-                current_message_.insert(current_message_.end(), payload.begin(), payload.end());
++                current_message_.insert(current_message_.end(), payload, payload + payload_length);
+@@ -399,6 +447,13 @@
+             case 0x8: // 关闭帧
+-                connected_ = false;
+-                if (on_disconnected_) {
++                receive_enabled_ = false;
++                receive_buffer_.clear();
++                current_message_.clear();
++                is_fragmented_ = false;
++                xEventGroupSetBits(handshake_event_group_, HANDSHAKE_FAILED_BIT);
++                if (connected_.exchange(false) && on_disconnected_) {
+                     on_disconnected_();
+                 }
+-                break;
++                return;
+@@ -406,1 +463,1 @@
+-                SendControlFrame(0xA, payload.data(), payload_length);
++                SendControlFrame(0xA, payload, payload_length);

@@ -1,0 +1,23 @@
+diff --git a/src/platform/SensorCommBase.hpp b/src/platform/SensorCommBase.hpp
+--- a/src/platform/SensorCommBase.hpp
++++ b/src/platform/SensorCommBase.hpp
+@@ -456,6 +456,7 @@
+ class SensorHal : public SensorHalCustom
+ {
+ public:
++    virtual ~SensorHal() = default;
+     /**
+      * @brief  Set the mode of a digital pin.
+      * @param pin   Pin number.
+diff --git a/src/platform/SensorCommCustom.hpp b/src/platform/SensorCommCustom.hpp
+--- a/src/platform/SensorCommCustom.hpp
++++ b/src/platform/SensorCommCustom.hpp
+@@ -54,7 +54,7 @@
+         }
+     }
+ 
+-    int writeBuffer(uint8_t *buffer, size_t len)
++    int writeBuffer(uint8_t *buffer, size_t len) override
+     {
+         if (customCallback(addr, 0x00, buffer, len, false, true)) {
+             return 0;

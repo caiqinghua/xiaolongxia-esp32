@@ -26,6 +26,7 @@ private:
     gpio_num_t pa_pin_ = GPIO_NUM_NC;
     uint8_t input_mic_mask_ = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4;
     std::mutex data_if_mutex_;
+    bool watch_playback_shutdown_started_ = false;
 
     void CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
         bool enable_output_path);
@@ -34,6 +35,8 @@ private:
     void ForcePowerAmplifierOff();
     uint16_t InputChannelMask() const;
     uint16_t MicrophoneChannelMask() const;
+    bool DrainWatchPlaybackLocked();
+    bool ApplyWatchOutputVolumeLocked(int volume);
 
     virtual int Read(int16_t* dest, int samples) override;
     virtual int Write(const int16_t* data, int samples) override;
@@ -47,6 +50,10 @@ public:
     virtual ~BoxAudioCodec();
 
     virtual void SetOutputVolume(int volume) override;
+    bool SetWatchOutputVolume(int volume) override;
+    bool SupportsWatchPlayback() const override;
+    bool SetWatchPlaybackOutput(bool enable) override;
+    bool WriteWatchPlayback(const std::vector<int16_t>& data) override;
     virtual void SetInputGain(float gain) override;
     virtual bool InputData(std::vector<int16_t>& data) override;
     virtual void EnableInput(bool enable) override;

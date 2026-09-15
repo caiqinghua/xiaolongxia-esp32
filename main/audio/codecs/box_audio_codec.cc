@@ -356,6 +356,8 @@ void BoxAudioCodec::EnableOutput(bool enable) {
         return;
     }
     if (enable) {
+        // Local recording disables TX; restore its clock before opening the DAC.
+        EnsureChannelEnabled(tx_handle_);
         // Play 16bit 1 channel
         esp_codec_dev_sample_info_t fs = {
             .bits_per_sample = 16,

@@ -6,8 +6,14 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <functional>
+#include "blufi_session_state.h"
+#include "blufi_control_session.h"
+#include "blufi_profile_startup.h"
 #include "esp_blufi_api.h"
 #include "esp_err.h"
+#include "esp_event.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,12 +28,8 @@ public:
      */
     static Blufi &GetInstance();
 
-    /**
-     * @brief Start WiFi scan for Blufi provisioning
-     * This method intelligently handles WiFi scanning based on current WiFi state:
-     * - If WiFi config mode is active, it uses the existing scan results from WifiConfigurationAp
-     * - Otherwise, it performs a dedicated scan without interfering with normal WiFi operations
-     */
+    // Request one asynchronous station scan while provisioning owns WiFi.
+    // Active access points are never switched or stopped by this operation.
     void start_wifi_scan();
 
     /**
@@ -36,6 +38,17 @@ public:
      * @return ESP_OK on success, otherwise an error code.
      */
     esp_err_t init(bool enable_wifi_provisioning = true);
+    esp_err_t init(BlufiRole role);
+    void SuspendWifiProvisioning();
+    bool RunWithoutWifiProvisioning(const std::function<bool()>& operation);
+    // Keep an existing control-only host alive until the pairing worker joins.
+    uint64_t AcquireControlLease();
+    bool ReleaseControlLease(uint64_t lease);
+
+    using ControlTicket = BlufiControlSession::Ticket;
+    ControlTicket CaptureControlPeer() const;
+    bool IsControlPeerCurrent(const ControlTicket& ticket) const;
+    esp_err_t SendControlData(const ControlTicket& ticket, const uint8_t* data, size_t length);
 
     /**
      * @brief Deinitializes Blufi and the Bluetooth stack.
@@ -43,6 +56,9 @@ public:
      */
     esp_err_t deinit();
     bool IsActive() const;
+    bool IsControlReady() const;
+    bool IsConnected() const { return m_ble_is_connected.load(); }
+    bool IsWifiProvisioning() const { return session_.AllowsProvisioning(); }
 
     esp_err_t SendDeviceWillSleepEvent();
     esp_err_t SendRecordingStartedEvent(
@@ -68,8 +84,18 @@ public:
     Blufi &operator=(const Blufi &) = delete;
 
 private:
-    bool inited_ = false;
-    bool control_only_mode_ = false;
+    std::mutex lifecycle_mutex_;
+    std::mutex credentials_mutex_;
+    BlufiSessionState session_;
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    BlufiControlSession control_session_{true};
+    BlufiProfileStartup profile_startup_;
+#else
+    BlufiControlSession control_session_{false};
+#endif
+    bool shutdown_failed_ = false;
+    uint64_t control_lease_ = 0;
+    uint64_t next_control_lease_ = 0;
 
     Blufi();
 
@@ -87,6 +113,11 @@ private:
     static esp_err_t _gap_register_callback();
 
     static esp_err_t _host_and_cb_init();
+    void HandleProfileInitialized(bool success);
+
+#if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
+    static esp_err_t AbortSecureHostStart();
+#endif
 
     void _security_init();
 
@@ -107,7 +138,7 @@ private:
 
     // WiFi scan methods
     void _send_wifi_list();
-    void _start_dedicated_wifi_scan();
+    void StartWifiScanAllowed();
     static void _wifi_scan_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
                                          void *event_data);
 
@@ -151,19 +182,28 @@ private:
 
     // State variables
     wifi_config_t m_sta_config{};
-    bool m_ble_is_connected;
+    std::atomic<bool> m_ble_is_connected{false};
     bool m_sta_connected;
     bool m_sta_got_ip;
-    bool m_provisioned;
-    bool m_deinited;
+    bool m_ssid_valid = false;
+    bool m_password_valid = true;
     uint8_t m_sta_bssid[6]{};
     uint8_t m_sta_ssid[32]{};
     int m_sta_ssid_len;
-    bool m_sta_is_connecting;
     esp_blufi_extra_info_t m_sta_conn_info{};
 
     // WiFi scan related
     std::vector<wifi_ap_record_t> m_ap_records;
+    std::mutex scan_mutex_;
     bool m_scan_in_progress = false;
-    bool m_scan_should_save_ssid = true;
+    BlufiSessionState::Ticket scan_ticket_ = 0;
+    ControlTicket scan_peer_;
+    esp_event_handler_instance_t scan_event_instance_ = nullptr;
+    struct ConnectionRequest;
+    void ConnectToAccessPoint(ConnectionRequest& request);
+    void DisconnectStation(const ConnectionRequest& request);
+    esp_err_t SendWifiReport(const ControlTicket& peer, wifi_mode_t mode,
+        esp_blufi_sta_conn_state_t state, uint8_t softap_connections, esp_blufi_extra_info_t* info);
+    esp_err_t DeinitLocked();
+    void DeinitCompletedProvisioning(BlufiSessionState::Ticket ticket);
 };

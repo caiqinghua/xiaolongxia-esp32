@@ -1,11 +1,22 @@
 # Define source files
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_service.cc"
+            "audio/assistant_audio_handoff.cc"
+            "audio/model_validation_audio.cc"
+            "audio/assistant_speech_monitor.cc"
+            "watch/watch_voice_capture.cc"
+            "watch/watch_speech_interrupt.cc"
+            "watch/watch_speech_interrupt_application.cc"
+            "audio/local_playback_output.cc"
+            "audio/audio_session_coordinator.cc"
+            "audio/assistant_session_lifecycle.cc"
             "audio/local_recording_service.cc"
             "audio/ogg_opus_writer.cc"
+            "audio/opus_codec_task.cc"
             "audio/demuxer/ogg_demuxer.cc"
             "audio/codecs/no_audio_codec.cc"
             "audio/codecs/box_audio_codec.cc"
+            "audio/codecs/box_playback_output.cc"
             "audio/codecs/es8311_audio_codec.cc"
             "audio/codecs/es8374_audio_codec.cc"
             "audio/codecs/es8388_audio_codec.cc"
@@ -31,17 +42,54 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
+            "protocols/assistant_wire_format.cc"
+            "protocols/assistant_receive_queue.cc"
+            "protocols/assistant_transport_handoff.cc"
             "mcp_server.cc"
             "server_config.cc"
             "system/boot_diagnostics.cc"
             "system/device_time_service.cc"
+            "watch/watch_time_tools.cc"
+            "watch/watch_time_state.cc"
+            "watch/watch_calendar.cc"
+            "watch/watch_time_service.cc"
+            "watch/watch_assistant_state.cc"
+            "watch/watch_recording_library.cc"
+            "watch/watch_push_to_talk.cc"
+            "watch/watch_level_settings.cc"
+            "watch/watch_voice_settings.cc"
+            "watch/watch_notification_settings.cc"
+            "watch/watch_voice_binding.cc"
+            "watch/watch_voice_identity.cc"
+            "watch/watch_voice_pairing.cc"
+            "watch/watch_voice_task.cc"
+            "watch/watch_firmware_update.cc"
+            "watch/watch_voice_application.cc"
+            "watch/watch_voice_cloud.cc"
+            "watch/watch_voice_cloud_client.cc"
+            "watch/watch_wifi_gate.cc"
+            "watch/watch_station_recovery.cc"
+            "watch/watch_station_policy.cc"
+            "watch/watch_network_application.cc"
+            "watch/watch_wifi_settings.cc"
+            "watch/watch_time_runtime.cc"
             "system/battery_telemetry_service.cc"
             "system/audream_power_manager.cc"
             "system_info.cc"
             "application.cc"
             "ota.cc"
+            "ota_upgrade.cc"
+            "ota_boot.cc"
+            "firmware_release.cc"
+            "asset_release.cc"
+            "asset_storage.cc"
+            "asset_partition.cc"
+    "asset_mapping.cc"
+    "asset_update_client.cc"
+            "firmware_release_identity.cc"
             "settings.cc"
             "storage/sd_card_storage.cc"
+            "storage/recording_file_deletion.cc"
             "storage/temporary_ap_transfer_service.cc"
             "device_state_machine.cc"
             "assets.cc"
@@ -313,6 +361,35 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_C6_TOUCH_AMOLED_1_8)
     set(BUILTIN_ICON_FONT font_awesome_30_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_06)
+    list(APPEND SOURCES "display/sh8601_panel_factory.cc")
+    if(CONFIG_AUDREAM_WATCH_UI)
+        list(APPEND SOURCES "watch/watch_view.cc")
+        list(APPEND SOURCES "watch/watch_firmware_view.cc")
+        list(APPEND SOURCES "watch/watch_firmware_application.cc")
+        list(APPEND SOURCES "audio/recording_packet_reader.cc" "audio/recording_playback_decoder.cc"
+            "audio/recording_playback_task.cc" "audio/recording_playback_source.cc"
+            "audio/watch_opus_writer.cc" "audio/watch_stream_encoder.cc" "audio/demuxer/libogg/src/framing.c"
+            "watch/watch_alert_sound.cc" "watch/watch_ancs_session.cc"
+            "watch/watch_android_notifications.cc")
+        list(APPEND INCLUDE_DIRS "audio/demuxer/libogg/include")
+        if(CONFIG_AUDREAM_WATCH_ANCS)
+            list(APPEND SOURCES "watch/watch_ancs_client.cc")
+        endif()
+        if(CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS)
+            list(APPEND SOURCES "watch/watch_android_gatt_server.cc" "watch/watch_notification_owner_grant.cc")
+        endif()
+        if(CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS OR CONFIG_AUDREAM_WATCH_DEVICE_PAIRING)
+            list(APPEND SOURCES "watch/watch_gatt_dispatcher.cc")
+        endif()
+        if(CONFIG_AUDREAM_WATCH_DEVICE_PAIRING)
+            list(APPEND SOURCES "watch/watch_pairing_gatt_server.cc" "watch/watch_pairing_controller.cc"
+                                "watch/watch_pairing_application.cc" "watch/watch_blufi_security.cc"
+                                "watch/watch_blufi_scope.c" "watch/watch_control_bond.cc")
+        endif()
+        list(APPEND SOURCES "watch/watch_activity.cc" "watch/watch_activity_record.cc" "watch/watch_wrist_control.cc" "watch/watch_time_mcp.cc"
+            "watch/watch_motion_task.cc" "watch/watch_qmi8658.cc" "watch/watch_motion_runtime.cc"
+            "watch/watch_motion_storage.cc" "watch/watch_pcf85063.cc" "watch/watch_rtc_runtime.cc")
+    endif()
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-touch-amoled-2.06")
     set(BUILTIN_TEXT_FONT font_puhui_basic_30_4)
@@ -933,6 +1010,12 @@ idf_component_register(SRCS ${SOURCES}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     WHOLE_ARCHIVE
                     PRIV_REQUIRES
+                        nvs_flash
+                        bootloader_support
+                        pthread
+                        esp_http_client
+                        http_parser
+                        mbedtls
                         esp_pm
                         esp_psram
                         esp_netif
@@ -971,6 +1054,11 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE AUDREAM_INTERNAL_FLASH_STORAGE=${AUDREAM_INTERNAL_FLASH_STORAGE}
                     PRIVATE AUDREAM_INTERNAL_FLASH_PARTITION_LABEL=\"recordings\"
                     )
+
+if(CONFIG_AUDREAM_WATCH_UI)
+    # Retain the fixed-position release identity even with linker garbage collection.
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u audream_release_identity")
+endif()
 
 # Add generation rules
 add_custom_command(

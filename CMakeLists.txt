@@ -11,3 +11,10 @@ idf_build_set_property(MINIMAL_BUILD ON)
 
 set(PROJECT_VER "2.2.3")
 project(xiaozhi)
+
+include(cmake/audream_transport_overlay.cmake)
+audream_enable_transport_overlay()
+include(cmake/audream_motion_overlay.cmake)
+audream_enable_motion_overlay()
+include(cmake/audream_blufi_overlay.cmake)
+audream_enable_blufi_overlay()

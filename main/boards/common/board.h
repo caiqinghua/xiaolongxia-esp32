@@ -13,6 +13,10 @@
 #include "backlight.h"
 #include "camera.h"
 #include "assets.h"
+#include "board_runtime_profile.h"
+#include "watch/watch_recording_state.h"
+#include "watch/watch_activity.h"
+#include "watch/watch_wrist_control.h"
 
 /**
  * Network events for unified callback
@@ -68,7 +72,18 @@ public:
     virtual std::string GetBoardType() = 0;
     virtual std::string GetUuid() { return uuid_; }
     virtual bool IsRecordingOnlyMode() const { return false; }
+    virtual BoardRuntimeProfile GetRuntimeProfile() const {
+        return LegacyBoardRuntimeProfile(IsRecordingOnlyMode());
+    }
     virtual Backlight* GetBacklight() { return nullptr; }
+    // Watch controls run on the application task, never in LVGL callbacks.
+    virtual bool ExecuteWatchRecordingCommand(WatchRecordingCommand) { return false; }
+    virtual WatchRecordingControlStatus GetWatchRecordingControlStatus() const { return {}; }
+    virtual WatchMotionSnapshot GetWatchMotionSnapshot() const { return {}; }
+    virtual WatchWristSnapshot GetWatchWristSnapshot() const { return {}; }
+    virtual bool RequestWatchWrist(uint64_t, WatchWristAction, bool) { return false; }
+    virtual bool RetryWatchActivityStorage(uint64_t) { return false; }
+    virtual bool ResetCorruptWatchActivityStorage(uint64_t, uint64_t) { return false; }
     virtual Led* GetLed();
     virtual AudioCodec* GetAudioCodec() = 0;
     virtual bool GetTemperature(float& esp32temp);
@@ -76,6 +91,12 @@ public:
     virtual Camera* GetCamera();
     virtual NetworkInterface* GetNetwork() = 0;
     virtual void StartNetwork() = 0;
+    // This changes radio policy, not the saved network credentials.
+    virtual bool ApplyWatchWifiEnabled(bool) { return false; }
+    virtual bool RestoreWatchStation() { return false; }
+    virtual bool HasWatchWifiCredentials() { return false; }
+    virtual bool SuspendIdleWatchStation() { return false; }
+    virtual bool IsWatchWifiProvisioning() { return false; }
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
