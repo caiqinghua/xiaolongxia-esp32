@@ -82,14 +82,21 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         return false;
     }
 
+    bool sent = false;
     if (version_ == 1 && !packet->payload.empty() &&
         packet->payload.size() <= assistant_wire::kMaxAudioBytes) {
-        return websocket_->Send(packet->payload.data(), packet->payload.size(), true);
+        sent = websocket_->Send(packet->payload.data(), packet->payload.size(), true);
+    } else {
+        std::string serialized;
+        if (!assistant_wire::EncodeAudio(version_, packet->payload.data(), packet->payload.size(),
+                                         packet->timestamp, serialized)) return false;
+        sent = websocket_->Send(serialized.data(), serialized.size(), true);
     }
-    std::string serialized;
-    if (!assistant_wire::EncodeAudio(version_, packet->payload.data(), packet->payload.size(),
-                                     packet->timestamp, serialized)) return false;
-    return websocket_->Send(serialized.data(), serialized.size(), true);
+    if (!sent) {
+        ESP_LOGE(TAG, "Failed to send audio packet (%u bytes)", static_cast<unsigned>(packet->payload.size()));
+        SetError(Lang::Strings::SERVER_ERROR);
+    }
+    return sent;
 }
 
 bool WebsocketProtocol::SendText(const std::string& text) {

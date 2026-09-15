@@ -72,6 +72,36 @@ static void TestCloudAuthorizationAndExpiry() {
     assert(!protocol.SetCloudAuthorization(authorization, device) && !protocol.OpenAudioChannel());
 }
 
+static void TestAudioSendFailureReportsNetworkError() {
+    for (int version : {1, 2, 3}) {
+        Reset();
+        Settings::version = version;
+        WebsocketProtocol protocol;
+        unsigned errors = 0;
+        protocol.OnNetworkError([&](const std::string& message) { assert(!message.empty()); ++errors; });
+        assert(protocol.OpenAudioChannel());
+        const auto sent = WebSocket::current->sent.size();
+        // Invalid input is not a network failure and must not terminate a healthy channel.
+        assert(!protocol.SendAudio(nullptr) && errors == 0 && protocol.IsAudioChannelOpened());
+        WebSocket::send_ok = false;
+        auto packet = std::make_unique<AudioStreamPacket>();
+        packet->payload = {1, 2, 3};
+        assert(!protocol.SendAudio(std::move(packet)));
+        assert(errors == 1 && !protocol.IsAudioChannelOpened());
+        assert(WebSocket::current->sent.size() == sent);
+        // A later packet cannot silently resume this failed turn, even if Send recovers.
+        WebSocket::send_ok = true;
+        packet = std::make_unique<AudioStreamPacket>();
+        packet->payload = {4, 5, 6};
+        assert(!protocol.SendAudio(std::move(packet)) && errors == 1);
+        protocol.CloseAudioChannel(false);
+        assert(protocol.OpenAudioChannel());
+        packet = std::make_unique<AudioStreamPacket>();
+        packet->payload = {7, 8, 9};
+        assert(protocol.SendAudio(std::move(packet)) && errors == 1);
+    }
+}
+
 static void TestHandshakeAndAudio() {
     for (int version : {1, 2, 3}) {
         Reset();
@@ -503,6 +533,7 @@ static void TestCloudExpiryRetainsSessionLeaseUntilTransportStops() {
 int main() {
     TestCloudAuthorizationAndExpiry();
     TestHandshakeAndAudio();
+    TestAudioSendFailureReportsNetworkError();
     TestRejectedHelloAndTimeout();
     TestReconnectReset();
     TestConnectionFailures();
@@ -517,7 +548,7 @@ int main() {
     TestCloudExpiryRetainsSessionLeaseUntilTransportStops();
 #endif
     Reset();
-    std::cout << "PASS: " << (CONFIG_AUDREAM_WATCH_UI ? 13 : 8)
+    std::cout << "PASS: " << (CONFIG_AUDREAM_WATCH_UI ? 14 : 9)
               << " WebSocket protocol integration test groups (watch="
               << CONFIG_AUDREAM_WATCH_UI << ")\n";
 }
