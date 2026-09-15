@@ -60,6 +60,7 @@ public:
     bool Clear(uint64_t session);
     WatchAncsSnapshot Snapshot() const;
     WatchAncsState State() const;
+    bool HasPendingRequests() const;
 
 private:
     struct Pending {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sdkconfig.h"
 #include <aes/esp_aes.h>
 #include <cassert>
 #include <cstdint>
@@ -11,6 +12,9 @@
 #include "blufi_session_state.h"
 #include "blufi_control_session.h"
 #include "blufi_profile_startup.h"
+#if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+#include "watch/watch_ble_link_policy.h"
+#endif
 #include "esp_blufi_api.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -59,6 +63,13 @@ public:
     bool IsControlReady() const;
     bool IsConnected() const { return m_ble_is_connected.load(); }
     bool IsWifiProvisioning() const { return session_.AllowsProvisioning(); }
+#if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+    void PollLinkPower();
+    void NotifyLinkActivity();
+    void HandleLinkPowerEvent(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* param);
+    void HandleLinkParameterUpdate(const uint8_t* address, uint16_t minimum, uint16_t maximum,
+                                  uint16_t interval, uint16_t latency, uint16_t timeout, bool success);
+#endif
 
     esp_err_t SendDeviceWillSleepEvent();
     esp_err_t SendRecordingStartedEvent(
@@ -96,6 +107,9 @@ private:
     bool shutdown_failed_ = false;
     uint64_t control_lease_ = 0;
     uint64_t next_control_lease_ = 0;
+#if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+    WatchBleLinkPolicy link_power_;
+#endif
 
     Blufi();
 

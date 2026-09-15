@@ -39,6 +39,7 @@ public:
     bool RequestAppName(uint64_t session, uint32_t uid, uint64_t revision);
     bool Clear(uint64_t session);
     WatchAncsClientSnapshot Snapshot() const;
+    bool NeedsResponsiveLink() const;
     // Select before watch confirmation. This selects a protocol, never grants
     // pairing or account permission. Only the native Android GATT service calls it.
     bool SelectAndroidPeer(uint16_t connection, const uint8_t* address);

@@ -249,6 +249,9 @@ void AudreamCustomDataTask(void* arg) {
             ESP_LOGW(BLUFI_TAG, "Discarded custom request from an expired or unauthorized BLE connection");
             continue;
         }
+#if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+        Blufi::GetInstance().NotifyLinkActivity();
+#endif
 
         char opcode_buffer[8] = {};
         const uint8_t opcode = request->data.size() >= 2 ? request->data[1] : 0;
@@ -397,6 +400,9 @@ bool Blufi::IsControlPeerCurrent(const ControlTicket& ticket) const {
 esp_err_t Blufi::SendControlData(const ControlTicket& ticket, const uint8_t* data, size_t length) {
     if (!data || !length || length > UINT32_MAX) return ESP_ERR_INVALID_ARG;
     if (!IsControlPeerCurrent(ticket)) return ESP_ERR_INVALID_STATE;
+#if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+    NotifyLinkActivity();
+#endif
 #if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
     return audream_blufi_send_custom_data_for_lease(ticket.authorization,
         const_cast<uint8_t*>(data), static_cast<uint32_t>(length));
@@ -621,6 +627,9 @@ esp_err_t Blufi::DeinitLocked() {
 #endif
         control_session_.Reset();
         m_ble_is_connected = false;
+#if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+        link_power_.Disconnected();
+#endif
         ret = _host_deinit();
         if (ret) {
             ESP_LOGE(BLUFI_TAG, "Host deinit failed: %s", esp_err_to_name(ret));
@@ -746,9 +755,19 @@ esp_err_t Blufi::_host_deinit() {
 }
 
 esp_err_t Blufi::_gap_register_callback() {
-#if CONFIG_AUDREAM_WATCH_ANCS
+#if CONFIG_AUDREAM_WATCH_ANCS || CONFIG_AUDREAM_WATCH_UI
     esp_err_t rc = esp_ble_gap_register_callback([](esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
-        if (!WatchAncsClient::Get().GapEvent(event, param)) esp_blufi_gap_event_handler(event, param);
+#if CONFIG_AUDREAM_WATCH_UI
+        if (event == ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT && param) {
+            const auto& update = param->update_conn_params;
+            Blufi::GetInstance().HandleLinkParameterUpdate(update.bda, update.min_int, update.max_int,
+                update.conn_int, update.latency, update.timeout, update.status == ESP_BT_STATUS_SUCCESS);
+        }
+#endif
+#if CONFIG_AUDREAM_WATCH_ANCS
+        if (WatchAncsClient::Get().GapEvent(event, param)) return;
+#endif
+        esp_blufi_gap_event_handler(event, param);
     });
 #else
     esp_err_t rc = esp_ble_gap_register_callback(esp_blufi_gap_event_handler);
@@ -1430,6 +1449,9 @@ void Blufi::DisconnectStation(const ConnectionRequest& request) {
 }
 
 void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* param) {
+#if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+    HandleLinkPowerEvent(event, param);
+#endif
     const auto peer = CaptureControlPeer();
 #if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
     switch (event) {

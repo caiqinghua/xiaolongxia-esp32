@@ -17,6 +17,7 @@ uint64_t Ready(WatchAncsSession& engine) {
     engine.SetEnabled(true);
     const auto session = engine.BeginSession();
     assert(session && engine.Authorized(session));
+    assert(!engine.HasPendingRequests());
     return session;
 }
 Bytes Event(uint32_t uid, uint8_t type = 0) {
@@ -45,6 +46,7 @@ bool Receive(WatchAncsSession& engine, uint64_t session, const Bytes& bytes, uin
 }
 WatchAncsRequest Start(WatchAncsSession& engine, uint64_t session, uint32_t uid = kUid) {
     assert(Notify(engine, session, uid));
+    assert(engine.HasPendingRequests());
     const auto request = engine.NextRequest(session, 100);
     assert(request && request->uid == uid && request->session == session);
     return *request;
@@ -56,6 +58,7 @@ void Failed(const WatchAncsSession& engine, WatchAncsError error) {
     const auto state = engine.Snapshot();
     assert(state.state == WatchAncsState::kFailed && state.error == error);
     assert(state.session == 0 && state.notifications.empty());
+    assert(!engine.HasPendingRequests());
 }
 
 void TestAuthorizationAndSessionRetirement() {

@@ -2,6 +2,11 @@
 #include <algorithm>
 #include <array>
 
+bool WatchAncsSession::HasPendingRequests() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return state_ == WatchAncsState::kReady &&
+        (pending_.has_value() || !queued_.empty() || !queued_apps_.empty());
+}
 namespace {
 uint32_t UInt32(const uint8_t* bytes) {
     return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |

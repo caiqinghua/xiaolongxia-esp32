@@ -954,6 +954,9 @@ void Application::Run() {
 }
 
 void Application::RefreshWatchDisplay() {
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING && defined(CONFIG_BT_BLUEDROID_ENABLED)
+    Blufi::GetInstance().PollLinkPower();
+#endif
 #if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
     WatchPairingGattServer::Get().Poll();
 #endif

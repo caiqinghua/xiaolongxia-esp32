@@ -5,6 +5,24 @@
 #include <cstring>
 #include <limits>
 
+bool WatchAncsClient::NeedsResponsiveLink() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!connected_ || retiring_) return false;
+    if (restoring_control_ || control_bond_check_ || engine_.HasPendingRequests()) return true;
+    switch (state_) {
+        case WatchAncsLinkState::kPeerConsent:
+        case WatchAncsLinkState::kOpening:
+        case WatchAncsLinkState::kNegotiating:
+        case WatchAncsLinkState::kPairing:
+        case WatchAncsLinkState::kConfirmNumber:
+        case WatchAncsLinkState::kDiscovering:
+        case WatchAncsLinkState::kSubscribing:
+        case WatchAncsLinkState::kDevicePairingReady:
+            return true;
+        default:
+            return false;
+    }
+}
 namespace {
 constexpr uint16_t kAppId = 0xada1;
 constexpr uint64_t kPhaseTimeoutMs = 60000;

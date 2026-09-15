@@ -89,6 +89,7 @@ void Reset(bool enabled = true) {
 }
 void Open() {
     const auto state = Client().Snapshot(); assert(state.state == WatchAncsLinkState::kPeerConsent && state.confirmation);
+    assert(Client().NeedsResponsiveLink());
     assert(!Client().Confirm(state.confirmation + 1, true));
     assert(Client().Confirm(state.confirmation, true));
     assert(Client().Snapshot().state == WatchAncsLinkState::kOpening);
@@ -153,6 +154,7 @@ void Subscribe(bool early = false) {
     }
     WriteAck(25, true);
     assert(Client().Snapshot().state == WatchAncsLinkState::kReady);
+    assert(Client().NeedsResponsiveLink() == early);
     assert((registrations == std::vector<uint16_t>{4,20,24}));
     assert((descriptor_writes == std::vector<std::pair<uint16_t, Bytes>>{{5,{2,0}}, {21,{1,0}}, {25,{1,0}}}));
 }
@@ -162,6 +164,7 @@ bool Called(const char* name) { return std::find(calls.begin(), calls.end(), nam
 void NoContent() { assert(Client().Snapshot().notifications.notifications.empty()); }
 void TestConsentAndAuthentication() {
     Reset(false);
+    assert(!Client().NeedsResponsiveLink());
     assert(!Called("open") && !Called("encrypt") && !Called("search"));
     esp_ble_gap_cb_param_t gap{}; std::memcpy(gap.ble_security.ble_req.bd_addr, peer, 6);
     assert(Client().GapEvent(ESP_GAP_BLE_SEC_REQ_EVT, &gap));
@@ -471,10 +474,12 @@ void TestDevicePairingAuthenticationFailures() {
 }
 void TestEarlyNotificationsAndPrivateLifecycle() {
     Ready(true);
+    assert(Client().NeedsResponsiveLink());
     assert(control_writes == std::vector<Bytes>({{0,0,0,0,0,0,1,120,0,3,0,2,5}}));
     Notify(20, Reply());
     assert(!Client().Snapshot().notifications.notifications.front().details_ready);
     WriteAck(30, false);
+    assert(!Client().NeedsResponsiveLink());
     auto snapshot = Client().Snapshot();
     assert(snapshot.notifications.notifications.front().title == "Hi");
     assert(snapshot.notifications.notifications.front().message == "OK");
