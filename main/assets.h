@@ -39,6 +39,7 @@ public:
     asset_storage::TrialStatus TrialState() const;
     bool Applied() const { return applied_; }
     bool UpdatesReady() const;
+    bool SupportsFirmware(uint32_t sequence) const;
     std::string CurrentVersion() const;
     std::unique_ptr<asset_storage::UpdateSession> BeginUpdate();
     bool GetAssetData(const std::string& name, void*& ptr, size_t& size);
@@ -70,6 +71,7 @@ private:
         virtual bool PollTrialHealth(int64_t, bool, uint32_t) { return false; }
         virtual bool EndTrialHealth(bool) { return false; }
         virtual bool UpdatesReady() const { return false; }
+        virtual bool SupportsFirmware(uint32_t) const { return false; }
         virtual std::string CurrentVersion() const { return {}; }
         virtual std::unique_ptr<asset_storage::UpdateSession> BeginUpdate() { return {}; }
     };
@@ -87,6 +89,7 @@ private:
         bool PollTrialHealth(int64_t now_ms, bool healthy, uint32_t wake_feeds) override;
         bool EndTrialHealth(bool failed) override;
         bool UpdatesReady() const override;
+        bool SupportsFirmware(uint32_t sequence) const override;
         std::string CurrentVersion() const override;
         std::unique_ptr<asset_storage::UpdateSession> BeginUpdate() override;
     private:

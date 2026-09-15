@@ -51,7 +51,14 @@ void Application::InitializeWatchFirmware(watch_update::Target target) {
             if (!watch_asset_update_) return asset_update::CheckResult{};
             return watch_asset_update_->Check(CONFIG_AUDREAM_ASSET_MANIFEST_URL, stop);
         }
-        return Ota::CheckSignedRelease(stop);
+        auto result = Ota::CheckSignedRelease(stop);
+        if (result.status == firmware_release::CheckStatus::kAvailable && result.release &&
+            !Assets::GetInstance().SupportsFirmware(result.release->Sequence())) {
+            ESP_LOGE("WatchFirmware", "Firmware release %u has no confirmed compatible model assets",
+                static_cast<unsigned>(result.release->Sequence()));
+            return firmware_release::CheckResult{firmware_release::CheckStatus::kInvalidRelease, {}, {}};
+        }
+        return result;
     };
     hooks.install = [this, target](const auto& envelope, const auto& progress, const auto& cancelled, const auto& commit) {
         const auto stop = [this, &cancelled] {
@@ -112,7 +119,11 @@ bool Application::AcquireWatchFirmware(watch_update::Operation operation) {
     watch_firmware_generation_.store(lease.generation);
     watch_firmware_storage_ = AudreamPowerManager::GetInstance().BeginStorageRead();
     const bool models = watch_firmware_->Read().target == watch_update::Target::kModels;
-    if (watch_firmware_storage_ && models) watch_asset_update_ = Assets::GetInstance().BeginUpdate();
+    if (watch_firmware_storage_) {
+        (void)Assets::GetInstance();
+        watch_assets_initialized_ = true;
+        if (models) watch_asset_update_ = Assets::GetInstance().BeginUpdate();
+    }
     if (!watch_firmware_storage_ || (models && !watch_asset_update_) || watch_firmware_revoked_.load() ||
         !audio_session_coordinator_.Complete(lease)) {
         ReleaseWatchFirmware(operation, true);

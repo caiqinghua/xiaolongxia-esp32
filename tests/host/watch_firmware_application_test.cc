@@ -33,6 +33,7 @@ void Reset() {
     auto& assets = Assets::GetInstance();
     assert(!assets.update_owned);
     assets.updates_ready = assets.update_acquire_ok = true;
+    assets.firmware_compatible = true;
     assets.applied = true;
     assets.trial_state = asset_storage::TrialStatus::kNone;
     assets.keep_observing = true;
@@ -132,6 +133,15 @@ firmware_release::InstallResult Ota::InstallSignedEnvelope(const std::string& en
 
 int main() {
     assert(sodium_init() >= 0);
+    {
+        Reset(); Application app;
+        Assets::GetInstance().firmware_compatible = false;
+        app.InitializeWatchFirmware();
+        assert(app.HandleWatchFirmwareRequest(CheckRequest()));
+        Finish(app);
+        const auto state = app.BuildWatchFirmwareSnapshot();
+        assert(state.update.phase == Phase::kCheckFailed && !state.can_install && installs == 0);
+    }
     {
         Reset(); Application app;
         app.audio_service_.enabled = false;

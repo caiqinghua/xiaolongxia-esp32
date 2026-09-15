@@ -20,6 +20,7 @@
 #include "assets/lang_config.h"
 #include "mcp_server.h"
 #include "assets.h"
+#include "firmware_release_identity.h"
 #include "settings.h"
 #include "system/audream_power_manager.h"
 #include "audio/local_recording_service.h"
@@ -783,6 +784,12 @@ void Application::Initialize() {
 #if CONFIG_AUDREAM_WATCH_ANCS
         watch_boot_ready = watch_boot_ready && !watch_notifications_save_failed_;
 #endif
+        const auto* identity = firmware_release::CurrentIdentity();
+        const bool assets_compatible = identity && Assets::GetInstance().SupportsFirmware(identity->sequence);
+        watch_boot_ready = watch_boot_ready && assets_compatible;
+        if (!assets_compatible) {
+            ESP_LOGE(TAG, "Watch boot confirmation withheld because model assets are not confirmed for this firmware");
+        }
         watch_boot_health_.Begin(watch_boot_ready, esp_timer_get_time() / 1000);
         if (!watch_boot_ready) ESP_LOGE(TAG, "Watch boot confirmation withheld after initialization failure");
     }

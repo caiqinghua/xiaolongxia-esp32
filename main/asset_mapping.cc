@@ -12,6 +12,7 @@ bool IsValidConfig(const BootConfig& config) {
     return sodium_init() >= 0 && Model(compatibility.model) && Token(compatibility.sr_abi, 63) &&
         Token(compatibility.wake_model, 31) && compatibility.firmware_sequence &&
         compatibility.firmware_sequence <= 2147483647 &&
+        config.factory_firmware_min <= config.factory_firmware_max &&
         Hex(config.public_key_hex, key.data(), key.size()) && !sodium_is_zero(key.data(), key.size());
 }
 Mapping::~Mapping() {
@@ -79,6 +80,8 @@ bool Mapping::Open(const esp_partition_t* partition, const BootConfig* config) {
     if (factory_length > partition->size - header.size()) { failed_ = true; return false; }
     selected_.size = factory_length + header.size();
     if (config && IsValidConfig(*config)) {
+        factory_firmware_min_ = config->factory_firmware_min;
+        factory_firmware_max_ = config->factory_firmware_max;
         backend_ = Partition::Open(partition, storage_status_);
         if (backend_) {
             store_.reset(new(std::nothrow) Store(backend_->Geometry(), backend_->FactoryDigest(),
@@ -108,6 +111,15 @@ bool Mapping::Open(const esp_partition_t* partition, const BootConfig* config) {
     valid_ = true;
     if (selected_.slot) version_ = store_->SelectedRelease()->Version();
     return true;
+}
+
+bool Mapping::SupportsFirmware(uint32_t sequence) const {
+    if (!valid_ || failed_ || store_faulted_ || selected_.trial) return false;
+    if (!selected_.slot) {
+        return sequence >= factory_firmware_min_ && sequence <= factory_firmware_max_;
+    }
+    const auto* release = store_ ? store_->SelectedRelease() : nullptr;
+    return release && sequence >= release->MinimumFirmware() && sequence <= release->MaximumFirmware();
 }
 
 void Mapping::RefreshStoreState() {

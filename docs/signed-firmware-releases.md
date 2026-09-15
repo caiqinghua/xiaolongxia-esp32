@@ -1,7 +1,7 @@
 # Signed Firmware Releases
 
-状态：设备端签名清单下载/校验、发布发现 API、设备查询与发布工具已实现，尚未启用生产公钥或部署发布服务。
-不代表硬件 Secure Boot、量产签名策略、资产回退或目标固件验收已经完成。
+状态：设备端签名清单下载/校验、发布发现 API、设备查询、发布工具、模型兼容准入和生产信任配置生成器已实现。
+生产公钥和真实发布清单仍须由发布环境提供；不代表硬件 Secure Boot、量产签名策略或目标固件验收已经完成。
 
 ## 信任与入口
 
@@ -73,8 +73,50 @@ uv run --no-project --with cryptography python tools/firmware_release/sign_relea
 ```
 
 `--sequence` 必须与该镜像构建时的配置一致。发布时使用不可变镜像地址，先提供完整镜像，
-再发布对应清单。发现 API 与原子目录发布工具见 ispeak 的 `server/docs/firmware-releases.md`；
-发布审批、撤销/密钥轮换操作流程尚未完成。
+再发布对应清单。发现 API 与原子目录发布工具见 ispeak 的 `server/docs/firmware-releases.md`。
+
+## 联合模型兼容准入
+
+固件与模型采用两阶段升级，不在一次写入中同时替换两个独立分区。先发布一个
+`firmware_min`/`firmware_max` 同时覆盖升级前后固件序号的纯模型包，设备启动并完成本地模型
+健康确认后，该模型才成为已确认副本。固件发现结果只有在当前已确认模型副本或可信的出厂
+资产范围覆盖目标固件序号时才可安装；试用中、失败或范围不匹配的模型不能作为固件升级基础。
+
+新固件启动后再次以镜像内发布序号检查当前资产。若资产未确认、损坏或不兼容，组合模式不会
+调用 `esp_ota_mark_app_valid_cancel_rollback`，ESP-IDF 保留待回滚状态。正常发布顺序因此是：
+
+1. 发布并安装兼容旧/新固件的模型包。
+2. 重启并完成 30 秒真实采集/模型健康确认。
+3. 再检查、安装并重启新固件。
+4. 新固件完成本地启动健康观察后确认 OTA。
+
+这避免固件先被确认、随后才发现没有可启动模型的单边成功。它不替代真实断电和 bootloader
+回滚测试，也不允许发布只兼容新固件、无法在旧固件上先确认的模型包。
+
+## 生产信任配置
+
+`tools/firmware_release/prepare_release.py` 从仓库外的发布策略读取两个独立 Ed25519 公钥、可信
+HTTPS 地址、模型 ABI、唤醒模型、出厂资产兼容范围和目标固件序号。提供固件/模型签名清单时，
+它还会验签并要求模型兼容范围同时覆盖源固件和目标固件。工具只生成公开配置，不读取或输出私钥：
+
+```bash
+uv run --no-project --with cryptography python tools/firmware_release/prepare_release.py \
+  --policy /secure/release/watch-release-policy.json \
+  --firmware-manifest /secure/staging/firmware-release.json \
+  --asset-manifest /secure/staging/asset-release.json \
+  --sdkconfig-output /secure/staging/audream-watch-release.sdkconfig \
+  --server-public-keys-output /secure/staging/public-keys.json
+```
+
+生成的 sdkconfig 片段必须在构建前追加到手表 build 配置；`public-keys.json` 供 API 发布发现
+服务使用。两个输出均拒绝覆盖已有文件。策略 schema 为 `audream-watch-release-trust-v1`，字段见
+工具中的严格字段集；新增或遗漏字段都会失败，防止拼写错误被静默忽略。
+
+发布审批至少需要保留目标镜像/模型 hash、签名清单、策略文件、主机回归结果和目标板验收记录。
+撤销未安装版本时先从目录移除清单，再停止对应不可变文件的公开分发；已经安装的版本须发布更高
+序号修复，不能降低序号覆盖。公钥轮换必须先用旧固件信任的旧密钥签署过渡固件，过渡固件内嵌
+新公钥并完成目标板确认，之后才能用新密钥发布下一版本。若旧私钥已泄露且没有可验证的过渡
+路径，仅修改服务器公钥不能撤销设备内旧信任，必须使用受控刷机/召回流程。
 
 ## 发现与版本确认
 
@@ -171,6 +213,6 @@ completion、独立重启及底部操作可达性；截图已人工检查。测�
 生成的清单和镜像送入实际 C++ 校验/下载入口。
 
 目标 ESP 固件未构建，故自定义描述在实际 ELF/bin 中的最终位置、硬件镜像验证、分区容量、
-真实断网/掉电回退仍待验收。完整资产兼容性/回退、生产公钥配置和发布服务仍是交付阻塞项。
+真实断网/掉电回退仍待验收。生产公钥值、真实清单发布和发布服务部署仍是发布环境操作项。
 清单没有在线撤销或有效期检查，不能宣称防止签名版本冻结攻击；当前逻辑只拒绝不高于
 正在运行镜像序号的更新。签名不能替代发布者对音频、BLE、RTC 和功耗的硬件验收。

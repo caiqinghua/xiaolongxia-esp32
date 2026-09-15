@@ -97,6 +97,9 @@ asset_storage::TrialStatus Assets::TrialState() const {
 }
 
 bool Assets::UpdatesReady() const { return strategy_ && strategy_->UpdatesReady(); }
+bool Assets::SupportsFirmware(uint32_t sequence) const {
+    return strategy_ && strategy_->SupportsFirmware(sequence);
+}
 std::string Assets::CurrentVersion() const { return strategy_ ? strategy_->CurrentVersion() : std::string{}; }
 
 std::unique_ptr<asset_storage::UpdateSession> Assets::BeginUpdate() {
@@ -180,7 +183,9 @@ bool Assets::LvglStrategy::InitializePartition(Assets* assets) {
         if (const auto* identity = firmware_release::CurrentIdentity()) {
             config = asset_storage::BootConfig{
                 {identity->model, CONFIG_AUDREAM_ASSET_SR_ABI, "wn9_xiaolongxiaolong_tts", identity->sequence},
-                CONFIG_AUDREAM_ASSET_PUBLIC_KEY_HEX};
+                CONFIG_AUDREAM_ASSET_PUBLIC_KEY_HEX,
+                CONFIG_AUDREAM_FACTORY_ASSET_FIRMWARE_MIN,
+                CONFIG_AUDREAM_FACTORY_ASSET_FIRMWARE_MAX};
             if (!asset_storage::IsValidConfig(*config)) config.reset();
         }
     }
@@ -240,6 +245,9 @@ asset_storage::TrialStatus Assets::LvglStrategy::TrialState() const {
 }
 
 bool Assets::LvglStrategy::UpdatesReady() const { return mapping_ && mapping_->UpdatesReady(); }
+bool Assets::LvglStrategy::SupportsFirmware(uint32_t sequence) const {
+    return mapping_ && mapping_->SupportsFirmware(sequence);
+}
 std::string Assets::LvglStrategy::CurrentVersion() const { return mapping_ ? mapping_->Version() : std::string{}; }
 
 std::unique_ptr<asset_storage::UpdateSession> Assets::LvglStrategy::BeginUpdate() {

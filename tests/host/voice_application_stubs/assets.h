@@ -34,6 +34,7 @@ public:
     unsigned health_polls = 0;
     bool last_healthy = false, keep_observing = true;
     bool updates_ready = true, update_owned = false, update_acquire_ok = true;
+    bool firmware_compatible = true;
     unsigned update_acquires = 0, update_returns = 0;
     asset_storage::UpdateSession::CheckHook update_check;
     asset_storage::UpdateSession::InstallHook update_install;
@@ -66,6 +67,7 @@ public:
         return true;
     }
     bool UpdatesReady() const { return updates_ready && !update_owned; }
+    bool SupportsFirmware(uint32_t sequence) const { return sequence && firmware_compatible; }
     std::string CurrentVersion() const { return {}; }
     bool partition_valid() const { return available; }
     std::unique_ptr<asset_storage::UpdateSession> BeginUpdate() {

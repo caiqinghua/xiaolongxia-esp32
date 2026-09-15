@@ -462,6 +462,7 @@ int main() {
         {
             asset_storage::Mapping legacy;
             assert(legacy.Open(&descriptor) && legacy.Selected().slot == 0 && legacy.Size() == original.size());
+            assert(legacy.SupportsFirmware(0) && !legacy.SupportsFirmware(7));
             assert(!legacy.UpdatesReady() && !legacy.TrialPending() && maps == 1);
             assert(legacy.Data() == memory.data() && committed == before);
         }
@@ -469,13 +470,17 @@ int main() {
         assert(IsValidConfig(config));
         {
             auto invalid = config; invalid.public_key_hex.clear(); assert(!IsValidConfig(invalid));
+            invalid = config; invalid.factory_firmware_min = 9; invalid.factory_firmware_max = 8;
+            assert(!IsValidConfig(invalid));
             asset_storage::Mapping fallback;
-            assert(fallback.Open(&descriptor, &invalid) && fallback.Selected().slot == 0 && fallback.Faulted());
+            auto missing_key = config; missing_key.public_key_hex.clear();
+            assert(fallback.Open(&descriptor, &missing_key) && fallback.Selected().slot == 0 && fallback.Faulted());
             assert(committed == before && !fallback.UpdatesReady());
         }
         {
             asset_storage::Mapping trial;
             assert(trial.Open(&descriptor, &config) && !trial.UpdatesReady() && trial.TrialPending());
+            assert(!trial.SupportsFirmware(7));
             assert(trial.Selected().slot == 1 && trial.Size() == update.size() && maps == 1);
             assert(trial.Version() == "1.0.0");
             assert(trial.Data() == memory.data() + backend->Geometry().Offset(1));
@@ -487,6 +492,7 @@ int main() {
             asset_storage::Mapping rollback;
             assert(rollback.Open(&descriptor, &config) && !rollback.TrialPending());
             assert(rollback.Selected().slot == 0 && rollback.Data() == memory.data());
+            assert(rollback.SupportsFirmware(0) && !rollback.SupportsFirmware(7));
             rollback.Pin();
         }
         assert(maps == 1); // Borrowed SDK pointers survive owner destruction until reboot.
@@ -595,6 +601,12 @@ int main() {
         asset_storage::Mapping next;
         assert(next.Open(&descriptor, &config) && !next.TrialPending());
         assert(next.Selected().slot == ((mode == 0 || mode == 4 || mode == 5) ? 1 : 0));
+        if (next.Selected().slot) {
+            assert(next.SupportsFirmware(6) && next.SupportsFirmware(9));
+            assert(!next.SupportsFirmware(5) && !next.SupportsFirmware(10));
+        } else {
+            assert(next.SupportsFirmware(0) && !next.SupportsFirmware(7));
+        }
     }
     assert(maps == 0 && handles == 0);
     TestUpdateClient();

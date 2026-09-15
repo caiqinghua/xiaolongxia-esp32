@@ -946,6 +946,26 @@ config AUDREAM_ASSET_MANIFEST_URL
         The endpoint may return an empty 204 response or a signed manifest.
         It never replaces the compiled asset key, ABI or firmware identity.
 
+config AUDREAM_FACTORY_ASSET_FIRMWARE_MIN
+    int "Minimum firmware sequence supported by factory assets"
+    depends on AUDREAM_WATCH_UI
+    range 0 2147483647
+    default 0
+    help
+        Lowest signed firmware sequence validated with the immutable factory
+        model bundle. Production firmware updates are rejected unless the
+        active confirmed asset bank or this trusted factory range supports them.
+
+config AUDREAM_FACTORY_ASSET_FIRMWARE_MAX
+    int "Maximum firmware sequence supported by factory assets"
+    depends on AUDREAM_WATCH_UI
+    range 0 2147483647
+    default 0
+    help
+        Highest signed firmware sequence validated with the immutable factory
+        model bundle. Keep zero in development builds without a release trust
+        configuration; signed firmware sequence zero is never an OTA target.
+
 config AUDREAM_OTA_RELEASE_SEQUENCE
     int "Audream firmware release sequence"
     depends on AUDREAM_WATCH_UI

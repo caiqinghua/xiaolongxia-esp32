@@ -112,6 +112,7 @@ if [[ -n "${RELEASE_DISCOVERY_FIXTURE_DIR:-}" ]]; then
     "$build/signed-test" "$RELEASE_DISCOVERY_FIXTURE_DIR/api-release.json" "$RELEASE_DISCOVERY_FIXTURE_DIR/api-firmware.bin"
 fi
 if [[ -n "${PYTHON_BIN:-}" ]]; then
+    "$PYTHON_BIN" "$root/tools/firmware_release/test_prepare_release.py"
     "$PYTHON_BIN" "$root/tools/firmware_release/test_sign_asset_release.py"
     "$PYTHON_BIN" "$root/tools/firmware_release/test_sign_asset_release.py" --export-fixture "$build"
     "$build/asset-test" "$build/asset-release.json" "$build/assets.bin"

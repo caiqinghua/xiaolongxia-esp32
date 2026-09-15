@@ -10,6 +10,8 @@ namespace asset_storage {
 struct BootConfig {
     asset_release::Compatibility compatibility;
     std::string public_key_hex;
+    uint32_t factory_firmware_min = 0;
+    uint32_t factory_firmware_max = 0;
 };
 bool IsValidConfig(const BootConfig& config);
 class UpdateSession;
@@ -28,6 +30,7 @@ public:
     const Selection& Selected() const { return selected_; }
     bool UpdatesReady() const { return valid_ && store_ && can_stage_ && !update_owned_ && !Faulted(); }
     bool TrialPending() const { return selected_.trial; }
+    bool SupportsFirmware(uint32_t sequence) const;
     TrialStatus TrialState() const {
         return !selected_.trial ? TrialStatus::kNone : failed_ || store_faulted_ ? TrialStatus::kFailed
             : health_active_ ? TrialStatus::kObserving : TrialStatus::kPending;
@@ -60,6 +63,7 @@ private:
     uint32_t last_wake_feeds_ = 0;
     bool health_started_ = false, health_active_ = false;
     bool update_owned_ = false, can_stage_ = false, store_faulted_ = false;
+    uint32_t factory_firmware_min_ = 0, factory_firmware_max_ = 0;
 };
 
 // Acquired by the Application task before worker startup and destroyed only
