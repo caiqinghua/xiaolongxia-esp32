@@ -860,7 +860,8 @@ endif()
 if (CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING)
     list(APPEND SOURCES "boards/common/blufi.cpp")
     if(CONFIG_AUDREAM_WATCH_UI AND CONFIG_BT_BLUEDROID_ENABLED)
-        list(APPEND SOURCES "watch/watch_ble_link_policy.cc" "watch/watch_ble_link_blufi.cc")
+        list(APPEND SOURCES "watch/watch_ble_advertising_policy.cc" "watch/watch_ble_advertising_blufi.cc"
+                            "watch/watch_ble_link_policy.cc" "watch/watch_ble_link_blufi.cc")
     endif()
 endif ()
 # Select language directory according to Kconfig

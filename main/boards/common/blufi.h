@@ -13,6 +13,7 @@
 #include "blufi_control_session.h"
 #include "blufi_profile_startup.h"
 #if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+#include "watch/watch_ble_advertising_policy.h"
 #include "watch/watch_ble_link_policy.h"
 #endif
 #include "esp_blufi_api.h"
@@ -64,6 +65,8 @@ public:
     bool IsConnected() const { return m_ble_is_connected.load(); }
     bool IsWifiProvisioning() const { return session_.AllowsProvisioning(); }
 #if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+    void BeginAdvertising();
+    bool HandleAdvertisingGapEvent(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param);
     void PollLinkPower();
     void NotifyLinkActivity();
     void HandleLinkPowerEvent(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* param);
@@ -108,6 +111,7 @@ private:
     uint64_t control_lease_ = 0;
     uint64_t next_control_lease_ = 0;
 #if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+    WatchBleAdvertisingPolicy advertising_power_;
     WatchBleLinkPolicy link_power_;
 #endif
 
@@ -128,6 +132,9 @@ private:
 
     static esp_err_t _host_and_cb_init();
     void HandleProfileInitialized(bool success);
+#if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
+    void ApplyAdvertisingAction(WatchBleAdvertisingAction action, int64_t now_ms);
+#endif
 
 #if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
     static esp_err_t AbortSecureHostStart();

@@ -12,8 +12,10 @@ void Blufi::NotifyLinkActivity() {
 
 void Blufi::HandleLinkPowerEvent(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* param) {
     if (event == ESP_BLUFI_EVENT_BLE_CONNECT && param) {
+        advertising_power_.Cancel();
         link_power_.Connected(param->connect.remote_bda, esp_timer_get_time() / 1000);
     } else if (event == ESP_BLUFI_EVENT_BLE_DISCONNECT || event == ESP_BLUFI_EVENT_DEINIT_FINISH) {
+        advertising_power_.Cancel();
         link_power_.Disconnected();
     }
 }
@@ -29,14 +31,17 @@ void Blufi::HandleLinkParameterUpdate(const uint8_t* address, uint16_t minimum, 
 void Blufi::PollLinkPower() {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (!session_.IsActive() || shutdown_failed_) {
+        advertising_power_.Cancel();
         link_power_.Disconnected();
         return;
     }
+    const auto now_ms = esp_timer_get_time() / 1000;
+    ApplyAdvertisingAction(advertising_power_.Poll(now_ms), now_ms);
     bool busy = session_.AllowsProvisioning() || control_lease_ != 0;
 #if CONFIG_AUDREAM_WATCH_ANCS
     busy = busy || WatchAncsClient::Get().NeedsResponsiveLink();
 #endif
-    link_power_.Poll(esp_timer_get_time() / 1000, busy,
+    link_power_.Poll(now_ms, busy,
         [](const WatchBleLinkPolicy::Address& address, const WatchBleLinkParameters& desired) {
             esp_ble_conn_update_params_t request{};
             std::copy(address.begin(), address.end(), request.bda);

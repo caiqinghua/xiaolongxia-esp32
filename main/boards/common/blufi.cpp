@@ -163,6 +163,9 @@ void StartAudreamBluFiAdvertising() {
     ESP_LOGI(BLUFI_TAG, "BLUFI device name: %s, serial number: %s", BLUFI_DEVICE_NAME, serial_number.c_str());
 
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
+#if CONFIG_AUDREAM_WATCH_UI
+    Blufi::GetInstance().BeginAdvertising();
+#endif
     ConfigureAudreamScanResponse(serial_number);
 #endif
     esp_blufi_adv_start_with_name(BLUFI_DEVICE_NAME);
@@ -763,6 +766,7 @@ esp_err_t Blufi::_gap_register_callback() {
             Blufi::GetInstance().HandleLinkParameterUpdate(update.bda, update.min_int, update.max_int,
                 update.conn_int, update.latency, update.timeout, update.status == ESP_BT_STATUS_SUCCESS);
         }
+        if (Blufi::GetInstance().HandleAdvertisingGapEvent(event, param)) return;
 #endif
 #if CONFIG_AUDREAM_WATCH_ANCS
         if (WatchAncsClient::Get().GapEvent(event, param)) return;
