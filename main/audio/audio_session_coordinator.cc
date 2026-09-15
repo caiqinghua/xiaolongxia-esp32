@@ -55,11 +55,16 @@ AudioSessionTransition AudioSessionCoordinator::Begin(AudioSessionMode target) {
         (target_ == AudioSessionMode::kFileTransfer || target_ == AudioSessionMode::kDevicePairing ||
          target_ == AudioSessionMode::kFirmwareUpdate || target_ == AudioSessionMode::kModelValidation || IsLocalPlayback(target_)) &&
         (mode_ == AudioSessionMode::kTransitioning || mode_ == AudioSessionMode::kFault);
-    if (!preempt_stream && !CanTransition(mode_, target)) {
+    const bool preempt_assistant_cleanup = target == AudioSessionMode::kLocalRecording &&
+        mode_ == AudioSessionMode::kTransitioning && target_ == AudioSessionMode::kIdle &&
+        IsAssistant(transition_source_);
+    if (!preempt_stream && !preempt_assistant_cleanup && !CanTransition(mode_, target)) {
         return {};
     }
     const auto previous = mode_;
-    const auto purpose = (mode_ == AudioSessionMode::kTransitioning || mode_ == AudioSessionMode::kFault) ? target_ : mode_;
+    const auto purpose = preempt_assistant_cleanup ? transition_source_ :
+        ((mode_ == AudioSessionMode::kTransitioning || mode_ == AudioSessionMode::kFault) ? target_ : mode_);
+    transition_source_ = previous;
     mode_ = AudioSessionMode::kTransitioning;
     target_ = target;
     ++generation_;
@@ -80,6 +85,7 @@ AudioSessionTransition AudioSessionCoordinator::BeginFaultCleanup(uint64_t expec
         (expected_generation != 0 && expected_generation != generation_)) {
         return {};
     }
+    transition_source_ = mode_;
     mode_ = AudioSessionMode::kTransitioning;
     target_ = AudioSessionMode::kIdle;
     ++generation_;
@@ -99,6 +105,7 @@ AudioSessionTransition AudioSessionCoordinator::BeginAssistantCleanup(uint64_t g
     std::lock_guard<std::mutex> lock(mutex_);
     if (generation == 0 || generation != generation_ || !IsAssistant(mode_)) return {};
     const auto previous = mode_;
+    transition_source_ = previous;
     mode_ = AudioSessionMode::kTransitioning;
     target_ = AudioSessionMode::kIdle;
     if (++generation_ == 0) ++generation_;

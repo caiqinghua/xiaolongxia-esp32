@@ -77,7 +77,10 @@ bool AssistantSessionLifecycle::Poll(uint32_t timeout_ms) {
     if (RetireIfPreempted()) return true;
     if (!closing_) return false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    if (!close_transport_(timeout_ms)) return false;
+    const bool transport_closed = close_transport_(timeout_ms);
+    // Recording may reserve ownership while the transport callback waits.
+    if (RetireIfPreempted()) return true;
+    if (!transport_closed) return false;
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now()).count();
     if (!quiesce_audio_(static_cast<uint32_t>(std::max<int64_t>(0, remaining)))) return false;

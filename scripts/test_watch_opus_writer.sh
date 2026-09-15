@@ -29,6 +29,7 @@ recordings="${WATCH_OPUS_ARTIFACTS:-$build/recordings}"
     -fsanitize=address,undefined -fno-omit-frame-pointer -DCONFIG_AUDREAM_WATCH_UI=1 \
     -I "$root/tests/host/recording_stubs" -I "$root/main" -I "$ogg/include" \
     "$root/main/audio/audio_session_coordinator.cc" "$root/main/audio/local_recording_service.cc" \
+    "$root/main/audio/assistant_session_lifecycle.cc" \
     "$root/main/audio/watch_opus_writer.cc" "$root/tests/host/local_recording_test.cc" \
     "$build/framing.o" "${opus_flags[@]}" -o "$build/recording_test"
 "$build/recording_test" "$build/lifecycle"

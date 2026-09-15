@@ -1,4 +1,5 @@
 #include "audio/local_recording_service.h"
+#include "audio/assistant_session_lifecycle.h"
 #include "audio/audio_service.h"
 #include "esp_timer.h"
 #include "storage/sd_card_storage.h"
@@ -256,6 +257,58 @@ void TestMissingPlaybackHandoffFailsClosed() {
     Check(recorder.RecoverFailedStart(audio), "registered owner confirms actual release");
     Check(recorder.SetPlaybackHandoff(nullptr), "restore normal recording setup");
 }
+void TestRecordingTakesOverPendingAssistantCleanup() {
+    auto& recorder = LocalRecordingService::GetInstance();
+    for (bool network_pending : {false, true}) {
+        for (bool ready_on_first_attempt : {false, true}) {
+            AudioSessionCoordinator coordinator;
+            AudioService audio; audio.coordinator = &coordinator;
+            bool transport_released = !network_pending;
+            audio.quiesce_succeeds = false;
+            unsigned resumes = 0;
+            AssistantSessionLifecycle assistant(coordinator,
+                [&](uint32_t) { return transport_released; },
+                [&](uint32_t timeout) { return audio.QuiesceAssistant(timeout); },
+                [&]() { ++resumes; return audio.ResumeAssistantAudio(); });
+            const auto token = assistant.Begin();
+            Check(token && !assistant.Stop(token), "assistant close waits for outstanding resources");
+            bool handoff_ready = ready_on_first_attempt;
+            unsigned handoffs = 0;
+            Check(recorder.SetAssistantHandoff([&](uint64_t generation, uint32_t timeout) {
+                ++handoffs;
+                Check(coordinator.HoldsExclusiveResources(generation), "recording owns the cleanup reservation");
+                Check(!audio.capturing && !audio.callback, "cleanup precedes recording capture and writer setup");
+                assistant.RetireIfPreempted();
+                Check(!assistant.Token() && !assistant.Poll() && resumes == 1,
+                    "old assistant cannot restore audio admission during recording handoff");
+                transport_released = audio.quiesce_succeeds = handoff_ready;
+                return transport_released && audio.QuiesceAssistant(timeout);
+            }), "install production recording handoff entry point");
+            const auto before = std::distance(std::filesystem::directory_iterator(SdCardStorage::GetInstance().directory),
+                std::filesystem::directory_iterator{});
+            if (!ready_on_first_attempt) {
+                Check(!recorder.Start(audio) && handoffs == 1 && !audio.capturing,
+                    "unreleased assistant prevents capture, not cleanup ownership");
+                Check(coordinator.Mode() == AudioSessionMode::kFault && coordinator.BlocksSleep(),
+                    "failed handoff retains a recording fault lease");
+                Check(before == std::distance(std::filesystem::directory_iterator(SdCardStorage::GetInstance().directory),
+                    std::filesystem::directory_iterator{}), "failed takeover creates no empty audio file");
+                handoff_ready = true;
+                Check(recorder.RecoverFailedStart(audio), "recording owner can finish failed takeover");
+            }
+            Check(recorder.Start(audio) && audio.capturing, "recording starts after assistant resources are released");
+            Check(!assistant.Stop(token) && !assistant.Poll() && resumes == 1,
+                "late assistant cleanup cannot disturb active recording");
+            audio.EmitPacket();
+            const auto result = recorder.Stop(audio);
+            Check(result.valid && result.packet_count == 1 && !coordinator.BlocksSleep(),
+                "recording saves and releases resources after takeover");
+            Check(recorder.SetAssistantHandoff(nullptr), "remove released test handoff");
+            const auto next = assistant.Begin();
+            Check(next && next != token && assistant.Stop(next), "assistant can restart after recording finishes");
+        }
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -271,5 +324,6 @@ int main(int argc, char** argv) {
     TestStorageFailureDoesNotPreemptAssistant();
     TestRecoveryCannotClaimAnotherFault();
     TestRecordingWaitsForPlaybackCleanup(); TestMissingPlaybackHandoffFailsClosed();
-    std::cout << "10 local recording lifecycle tests passed\n";
+    TestRecordingTakesOverPendingAssistantCleanup();
+    std::cout << "11 local recording lifecycle tests passed\n";
 }

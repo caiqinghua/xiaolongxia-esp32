@@ -127,6 +127,7 @@ bash "$root/scripts/test_ap_transfer.sh"
     -I "$root/tests/host/recording_stubs" -I "$root/main" \
     "$root/main/audio/audio_session_coordinator.cc" \
     "$root/main/audio/local_recording_service.cc" \
+    "$root/main/audio/assistant_session_lifecycle.cc" \
     "$root/main/audio/ogg_opus_writer.cc" \
     "$root/tests/host/local_recording_test.cc" -o "$build_dir/local_recording_test"
 "$build_dir/local_recording_test" "$build_dir/recordings"

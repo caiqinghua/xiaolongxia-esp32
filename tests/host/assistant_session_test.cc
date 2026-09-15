@@ -90,6 +90,42 @@ void TestStaleActions() {
     Check(f.session.Stop(second), "second connection closes normally");
 }
 
+void TestRecordingPreemptsAssistantCleanup() {
+    for (bool network_pending : {false, true}) {
+        Fixture f;
+        const auto token = f.session.Begin();
+        f.network_released = !network_pending;
+        f.audio_released = false;
+        Check(!f.session.Stop(token), "assistant teardown remains pending");
+        const auto recording = f.coordinator.Begin(AudioSessionMode::kLocalRecording);
+        Check(static_cast<bool>(recording), "recording can take over pending assistant teardown");
+        const auto calls = f.calls.size();
+        Check(f.session.Poll() && !f.session.Token(), "preempted cleanup retires its old intent");
+        Check(f.calls.size() == calls && f.resumes == 1, "old cleanup cannot resume or quiesce new owner");
+        Check(f.coordinator.BlocksSleep() && !f.coordinator.AllowsAssistantResources(),
+            "recording reservation retains unresolved resources");
+        Check(f.coordinator.Complete(recording), "recording owner completes its own handoff");
+    }
+}
+
+void TestRecordingPreemptsDuringCloseCallback() {
+    for (bool closed : {false, true}) {
+        AudioSessionCoordinator coordinator;
+        AudioSessionTransition recording;
+        unsigned drains = 0, resumes = 0;
+        AssistantSessionLifecycle session(coordinator, [&](uint32_t) {
+            recording = coordinator.Begin(AudioSessionMode::kLocalRecording);
+            Check(static_cast<bool>(recording), "recording reserves while transport close is in progress");
+            return closed;
+        }, [&](uint32_t) { ++drains; return true; }, [&]() { ++resumes; return true; });
+        const auto token = session.Begin();
+        Check(session.Stop(token) && !session.Token(), "close completion observes recording preemption");
+        Check(drains == 0 && resumes == 1, "old close cannot continue audio cleanup after handoff");
+        Check(coordinator.IsCurrent(recording.generation) && coordinator.BlocksSleep(),
+            "recording remains responsible for unfinished resources");
+    }
+}
+
 void TestAudioStartupFailure() {
     Fixture f;
     f.audio_ready = false;
@@ -180,11 +216,13 @@ int main() {
     TestAssistantLifecycle();
     TestPendingTransportAndAudio();
     TestRecordingPreemption();
+    TestRecordingPreemptsAssistantCleanup();
+    TestRecordingPreemptsDuringCloseCallback();
     TestStaleActions();
     TestAudioStartupFailure();
     TestPreemptionDuringStartup();
     TestNextTurnKeepsTransportAndDrainsAudio();
     TestNextTurnCanBeCanceledAndPreempted();
     TestNextTurnResumeFailure();
-    std::cout << "9 assistant session lifecycle tests passed\n";
+    std::cout << "11 assistant session lifecycle tests passed\n";
 }

@@ -3107,3 +3107,17 @@ UI 测试使用本地受管 LVGL、实际普惠/图标字体和 `WatchTimeServic
 修复前完整主机套件运行至新增错误通知断言失败，复现日志为 `/tmp/audream-assistant-send-before.log`。本阶段仅修改发送失败传播和测试，不修改原录音、板型默认开关或语音算法；没有执行 ESP 固件构建、烧录、安装或部署。
 
 修复后完整 `scripts/test_watch_runtime.sh` 退出 0，日志为 `/tmp/audream-assistant-send-after.log`；原模式和组合模式的 WebSocket 集成测试均通过。`git diff --check` 通过。仍保留上游 cJSON 弃用警告，未安装依赖。
+
+### 25.155 长按录音接管助手退出清理（2026-09-15）
+
+核对助手退出与录音实际调用链发现：活动助手允许录音抢占，但 BeginAssistantCleanup 将资源状态改为 transitioning/idle 后，录音 Start 的预约被拒绝。板级虽然会重试，但只能等待助手清理完成；重试截止前没有释放时仍会报启动失败。现在协调器记录切换来源，允许本地录音接管来自助手的退出清理，保留原来的传输关闭、音频排空、写入器建立和采集顺序。普通故障恢复、录音最终落盘、维护及固件提交的不可抢占边界不变。
+
+助手 close 回调返回后重新检查代次；若录音已经接管，则旧助手只撤销自己的会话意图，不继续调用音频清理或恢复。录音接管不是资源释放证明：既有 PrepareRecordingOwnership 仍须通过主任务关闭 transport，再确认 Quiesce 成功，才能开始采集；失败保留录音故障预约和休眠阻塞，后续通过原恢复与重试入口收尾。
+
+回归覆盖四种助手阶段的退出接管、旧清理完成/失败被拒绝、权限不泄漏到其他切换、close 返回成功或失败期间的录音抢占。真实 LocalRecordingService 与 AssistantSessionLifecycle 联测覆盖等待网络/音频、立即释放/首次失败四种组合；检查未释放时无采集和空文件，恢复后 Opus 与 metadata 保存成功，录音结束后助手可再次建立会话。网络和 codec 为受控替身，不等同于真实 FreeRTOS、无线或硬件测试。
+
+修复前新增会话测试在 `recording can take over pending assistant teardown` 断言失败；修复后 11 组助手会话、15 组音频协调及 11 组录音生命周期测试通过。`scripts/test_watch_opus_writer.sh` 同时验证原 Opus 写入和五种采样率的 FFmpeg 解码时长。本轮不修改板级按键、录音格式/增益、语音算法或默认功能开关；没有执行 ESP 构建、烧录或部署。
+
+首轮完整回归发现原录音模式也编译同一联测文件，其链接命令缺少新增使用的 AssistantSessionLifecycle 源文件；已补齐两个录音测试入口的依赖。原录音模式单独重跑 11 组生命周期测试通过，不将首轮链接失败记作通过。
+
+最终完整 `scripts/test_watch_runtime.sh` 退出 0，日志为 `/tmp/audream-assistant-recording-priority-final.log`，覆盖原录音与组合模式、助手协议、音频交接、通知、安全绑定、升级和功耗回归。`git diff --check` 通过，保留上游 cJSON 弃用警告。独立 StickS3 绿灯改动不纳入本阶段提交。

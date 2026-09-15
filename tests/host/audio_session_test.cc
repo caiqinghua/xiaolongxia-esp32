@@ -284,7 +284,34 @@ void TestModelValidationOwnership() {
     }
 }
 
+void TestAssistantCleanupPreemptionScope() {
+    for (auto phase : {AudioSessionMode::kAssistantConnecting, AudioSessionMode::kAssistantListening,
+                       AudioSessionMode::kAssistantThinking, AudioSessionMode::kAssistantSpeaking}) {
+        AudioSessionCoordinator coordinator;
+        const auto assistant = coordinator.Begin(AudioSessionMode::kAssistantConnecting);
+        Check(coordinator.Complete(assistant) && coordinator.UpdateAssistant(phase, assistant.generation),
+            "assistant phase ready for cleanup");
+        const auto cleanup = coordinator.BeginAssistantCleanup(assistant.generation);
+        Check(cleanup && !coordinator.Begin(AudioSessionMode::kFileTransfer) &&
+            !coordinator.Begin(AudioSessionMode::kAssistantConnecting), "only recording can take over assistant cleanup");
+        const auto recording = coordinator.Begin(AudioSessionMode::kLocalRecording);
+        Check(recording && recording.interrupted_purpose == phase, "recording retains interrupted assistant purpose");
+        Check(!coordinator.Complete(cleanup) && !coordinator.Fail(cleanup, true), "obsolete cleanup cannot release recording");
+        Check(coordinator.Complete(recording), "recording handoff completes");
+        const auto stop = coordinator.Begin(AudioSessionMode::kIdle);
+        Check(stop && !coordinator.Begin(AudioSessionMode::kLocalRecording),
+            "assistant cleanup permission does not leak into recording finalization");
+        Check(coordinator.Complete(stop), "recording finalization completes");
+        const auto maintenance = coordinator.Begin(AudioSessionMode::kMaintenance);
+        Check(coordinator.Fail(maintenance, false), "maintenance fault retains resources");
+        const auto recovery = coordinator.BeginFaultCleanup();
+        Check(recovery && !coordinator.Begin(AudioSessionMode::kLocalRecording),
+            "generic fault recovery is not assistant cleanup");
+    }
+}
+
 int main() {
+    TestAssistantCleanupPreemptionScope();
     TestModelValidationOwnership();
     TestFirmwareCommitRace();
     TestDevicePairingPreemption();
@@ -297,5 +324,5 @@ int main() {
     TestTransferReleaseChecksOwnerAndPurpose();
     TestRecordingPreemptsPendingTransfer();
     TestLocalPlaybackIsolationAndPause(); TestRecordingPreemptsEveryPlaybackPhase(); TestPlaybackCannotReleaseAnotherFault();
-    std::cout << "14 audio session tests passed\n";
+    std::cout << "15 audio session tests passed\n";
 }

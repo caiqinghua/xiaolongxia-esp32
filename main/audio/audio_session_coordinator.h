@@ -83,5 +83,6 @@ private:
     mutable std::mutex mutex_;
     AudioSessionMode mode_ = AudioSessionMode::kIdle;
     AudioSessionMode target_ = AudioSessionMode::kIdle;
+    AudioSessionMode transition_source_ = AudioSessionMode::kIdle;
     uint64_t generation_ = 1;
 };
