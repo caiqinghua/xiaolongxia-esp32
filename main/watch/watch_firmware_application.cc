@@ -7,10 +7,14 @@
 #include "wifi_station.h"
 #include "system/audream_power_manager.h"
 #include "esp_app_desc.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include <algorithm>
 
 namespace {
+constexpr int64_t kModelValidationHealthyMs = 30000;
+constexpr uint32_t kModelValidationCaptureMs = 35000;
+
 bool FirmwareBatteryReady(bool installing) {
     int battery = -1;
     bool charging = false, discharging = false;
@@ -164,6 +168,24 @@ bool Application::HandleWatchFirmwareRequest(const WatchViewRequest& request) {
     using watch_update::Phase;
     if (!watch_firmware_ || !request.id) return false;
     const auto snapshot = watch_firmware_->Read();
+    if (request.action == WatchViewAction::kValidateModels)
+        return request.update_target == watch_update::Target::kModels && StartWatchModelValidation(request.id);
+    if (request.action == WatchViewAction::kCancelModelValidation)
+        return request.update_target == watch_update::Target::kModels &&
+            StopWatchModelValidation(request.firmware_request, true, 3000);
+    if (request.action == WatchViewAction::kRollbackModels) {
+        const auto& assets = Assets::GetInstance();
+        if (request.update_target != watch_update::Target::kModels || snapshot.target != watch_update::Target::kModels ||
+            (assets.TrialState() != asset_storage::TrialStatus::kFailed &&
+             !(assets.TrialState() == asset_storage::TrialStatus::kPending &&
+               watch_model_validation_phase_ == WatchModelValidationPhase::kCleanupFailed)) ||
+            watch_model_validation_generation_ ||
+            snapshot.active || snapshot.commit_started || snapshot.boot_selected || watch_firmware_preparation_ ||
+            audio_session_coordinator_.Mode() != AudioSessionMode::kIdle || !audio_service_.IsIdle() ||
+            Board::GetInstance().GetWatchRecordingControlStatus().starting) return false;
+        Reboot();
+        return false;
+    }
     if (request.action == WatchViewAction::kSelectUpdateTarget) {
         if ((request.update_target != watch_update::Target::kFirmware && request.update_target != watch_update::Target::kModels) ||
             snapshot.active || snapshot.commit_started || snapshot.boot_selected ||
@@ -231,6 +253,7 @@ bool Application::HandleWatchFirmwareRequest(const WatchViewRequest& request) {
 }
 
 bool Application::StopWatchFirmware(uint32_t timeout_ms) {
+    if (watch_model_validation_generation_ && !StopWatchModelValidation(0, true, timeout_ms)) return false;
     watch_firmware_revoked_.store(true);
     if (watch_firmware_preparation_) {
         watch_firmware_preparation_.reset();
@@ -243,6 +266,7 @@ bool Application::StopWatchFirmware(uint32_t timeout_ms) {
 }
 
 void Application::PollWatchFirmware() {
+    PollWatchModelValidation();
     if (!watch_firmware_) return;
     watch_firmware_->Poll();
     auto raw = watch_firmware_->Read();
@@ -293,10 +317,19 @@ WatchFirmwareSnapshot Application::BuildWatchFirmwareSnapshot() {
     if (!watch_firmware_) return state;
     state.available = true;
     state.update = watch_firmware_->Read();
+    const auto& assets = Assets::GetInstance();
+    state.model_trial = assets.TrialState();
+    state.model_validation_active = watch_model_validation_generation_ != 0;
+    state.model_validation_request = watch_model_validation_request_;
+    state.model_validation_phase = watch_model_validation_phase_;
+    if (state.model_validation_active) {
+        const auto elapsed = std::max<int64_t>(0, esp_timer_get_time() / 1000 - watch_model_validation_started_ms_);
+        state.model_validation_progress = static_cast<unsigned>(std::min<int64_t>(99,
+            elapsed * 100 / kModelValidationHealthyMs));
+    }
     if (state.update.target == watch_update::Target::kFirmware)
         state.current_version = esp_app_get_description()->version;
     else if (watch_assets_initialized_) {
-        const auto& assets = Assets::GetInstance();
         state.current_version = assets.CurrentVersion();
         state.current_builtin = assets.partition_valid() && state.current_version.empty();
     }
@@ -316,5 +349,130 @@ WatchFirmwareSnapshot Application::BuildWatchFirmwareSnapshot() {
     state.can_reboot = state.update.phase == watch_update::Phase::kRebootRequired && state.update.boot_selected &&
         !state.update.active && audio_session_coordinator_.Mode() == AudioSessionMode::kFirmwareCommit &&
         audio_session_coordinator_.IsCurrent(watch_firmware_generation_.load());
+    const bool model_idle = state.update.target == watch_update::Target::kModels && !state.update.active &&
+        !state.update.commit_started && !state.update.boot_selected && !state.network_preparing &&
+        audio_session_coordinator_.Mode() == AudioSessionMode::kIdle && audio_service_.IsIdle() &&
+        !Board::GetInstance().GetWatchRecordingControlStatus().starting;
+    state.can_validate_models = model_idle && state.model_trial == asset_storage::TrialStatus::kPending &&
+        assets.Applied() && watch_boot_health_.Confirmed() && !watch_model_validation_generation_;
+    state.can_rollback_models = model_idle && !watch_model_validation_generation_ &&
+        (state.model_trial == asset_storage::TrialStatus::kFailed ||
+         (state.model_trial == asset_storage::TrialStatus::kPending &&
+          state.model_validation_phase == WatchModelValidationPhase::kCleanupFailed));
     return state;
+}
+
+bool Application::StartWatchModelValidation(uint64_t request_id) {
+    if (!request_id || !watch_firmware_ || watch_model_validation_generation_ ||
+        watch_firmware_->Read().target != watch_update::Target::kModels ||
+        watch_firmware_->Read().active || watch_firmware_->Read().commit_started ||
+        watch_firmware_->Read().boot_selected || watch_firmware_preparation_ ||
+        audio_session_coordinator_.Mode() != AudioSessionMode::kIdle || !audio_service_.IsIdle() ||
+        Board::GetInstance().GetWatchRecordingControlStatus().starting || watch_cloud_task_.Active() ||
+        HasAssistantSession() || pending_assistant_listening_ || assistant_session_.IsClosing() || reset_protocol_pending_ ||
+        !watch_boot_health_.Confirmed()) return false;
+    auto& assets = Assets::GetInstance();
+    if (!assets.Applied() || assets.TrialState() != asset_storage::TrialStatus::kPending) return false;
+    const auto transition = audio_session_coordinator_.Begin(AudioSessionMode::kModelValidation);
+    if (!transition) return false;
+    watch_wake_lease_.Revoke();
+    bool ready = audio_service_.QuiesceAssistant(3000);
+    bool health_started = false;
+    if (ready) {
+        watch_model_validation_storage_ = AudreamPowerManager::GetInstance().BeginStorageRead();
+        ready = watch_model_validation_storage_;
+    }
+    srmodel_list_t* models = nullptr;
+    if (ready) ready = assets.LoadAssistantModels(models) && audio_service_.PrepareWatchWakeWord(models) &&
+        audio_service_.PrepareVoiceProcessing(models, true);
+    if (ready) {
+        health_started = assets.BeginTrialHealth(true, esp_timer_get_time() / 1000,
+            audio_service_.ModelValidationFeedCount());
+        ready = health_started;
+    }
+    if (ready) ready = audio_session_coordinator_.Complete(transition) &&
+        audio_service_.StartModelValidation(transition.generation, kModelValidationCaptureMs);
+    if (!ready) {
+        if (health_started) assets.EndTrialHealth(true);
+        audio_service_.RevokeModelValidation(transition.generation);
+        const bool drained = audio_service_.QuiesceAssistant(3000);
+        if (watch_model_validation_storage_) {
+            AudreamPowerManager::GetInstance().EndStorageRead();
+            watch_model_validation_storage_ = false;
+        }
+        const bool released = audio_session_coordinator_.OwnsModelValidationResources(transition.generation)
+            ? audio_session_coordinator_.ReleaseModelValidation(transition.generation, drained)
+            : audio_session_coordinator_.Fail(transition, drained);
+        if (released) audio_service_.ResumeAssistantAudio();
+        watch_model_validation_phase_ = !released ? WatchModelValidationPhase::kCleanupFailed
+            : health_started ? WatchModelValidationPhase::kFailed : WatchModelValidationPhase::kIdle;
+        return false;
+    }
+    watch_model_validation_request_ = request_id;
+    watch_model_validation_generation_ = transition.generation;
+    watch_model_validation_started_ms_ = esp_timer_get_time() / 1000;
+    watch_model_validation_phase_ = WatchModelValidationPhase::kRunning;
+    watch_firmware_busy_.store(true);
+    ESP_LOGI("WatchFirmware", "Local model validation started");
+    return true;
+}
+
+bool Application::StopWatchModelValidation(uint64_t request_id, bool cancelled, uint32_t timeout_ms) {
+    const auto generation = watch_model_validation_generation_;
+    if (!generation || (request_id && request_id != watch_model_validation_request_)) return false;
+    audio_service_.RevokeModelValidation(generation);
+    Assets::GetInstance().EndTrialHealth(!cancelled);
+    const bool drained = audio_service_.QuiesceAssistant(timeout_ms);
+    const bool current = audio_session_coordinator_.OwnsModelValidationResources(generation);
+    const bool released = !current || audio_session_coordinator_.ReleaseModelValidation(generation, drained);
+    if (watch_model_validation_storage_) {
+        AudreamPowerManager::GetInstance().EndStorageRead();
+        watch_model_validation_storage_ = false;
+    }
+    watch_model_validation_request_ = 0;
+    watch_model_validation_generation_ = 0;
+    watch_model_validation_started_ms_ = 0;
+    watch_model_validation_phase_ = !drained || !released ? WatchModelValidationPhase::kCleanupFailed
+        : cancelled ? WatchModelValidationPhase::kCancelled : WatchModelValidationPhase::kFailed;
+    if (released && audio_session_coordinator_.Mode() == AudioSessionMode::kIdle) audio_service_.ResumeAssistantAudio();
+    const auto update = watch_firmware_ ? watch_firmware_->Read() : watch_update::Snapshot{};
+    watch_firmware_busy_.store(update.active || update.commit_started || update.phase == watch_update::Phase::kResourceFault);
+    return drained && released;
+}
+
+void Application::PollWatchModelValidation() {
+    const auto generation = watch_model_validation_generation_;
+    if (!generation) return;
+    if (!audio_session_coordinator_.OwnsModelValidationResources(generation)) {
+        StopWatchModelValidation(0, true, 3000);
+        return;
+    }
+    const auto now_ms = esp_timer_get_time() / 1000;
+    const auto feeds = audio_service_.ModelValidationFeedCount();
+    const bool current = audio_service_.IsModelValidationCurrent(generation);
+    const bool active = Assets::GetInstance().PollTrialHealth(now_ms,
+        current && feeds > 0 && watch_boot_health_.Confirmed(), feeds);
+    const auto trial = Assets::GetInstance().TrialState();
+    if (!active && trial == asset_storage::TrialStatus::kNone) {
+        audio_service_.RevokeModelValidation(generation);
+        const bool drained = audio_service_.QuiesceAssistant(3000);
+        const bool released = audio_session_coordinator_.ReleaseModelValidation(generation, drained);
+        if (watch_model_validation_storage_) {
+            AudreamPowerManager::GetInstance().EndStorageRead();
+            watch_model_validation_storage_ = false;
+        }
+        watch_model_validation_request_ = 0;
+        watch_model_validation_generation_ = 0;
+        watch_model_validation_started_ms_ = 0;
+        watch_model_validation_phase_ = drained && released ? WatchModelValidationPhase::kSucceeded
+            : WatchModelValidationPhase::kCleanupFailed;
+        if (released) audio_service_.ResumeAssistantAudio();
+        watch_firmware_busy_.store(!released);
+        ESP_LOGI("WatchFirmware", "Local model validation completed: success=%d", drained && released);
+        return;
+    }
+    if (!current || trial == asset_storage::TrialStatus::kFailed ||
+        now_ms - watch_model_validation_started_ms_ >= kModelValidationCaptureMs) {
+        StopWatchModelValidation(0, false, 3000);
+    }
 }

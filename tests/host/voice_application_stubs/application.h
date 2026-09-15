@@ -31,16 +31,38 @@ struct TestAudioService {
     unsigned drains = 0;
     bool wake_ready = true, processor_ready = true, wake_running = false, start_ready = true;
     unsigned wake_preparations = 0, wake_starts = 0;
+    uint64_t model_validation_generation = 0;
+    uint32_t model_validation_feeds = 123;
+    bool model_validation_start_ready = true;
+    unsigned assistant_resumes = 0;
     bool IsAssistantUserEnabled() const { return enabled.load(); }
     bool IsIdle() const { return idle; }
     bool IsAssistantCaptureDrained() const { return drain_ready; }
-    bool QuiesceAssistant(uint32_t) { ++drains; if (drain_ready) wake_running = false; return drain_ready; }
+    bool QuiesceAssistant(uint32_t) {
+        ++drains;
+        if (drain_ready) { wake_running = false; model_validation_generation = 0; }
+        return drain_ready;
+    }
     bool IsWakeWordRunning() const { return wake_running; }
     uint32_t WakeInputFeedCount() const { return 123; }
     bool PrepareWatchWakeWord(srmodel_list_t*) { ++wake_preparations; return wake_ready; }
     bool PrepareVoiceProcessing(srmodel_list_t*, bool local) { return local && processor_ready; }
-    bool ResumeAssistantAudio() { return drain_ready; }
+    bool ResumeAssistantAudio() { ++assistant_resumes; return drain_ready; }
     bool Stop() { return drain_ready; }
+    bool StartModelValidation(uint64_t generation, uint32_t duration_ms) {
+        if (!generation || !duration_ms || !model_validation_start_ready) return false;
+        model_validation_generation = generation;
+        return true;
+    }
+    bool RevokeModelValidation(uint64_t generation) {
+        if (!generation || generation != model_validation_generation) return false;
+        model_validation_generation = 0;
+        return true;
+    }
+    bool IsModelValidationCurrent(uint64_t generation) const {
+        return generation && generation == model_validation_generation;
+    }
+    uint32_t ModelValidationFeedCount() const { return model_validation_feeds; }
     void EnableWakeWordDetection(bool enabled) { if (enabled) ++wake_starts; wake_running = enabled && start_ready; }
 };
 struct TestAssistantSession { bool IsClosing() const { return false; } };
@@ -66,6 +88,11 @@ public:
     bool watch_firmware_network_ = false, watch_firmware_storage_ = false;
     bool watch_assets_initialized_ = false;
     std::unique_ptr<asset_storage::UpdateSession> watch_asset_update_;
+    uint64_t watch_model_validation_request_ = 0;
+    uint64_t watch_model_validation_generation_ = 0;
+    int64_t watch_model_validation_started_ms_ = 0;
+    bool watch_model_validation_storage_ = false;
+    WatchModelValidationPhase watch_model_validation_phase_ = WatchModelValidationPhase::kIdle;
     uint64_t watch_library_request_ = 0;
     unsigned reboots = 0;
     void Reboot() { ++reboots; }
@@ -78,6 +105,9 @@ public:
     bool HandleWatchFirmwareRequest(const WatchViewRequest& request);
     bool StopWatchFirmware(uint32_t timeout_ms);
     void PollWatchFirmware();
+    bool StartWatchModelValidation(uint64_t request_id);
+    bool StopWatchModelValidation(uint64_t request_id, bool cancelled, uint32_t timeout_ms);
+    void PollWatchModelValidation();
     WatchFirmwareSnapshot BuildWatchFirmwareSnapshot();
     ~Application() {
         if (watch_firmware_preparation_) ReleaseWatchFirmwareNetwork();

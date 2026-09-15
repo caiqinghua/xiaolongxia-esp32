@@ -118,6 +118,7 @@ Application::Application()
 Application::~Application() {
     // Captured Application members must outlive all network worker cleanup.
 #if CONFIG_AUDREAM_WATCH_UI
+    if (watch_model_validation_generation_) StopWatchModelValidation(0, true, 3000);
     if (watch_firmware_preparation_) {
         watch_firmware_preparation_.reset();
         ReleaseWatchFirmwareNetwork();
@@ -1118,6 +1119,9 @@ void Application::HandleWatchViewRequest(const WatchViewRequest& request) {
         case WatchViewAction::kCancelFirmware:
         case WatchViewAction::kRebootFirmware:
         case WatchViewAction::kSelectUpdateTarget:
+        case WatchViewAction::kValidateModels:
+        case WatchViewAction::kCancelModelValidation:
+        case WatchViewAction::kRollbackModels:
 #if CONFIG_AUDREAM_WATCH_UI
             succeeded = HandleWatchFirmwareRequest(request);
             // Publish the cancellable runtime state before clearing the queued
@@ -1654,8 +1658,12 @@ void Application::CheckAssetsVersion() {
         }
     }
 
-    // Apply assets
-    assets.Apply();
+    // Applying the selected trial is part of its local health gate. A broken
+    // font, image, or index must remain unconfirmed and recover on restart.
+    if (!assets.Apply()) {
+        assets.EndTrialHealth(true);
+        ESP_LOGE(TAG, "Selected assets failed local display initialization");
+    }
     display->SetChatMessage("system", "");
     display->SetEmotion("microchip_ai");
 }

@@ -54,7 +54,8 @@ bool Assets::FindPartition(Assets* assets) {
 }
 
 bool Assets::Apply() {
-    return strategy_ ? strategy_->Apply(this) : false;
+    applied_ = strategy_ && strategy_->Apply(this);
+    return applied_;
 }
 
 bool Assets::InitializePartition() {
@@ -65,6 +66,7 @@ void Assets::UnApplyPartition() {
     if (strategy_) {
         strategy_->UnApplyPartition(this);
     }
+    applied_ = false;
 }
 
 bool Assets::GetAssetData(const std::string& name, void*& ptr, size_t& size) {
@@ -84,6 +86,14 @@ bool Assets::BeginTrialHealth(bool models_ready, int64_t now_ms, uint32_t wake_f
 
 bool Assets::PollTrialHealth(int64_t now_ms, bool healthy, uint32_t wake_feeds) {
     return strategy_ && strategy_->PollTrialHealth(now_ms, healthy, wake_feeds);
+}
+
+bool Assets::EndTrialHealth(bool failed) {
+    return strategy_ && strategy_->EndTrialHealth(failed);
+}
+
+asset_storage::TrialStatus Assets::TrialState() const {
+    return strategy_ ? strategy_->TrialState() : asset_storage::TrialStatus::kNone;
 }
 
 bool Assets::UpdatesReady() const { return strategy_ && strategy_->UpdatesReady(); }
@@ -225,6 +235,10 @@ bool Assets::LvglStrategy::TrialPending() const {
     return mapping_ && mapping_->TrialPending();
 }
 
+asset_storage::TrialStatus Assets::LvglStrategy::TrialState() const {
+    return mapping_ ? mapping_->TrialState() : asset_storage::TrialStatus::kNone;
+}
+
 bool Assets::LvglStrategy::UpdatesReady() const { return mapping_ && mapping_->UpdatesReady(); }
 std::string Assets::LvglStrategy::CurrentVersion() const { return mapping_ ? mapping_->Version() : std::string{}; }
 
@@ -247,6 +261,10 @@ bool Assets::LvglStrategy::PollTrialHealth(int64_t now_ms, bool healthy, uint32_
     if (pending && !mapping_->TrialPending()) ESP_LOGI(TAG, "Asset trial confirmed after model initialization and sustained wake input");
     else if (pending && !active && mapping_->Faulted()) ESP_LOGE(TAG, "Asset trial confirmation failed; reboot recovery remains required");
     return active;
+}
+
+bool Assets::LvglStrategy::EndTrialHealth(bool failed) {
+    return mapping_ && mapping_->EndTrialHealth(failed);
 }
 
 bool Assets::LvglStrategy::GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) {

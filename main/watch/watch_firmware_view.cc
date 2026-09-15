@@ -120,6 +120,22 @@ void WatchView::BuildFirmwareUpdate() {
         request.firmware_sequence = state_.firmware.update.sequence;
         Submit(request);
     });
+    firmware_validate_ = Button(body_, WATCH_MODELS_VALIDATE, [this] {
+        if (!state_.firmware.can_validate_models || state_.firmware.update.target != watch_update::Target::kModels)
+            return;
+        WatchViewRequest request;
+        request.action = WatchViewAction::kValidateModels;
+        request.update_target = watch_update::Target::kModels;
+        Submit(request);
+    });
+    firmware_rollback_ = Button(body_, WATCH_MODELS_ROLLBACK, [this] {
+        if (!state_.firmware.can_rollback_models || state_.firmware.update.target != watch_update::Target::kModels)
+            return;
+        WatchViewRequest request;
+        request.action = WatchViewAction::kRollbackModels;
+        request.update_target = watch_update::Target::kModels;
+        Submit(request);
+    });
     RefreshFirmwareUpdate();
 }
 
@@ -136,6 +152,10 @@ void WatchView::RefreshFirmwareUpdate() {
     const bool pending = pending_request_ && (pending_action_ == WatchViewAction::kCheckFirmware ||
         pending_action_ == WatchViewAction::kInstallFirmware);
     const bool committed = update.commit_started || update.boot_selected;
+    const bool models = update.target == watch_update::Target::kModels;
+    const bool model_validation_message = models && !confirmation &&
+        (firmware.model_trial != asset_storage::TrialStatus::kNone ||
+         firmware.model_validation_phase != WatchModelValidationPhase::kIdle);
     const bool cancel = !committed && update.phase != Phase::kResourceFault &&
         (pending || firmware.network_preparing || update.active || available);
     const bool usable = handler_ && visible_ && !touch_locked_ && !state_.time.sleep_prepared && firmware.available;
@@ -152,8 +172,22 @@ void WatchView::RefreshFirmwareUpdate() {
     if (firmware.network_preparing) status = WATCH_UPDATE_CONNECTING;
     else if (confirmation && available) status = same ? WATCH_UPDATE_CONFIRM : WATCH_UPDATE_EXPIRED;
     if (update.cancelling && update.active) status = WATCH_UPDATE_STOPPING;
+    if (models && !confirmation) {
+        if (firmware.model_validation_active || firmware.model_trial == asset_storage::TrialStatus::kObserving)
+            status = WATCH_MODELS_TRIAL_RUNNING;
+        else if (firmware.model_validation_phase == WatchModelValidationPhase::kSucceeded)
+            status = WATCH_MODELS_TRIAL_PASSED;
+        else if (firmware.model_validation_phase == WatchModelValidationPhase::kCancelled)
+            status = WATCH_MODELS_TRIAL_CANCELLED;
+        else if (firmware.model_trial == asset_storage::TrialStatus::kFailed ||
+                 firmware.model_validation_phase == WatchModelValidationPhase::kFailed ||
+                 firmware.model_validation_phase == WatchModelValidationPhase::kCleanupFailed)
+            status = WATCH_MODELS_TRIAL_FAILED;
+        else if (firmware.model_trial == asset_storage::TrialStatus::kPending)
+            status = WATCH_MODELS_TRIAL_PENDING;
+    }
     if (!firmware.available) status = WATCH_UPDATE_UNAVAILABLE;
-    else if (!update.active && !committed && !firmware.network_preparing &&
+    else if (!model_validation_message && !update.active && !committed && !firmware.network_preparing &&
              (update.phase == Phase::kIdle || available)) {
         switch (firmware.blocked) {
             case WatchUpdateBlock::kWifiDisabled: status = WATCH_UPDATE_WIFI_OFF; break;
@@ -171,25 +205,44 @@ void WatchView::RefreshFirmwareUpdate() {
                   selected.version.c_str(), static_cast<unsigned>((selected.bytes + 1023) / 1024));
     lv_label_set_text(firmware_version_, version);
     Visibility(firmware_version_, !selected.version.empty());
-    const bool progress = update.phase == Phase::kInstalling || committed;
+    const bool progress = update.phase == Phase::kInstalling || committed || firmware.model_validation_active;
     Visibility(firmware_progress_, progress);
     Visibility(firmware_progress_text_, progress);
-    const auto percent = std::min(update.progress, update.boot_selected ? 100U : 99U);
+    const auto percent = firmware.model_validation_active ? std::min(firmware.model_validation_progress, 99U)
+        : std::min(update.progress, update.boot_selected ? 100U : 99U);
     lv_bar_set_value(firmware_progress_, percent, LV_ANIM_OFF);
     char text[48];
-    std::snprintf(text, sizeof(text), "%u%%  %u KiB/s", percent, static_cast<unsigned>(update.bytes_per_second / 1024));
+    if (firmware.model_validation_active) std::snprintf(text, sizeof(text), "%u%%", percent);
+    else std::snprintf(text, sizeof(text), "%u%%  %u KiB/s", percent, static_cast<unsigned>(update.bytes_per_second / 1024));
     lv_label_set_text(firmware_progress_text_, text);
-    Visibility(firmware_check_, !available && !update.active && !committed && !firmware.network_preparing && !confirmation);
+    Visibility(firmware_check_, !model_validation_message && !available && !update.active && !committed &&
+        !firmware.network_preparing && !confirmation);
     Enabled(firmware_check_, usable && !pending_request_ && firmware.can_check);
     Visibility(firmware_install_, available);
     Enabled(firmware_install_, usable && !pending_request_ && firmware.can_install && (!confirmation || same));
-    Visibility(firmware_cancel_, cancel);
+    Visibility(firmware_cancel_, cancel || firmware.model_validation_active);
+    if (firmware_cancel_ && lv_obj_get_child_count(firmware_cancel_))
+        lv_label_set_text(lv_obj_get_child(firmware_cancel_, 0),
+            firmware.model_validation_active ? WATCH_MODELS_CANCEL : WATCH_UPDATE_CANCEL);
     Enabled(firmware_cancel_, usable && !update.cancelling);
     Visibility(firmware_reboot_, update.boot_selected);
     Enabled(firmware_reboot_, usable && !pending_request_ && firmware.can_reboot);
+    Visibility(firmware_validate_, !confirmation && models && firmware.model_trial == asset_storage::TrialStatus::kPending &&
+        !firmware.model_validation_active);
+    Enabled(firmware_validate_, usable && !pending_request_ && firmware.can_validate_models);
+    Visibility(firmware_rollback_, !confirmation && models && firmware.can_rollback_models);
+    Enabled(firmware_rollback_, usable && !pending_request_ && firmware.can_rollback_models);
 }
 
 void WatchView::CancelFirmware() {
+    if (state_.firmware.model_validation_active) {
+        WatchViewRequest request;
+        request.action = WatchViewAction::kCancelModelValidation;
+        request.update_target = watch_update::Target::kModels;
+        request.firmware_request = state_.firmware.model_validation_request;
+        Submit(request);
+        return;
+    }
     const auto& update = state_.firmware.update;
     const bool pending = pending_request_ && (pending_action_ == WatchViewAction::kCheckFirmware ||
         pending_action_ == WatchViewAction::kInstallFirmware);

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include "system/audream_power_manager.h"
 #include "asset_update_client.h"
+#include "asset_trial_status.h"
 namespace asset_storage {
 class UpdateSession {
 public:
@@ -26,6 +27,8 @@ struct srmodel_list_t {};
 class Assets {
 public:
     bool available = true;
+    bool applied = true;
+    asset_storage::TrialStatus trial_state = asset_storage::TrialStatus::kNone;
     bool models_ready = false;
     unsigned health_begins = 0;
     unsigned health_polls = 0;
@@ -42,12 +45,25 @@ public:
     }
     bool BeginTrialHealth(bool ready, int64_t now_ms, uint32_t wake_feeds) {
         assert(now_ms >= 0 && wake_feeds == 123);
-        ++health_begins; models_ready = ready; return ready;
+        ++health_begins; models_ready = ready;
+        if (ready && trial_state == asset_storage::TrialStatus::kPending)
+            trial_state = asset_storage::TrialStatus::kObserving;
+        return ready;
     }
     bool PollTrialHealth(int64_t now_ms, bool healthy, uint32_t wake_feeds) {
         assert(now_ms >= 0 && wake_feeds == 123);
-        assert(AudreamPowerManager::GetInstance().storage_leases == (healthy ? 1 : 0));
-        ++health_polls; last_healthy = healthy; return keep_observing;
+        if (healthy) assert(AudreamPowerManager::GetInstance().storage_leases == 1);
+        ++health_polls; last_healthy = healthy;
+        if (healthy && !keep_observing) trial_state = asset_storage::TrialStatus::kNone;
+        return keep_observing;
+    }
+    asset_storage::TrialStatus TrialState() const { return trial_state; }
+    bool Applied() const { return applied; }
+    bool EndTrialHealth(bool failed) {
+        if (trial_state != asset_storage::TrialStatus::kPending &&
+            trial_state != asset_storage::TrialStatus::kObserving) return false;
+        trial_state = failed ? asset_storage::TrialStatus::kFailed : asset_storage::TrialStatus::kPending;
+        return true;
     }
     bool UpdatesReady() const { return updates_ready && !update_owned; }
     std::string CurrentVersion() const { return {}; }

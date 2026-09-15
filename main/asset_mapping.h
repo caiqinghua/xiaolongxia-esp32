@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asset_partition.h"
+#include "asset_trial_status.h"
 #include "ota_boot_health.h"
 #include "asset_update_client.h"
 #include <atomic>
@@ -27,6 +28,10 @@ public:
     const Selection& Selected() const { return selected_; }
     bool UpdatesReady() const { return valid_ && store_ && can_stage_ && !update_owned_ && !Faulted(); }
     bool TrialPending() const { return selected_.trial; }
+    TrialStatus TrialState() const {
+        return !selected_.trial ? TrialStatus::kNone : failed_ || store_faulted_ ? TrialStatus::kFailed
+            : health_active_ ? TrialStatus::kObserving : TrialStatus::kPending;
+    }
     bool Faulted() const { return failed_ || store_faulted_; }
     PartitionStatus StorageStatus() const { return storage_status_; }
     // The SDK retains model pointers for the rest of this boot.
@@ -34,6 +39,7 @@ public:
     // Application owner only. Poll requires a storage lease before healthy=true.
     bool BeginTrialHealth(bool models_ready, int64_t now_ms, uint32_t wake_feeds);
     bool PollTrialHealth(int64_t now_ms, bool healthy, uint32_t wake_feeds);
+    bool EndTrialHealth(bool failed);
     std::unique_ptr<UpdateSession> BeginUpdate(asset_update::Client::CreateHttp create_http,
                                              std::function<int64_t()> now_ms);
 private:

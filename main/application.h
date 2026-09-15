@@ -238,6 +238,11 @@ private:
     bool watch_firmware_network_ = false, watch_firmware_storage_ = false;
     bool watch_assets_initialized_ = false;
     std::unique_ptr<asset_storage::UpdateSession> watch_asset_update_;
+    uint64_t watch_model_validation_request_ = 0;
+    uint64_t watch_model_validation_generation_ = 0;
+    int64_t watch_model_validation_started_ms_ = 0;
+    bool watch_model_validation_storage_ = false;
+    WatchModelValidationPhase watch_model_validation_phase_ = WatchModelValidationPhase::kIdle;
     void InitializeWatchFirmware(watch_update::Target target = watch_update::Target::kFirmware);
     WatchUpdateBlock WatchFirmwareBlock(bool installing);
     bool AcquireWatchFirmware(watch_update::Operation operation);
@@ -247,6 +252,9 @@ private:
     bool HandleWatchFirmwareRequest(const WatchViewRequest& request);
     bool StopWatchFirmware(uint32_t timeout_ms);
     void PollWatchFirmware();
+    bool StartWatchModelValidation(uint64_t request_id);
+    bool StopWatchModelValidation(uint64_t request_id, bool cancelled, uint32_t timeout_ms);
+    void PollWatchModelValidation();
     WatchFirmwareSnapshot BuildWatchFirmwareSnapshot();
 #endif
     void PollWatchStationRecovery();

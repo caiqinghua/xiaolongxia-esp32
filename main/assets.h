@@ -35,6 +35,9 @@ public:
     bool LoadAssistantModels(srmodel_list_t*& models);
     bool BeginTrialHealth(bool models_ready, int64_t now_ms, uint32_t wake_feeds);
     bool PollTrialHealth(int64_t now_ms, bool healthy, uint32_t wake_feeds);
+    bool EndTrialHealth(bool failed);
+    asset_storage::TrialStatus TrialState() const;
+    bool Applied() const { return applied_; }
     bool UpdatesReady() const;
     std::string CurrentVersion() const;
     std::unique_ptr<asset_storage::UpdateSession> BeginUpdate();
@@ -62,8 +65,10 @@ private:
         virtual bool GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) = 0;
         virtual void PinModels() {}
         virtual bool TrialPending() const { return false; }
+        virtual asset_storage::TrialStatus TrialState() const { return asset_storage::TrialStatus::kNone; }
         virtual bool BeginTrialHealth(bool, int64_t, uint32_t) { return false; }
         virtual bool PollTrialHealth(int64_t, bool, uint32_t) { return false; }
+        virtual bool EndTrialHealth(bool) { return false; }
         virtual bool UpdatesReady() const { return false; }
         virtual std::string CurrentVersion() const { return {}; }
         virtual std::unique_ptr<asset_storage::UpdateSession> BeginUpdate() { return {}; }
@@ -77,8 +82,10 @@ private:
         bool GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) override;
         void PinModels() override;
         bool TrialPending() const override;
+        asset_storage::TrialStatus TrialState() const override;
         bool BeginTrialHealth(bool models_ready, int64_t now_ms, uint32_t wake_feeds) override;
         bool PollTrialHealth(int64_t now_ms, bool healthy, uint32_t wake_feeds) override;
+        bool EndTrialHealth(bool failed) override;
         bool UpdatesReady() const override;
         std::string CurrentVersion() const override;
         std::unique_ptr<asset_storage::UpdateSession> BeginUpdate() override;
@@ -108,6 +115,7 @@ protected:
     std::string default_assets_url_;
     srmodel_list_t* models_list_ = nullptr;
     bool models_pinned_ = false;
+    bool applied_ = false;
 };
 
 #endif

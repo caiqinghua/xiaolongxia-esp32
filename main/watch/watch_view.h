@@ -125,6 +125,8 @@ private:
     lv_obj_t* firmware_install_ = nullptr;
     lv_obj_t* firmware_cancel_ = nullptr;
     lv_obj_t* firmware_reboot_ = nullptr;
+    lv_obj_t* firmware_validate_ = nullptr;
+    lv_obj_t* firmware_rollback_ = nullptr;
     uint64_t firmware_check_request_ = 0;
     watch_update::Snapshot firmware_confirmation_;
     lv_obj_t* pairing_accept_ = nullptr;

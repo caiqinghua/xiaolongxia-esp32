@@ -1814,6 +1814,60 @@ void TestFirmwareUi(WatchViewState state, const std::filesystem::path& screensho
     Screenshot(lv_screen_active(), screenshots / "models-target-options.ppm");
     lv_dropdown_close(target); Tick();
     Screenshot(view.Root(), screenshots / "models-idle.ppm");
+    state.firmware.model_trial = asset_storage::TrialStatus::kPending;
+    state.firmware.can_validate_models = true;
+    state.firmware.can_check = false;
+    view.Update(state); Tick();
+    Check(FindLabel(view.Root(), WATCH_MODELS_TRIAL_PENDING) && FindButton(view.Root(), WATCH_MODELS_VALIDATE),
+        "pending model trial exposes an explicit local check");
+    Screenshot(view.Root(), screenshots / "models-trial-pending.ppm");
+    Click(view, WATCH_MODELS_VALIDATE);
+    auto validate = requests.back();
+    Check(validate.action == WatchViewAction::kValidateModels &&
+        validate.update_target == watch_update::Target::kModels,
+        "local model check is a typed owner request");
+    state.firmware.model_trial = asset_storage::TrialStatus::kObserving;
+    state.firmware.model_validation_active = true;
+    state.firmware.model_validation_request = validate.id;
+    state.firmware.model_validation_progress = 42;
+    state.firmware.model_validation_phase = WatchModelValidationPhase::kRunning;
+    view.Update(state); view.Complete(validate.id, true); Tick();
+    Check(FindLabel(view.Root(), WATCH_MODELS_TRIAL_RUNNING) && FindLabel(view.Root(), "42%") &&
+        FindButton(view.Root(), WATCH_MODELS_CANCEL), "local model check shows real running progress and cancellation");
+    auto* running_body = lv_obj_get_parent(FindButton(view.Root(), WATCH_MODELS_CANCEL));
+    lv_obj_scroll_to_y(running_body, 100000, LV_ANIM_OFF); Tick();
+    lv_area_t stop_bounds;
+    lv_obj_get_coords(FindButton(view.Root(), WATCH_MODELS_CANCEL), &stop_bounds);
+    Check(stop_bounds.y1 >= 64 && stop_bounds.y2 < 502,
+        "model check cancellation remains reachable at the bottom of the watch viewport");
+    Screenshot(view.Root(), screenshots / "models-trial-running.ppm");
+    Click(view, WATCH_MODELS_CANCEL);
+    Check(requests.back().action == WatchViewAction::kCancelModelValidation &&
+        requests.back().firmware_request == validate.id, "model check cancellation identifies its admitted owner request");
+    view.Complete(requests.back().id, true);
+    state.firmware.model_validation_active = false;
+    state.firmware.model_trial = asset_storage::TrialStatus::kFailed;
+    state.firmware.model_validation_phase = WatchModelValidationPhase::kFailed;
+    state.firmware.can_rollback_models = true;
+    view.Update(state); Tick();
+    Check(FindLabel(view.Root(), WATCH_MODELS_TRIAL_FAILED) && FindButton(view.Root(), WATCH_MODELS_ROLLBACK),
+        "failed model trial offers an explicit restart rollback");
+    auto* trial_body = lv_obj_get_parent(FindButton(view.Root(), WATCH_MODELS_ROLLBACK));
+    lv_obj_scroll_to_y(trial_body, 100000, LV_ANIM_OFF); Tick();
+    lv_area_t rollback_bounds;
+    lv_obj_get_coords(FindButton(view.Root(), WATCH_MODELS_ROLLBACK), &rollback_bounds);
+    Check(rollback_bounds.y1 >= 64 && rollback_bounds.y2 < 502,
+        "model rollback remains reachable at the bottom of the watch viewport");
+    Screenshot(view.Root(), screenshots / "models-trial-failed.ppm");
+    Click(view, WATCH_MODELS_ROLLBACK);
+    Check(requests.back().action == WatchViewAction::kRollbackModels,
+        "model rollback requires a typed physical action");
+    view.Complete(requests.back().id, false);
+    state.firmware.model_trial = asset_storage::TrialStatus::kNone;
+    state.firmware.model_validation_phase = WatchModelValidationPhase::kIdle;
+    state.firmware.can_rollback_models = false;
+    state.firmware.can_check = true;
+    view.Update(state); Tick();
     Click(view, WATCH_UPDATE_CHECK); check = requests.back();
     Check(check.update_target == watch_update::Target::kModels, "model check preserves the selected target");
     const auto while_checking = requests.size();

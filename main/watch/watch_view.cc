@@ -17,7 +17,8 @@ constexpr uint32_t kWarning = 0xF6B35C;
 bool IsFirmwareAction(WatchViewAction action) {
     return action == WatchViewAction::kCheckFirmware || action == WatchViewAction::kCancelFirmware ||
         action == WatchViewAction::kInstallFirmware || action == WatchViewAction::kRebootFirmware ||
-        action == WatchViewAction::kSelectUpdateTarget;
+        action == WatchViewAction::kSelectUpdateTarget || action == WatchViewAction::kValidateModels ||
+        action == WatchViewAction::kCancelModelValidation || action == WatchViewAction::kRollbackModels;
 }
 bool IsFirmwarePage(WatchPage page) {
     return page == WatchPage::kFirmwareUpdate || page == WatchPage::kFirmwareConfirm;
@@ -579,7 +580,7 @@ void WatchView::Submit(WatchViewRequest request) {
         request.action == WatchViewAction::kConfirmNotificationPeer) && !request.enabled) ||
         request.action == WatchViewAction::kClearNotifications || request.action == WatchViewAction::kAssistantEnd ||
         request.action == WatchViewAction::kCancelDevicePairing ||
-        request.action == WatchViewAction::kCancelFirmware ||
+        (request.action == WatchViewAction::kCancelFirmware || request.action == WatchViewAction::kCancelModelValidation) ||
         ((request.action == WatchViewAction::kConfirmDevicePairingPeer ||
           request.action == WatchViewAction::kApproveDevicePairingAccount ||
           request.action == WatchViewAction::kConfirmBindingRemoval || request.action == WatchViewAction::kConfirmControlRemoval) && !request.enabled) ||
@@ -720,6 +721,7 @@ void WatchView::Render() {
     firmware_status_ = firmware_version_ = firmware_progress_ = firmware_progress_text_ = nullptr;
     firmware_target_ = firmware_installed_ = nullptr;
     firmware_check_ = firmware_install_ = firmware_cancel_ = firmware_reboot_ = nullptr;
+    firmware_validate_ = firmware_rollback_ = nullptr;
     pairing_saved_choices_.clear();
     notification_items_.clear();
     weekdays_.fill(nullptr);

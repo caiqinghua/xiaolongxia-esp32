@@ -29,7 +29,7 @@ enum class WatchViewAction { kTimeCommand, kSetAlarm, kSetPreferences,
     kOpenBindingRemoval, kConfirmBindingRemoval, kOpenControlRemoval, kConfirmControlRemoval,
     kOpenSavedControlPeers, kSelectSavedControlPeer, kSelectAllSavedControlPeers, kConfirmAllControlRemoval,
     kCheckFirmware, kCancelFirmware, kInstallFirmware, kRebootFirmware,
-    kSelectUpdateTarget };
+    kSelectUpdateTarget, kValidateModels, kCancelModelValidation, kRollbackModels };
 
 struct WatchViewRequest {
     uint64_t id = 0;

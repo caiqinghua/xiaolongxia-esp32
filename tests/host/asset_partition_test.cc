@@ -524,7 +524,7 @@ int main() {
         asset_storage::Mapping changed;
         assert(!changed.Open(&descriptor, &config) && changed.Faulted() && !changed.Data() && maps == 0);
     }
-    for (int mode = 0; mode < 8; ++mode) {
+    for (int mode = 0; mode < 9; ++mode) {
         Reset(); auto backend = Partition::Open(&descriptor, status); assert(backend);
         Store store(backend->Geometry(), backend->FactoryDigest(), kCompatibility, PublicKey(), backend->MakeHooks());
         store.Boot();
@@ -544,8 +544,19 @@ int main() {
                 assert(!trial.BeginTrialHealth(false, 0, 0));
                 assert(!trial.BeginTrialHealth(true, 0, 0) && trial.Faulted());
                 assert(!trial.PollTrialHealth(60000, true, 100));
+            } else if (mode == 8) {
+                assert(trial.BeginTrialHealth(true, 0, 0));
+                assert(trial.TrialState() == asset_storage::TrialStatus::kObserving);
+                assert(trial.EndTrialHealth(true));
+                assert(trial.TrialState() == asset_storage::TrialStatus::kFailed && trial.Faulted());
+                assert(!trial.BeginTrialHealth(true, 1000, 1));
             } else {
                 assert(trial.BeginTrialHealth(true, 0, 0));
+                if (mode == 0) {
+                    assert(trial.EndTrialHealth(false));
+                    assert(trial.TrialState() == asset_storage::TrialStatus::kPending && !trial.Faulted());
+                    assert(trial.BeginTrialHealth(true, 0, 0));
+                }
                 uint32_t feeds = 0;
                 for (int i = 1; i <= 29; ++i) {
                     if (mode != 2) ++feeds;

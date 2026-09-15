@@ -60,6 +60,15 @@ bool Mapping::PollTrialHealth(int64_t now_ms, bool healthy, uint32_t wake_feeds)
     return health_active_;
 }
 
+bool Mapping::EndTrialHealth(bool failed) {
+    if (update_owned_ || !TrialPending()) return false;
+    health_active_ = false;
+    health_started_ = false;
+    health_ = {};
+    if (failed) failed_ = true;
+    return true;
+}
+
 bool Mapping::Open(const esp_partition_t* partition, const BootConfig* config) {
     if (attempted_) return valid_;
     attempted_ = true;

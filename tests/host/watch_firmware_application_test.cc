@@ -33,6 +33,9 @@ void Reset() {
     auto& assets = Assets::GetInstance();
     assert(!assets.update_owned);
     assets.updates_ready = assets.update_acquire_ok = true;
+    assets.applied = true;
+    assets.trial_state = asset_storage::TrialStatus::kNone;
+    assets.keep_observing = true;
     assets.update_acquires = assets.update_returns = 0;
     power.state = AudreamPowerState::kActive; power.allowed = true;
     GetWatchWifiGate().Initialize(true);
@@ -81,6 +84,24 @@ void Available(Application& app) {
     assert(app.HandleWatchFirmwareRequest(CheckRequest()));
     Finish(app);
     assert(app.BuildWatchFirmwareSnapshot().can_install);
+}
+void ConfirmBoot(Application& app) {
+    app.watch_boot_health_.Begin(true, 0);
+    for (int second = 1; second <= 30; ++second) {
+        const bool confirming = app.watch_boot_health_.Observe(second * 1000, true);
+        if (second < 30) assert(!confirming);
+        else assert(confirming);
+    }
+    app.watch_boot_health_.Complete(true);
+    assert(app.watch_boot_health_.Confirmed());
+}
+void SelectModels(Application& app, uint64_t id = 1) {
+    app.InitializeWatchFirmware();
+    WatchViewRequest select;
+    select.id = id;
+    select.action = WatchViewAction::kSelectUpdateTarget;
+    select.update_target = watch_update::Target::kModels;
+    assert(app.HandleWatchFirmwareRequest(select));
 }
 WatchViewRequest InstallRequest(Application& app) {
     const auto state = app.BuildWatchFirmwareSnapshot();
@@ -307,7 +328,78 @@ int main() {
             assert(!app.HandleWatchFirmwareRequest(install) && app.reboots == 1);
         }
     }
+    {
+        Reset(); Application app; SelectModels(app); ConfirmBoot(app);
+        auto& assets = Assets::GetInstance();
+        assets.trial_state = asset_storage::TrialStatus::kPending;
+        WatchViewRequest validate;
+        validate.id = 2; validate.action = WatchViewAction::kValidateModels;
+        validate.update_target = watch_update::Target::kModels;
+        assert(app.HandleWatchFirmwareRequest(validate));
+        auto state = app.BuildWatchFirmwareSnapshot();
+        assert(state.model_validation_active && state.model_validation_request == validate.id &&
+            state.model_trial == asset_storage::TrialStatus::kObserving && app.WatchFirmwareBusy());
+        assert(AudreamPowerManager::GetInstance().storage_leases == 1 &&
+            !AudreamPowerManager::GetInstance().network_leases &&
+            app.audio_session_coordinator_.Mode() == AudioSessionMode::kModelValidation &&
+            app.audio_service_.IsAssistantUserEnabled());
+        assets.keep_observing = false;
+        app.PollWatchFirmware();
+        state = app.BuildWatchFirmwareSnapshot();
+        assert(!state.model_validation_active && state.model_validation_phase == WatchModelValidationPhase::kSucceeded &&
+            state.model_trial == asset_storage::TrialStatus::kNone && !app.WatchFirmwareBusy() &&
+            AudreamPowerManager::GetInstance().storage_leases == 0 &&
+            app.audio_session_coordinator_.Mode() == AudioSessionMode::kIdle &&
+            app.audio_service_.IsAssistantUserEnabled());
+    }
+    {
+        Reset(); Application app; SelectModels(app); ConfirmBoot(app);
+        auto& assets = Assets::GetInstance();
+        assets.trial_state = asset_storage::TrialStatus::kPending;
+        WatchViewRequest validate;
+        validate.id = 2; validate.action = WatchViewAction::kValidateModels;
+        validate.update_target = watch_update::Target::kModels;
+        assert(app.HandleWatchFirmwareRequest(validate));
+        WatchViewRequest cancel;
+        cancel.id = 3; cancel.action = WatchViewAction::kCancelModelValidation;
+        cancel.update_target = watch_update::Target::kModels; cancel.firmware_request = 99;
+        assert(!app.HandleWatchFirmwareRequest(cancel));
+        cancel.firmware_request = validate.id;
+        assert(app.HandleWatchFirmwareRequest(cancel));
+        auto state = app.BuildWatchFirmwareSnapshot();
+        assert(!state.model_validation_active && state.model_trial == asset_storage::TrialStatus::kPending &&
+            state.model_validation_phase == WatchModelValidationPhase::kCancelled && state.can_validate_models);
+        validate.id = 4;
+        assert(app.HandleWatchFirmwareRequest(validate));
+        const auto recording = app.audio_session_coordinator_.Begin(AudioSessionMode::kLocalRecording);
+        assert(recording);
+        app.PollWatchFirmware();
+        state = app.BuildWatchFirmwareSnapshot();
+        assert(!state.model_validation_active && state.model_trial == asset_storage::TrialStatus::kPending &&
+            app.audio_session_coordinator_.Mode() == AudioSessionMode::kTransitioning &&
+            AudreamPowerManager::GetInstance().storage_leases == 0);
+        assert(app.audio_session_coordinator_.Complete(recording));
+    }
+    {
+        Reset(); Application app; SelectModels(app); ConfirmBoot(app);
+        auto& assets = Assets::GetInstance();
+        assets.trial_state = asset_storage::TrialStatus::kPending;
+        WatchViewRequest validate;
+        validate.id = 2; validate.action = WatchViewAction::kValidateModels;
+        validate.update_target = watch_update::Target::kModels;
+        assert(app.HandleWatchFirmwareRequest(validate));
+        app.audio_service_.model_validation_generation = 0;
+        app.PollWatchFirmware();
+        auto state = app.BuildWatchFirmwareSnapshot();
+        assert(state.model_trial == asset_storage::TrialStatus::kFailed && state.can_rollback_models &&
+            state.model_validation_phase == WatchModelValidationPhase::kFailed);
+        WatchViewRequest rollback;
+        rollback.id = 3; rollback.action = WatchViewAction::kRollbackModels;
+        rollback.update_target = watch_update::Target::kModels;
+        assert(!app.HandleWatchFirmwareRequest(rollback) && app.reboots == 1);
+    }
     Reset();
+    std::cout << "PASS: offline model validation, cancellation, recording preemption and explicit rollback\n";
     std::cout << "PASS: model update Application target, exclusive session, cancellation, recording handoff and reboot\n";
     std::cout << "PASS: firmware Application admission, on-demand station, intent fencing, handoff, failures and reboot\n";
 }
