@@ -144,7 +144,9 @@ public:
     bool SetWakeWordGuard(std::function<bool()> guard);
     bool IsWakeWordGenerationCurrent(uint64_t generation) const;
     bool PrepareVoiceProcessing(srmodel_list_t* models = nullptr, bool local_endpointing = false);
-    bool StartModelValidation(uint64_t generation);
+    // The owner must quiesce even after a failed start or an expired/revoked lease.
+    bool StartModelValidation(uint64_t generation, uint32_t duration_ms);
+    bool RevokeModelValidation(uint64_t generation);
     bool IsModelValidationCurrent(uint64_t generation) const;
     uint32_t ModelValidationFeedCount() const { return model_validation_feeds_.load(std::memory_order_relaxed); }
     bool EnableVoiceProcessing(bool enable);
@@ -192,6 +194,8 @@ private:
     std::unique_ptr<WakeWord> wake_word_;
     std::atomic<uint32_t> wake_input_feeds_{0};
     std::atomic<uint64_t> model_validation_generation_{0};
+    std::atomic<int64_t> model_validation_started_ms_{0};
+    std::atomic<int64_t> model_validation_deadline_ms_{0};
     std::atomic<uint32_t> model_validation_feeds_{0};
     std::unique_ptr<AudioDebugger> audio_debugger_;
     void* opus_encoder_ = nullptr;

@@ -1,6 +1,7 @@
 #include "audio/audio_service.h"
 #include <cassert>
 #include <iostream>
+#include <thread>
 
 namespace {
 EventGroupHandle_t events = nullptr;
@@ -129,21 +130,23 @@ int main() {
         audio.Initialize(&codec); audio.SetSessionCoordinator(&owner); audio.SetAssistantUserEnabled(false);
         const auto validation = owner.Begin(AudioSessionMode::kModelValidation);
         assert(validation && owner.OwnsModelValidationPreparation(validation.generation));
-        assert(!audio.StartModelValidation(validation.generation));
+        assert(!audio.StartModelValidation(validation.generation, 60000));
         assert(audio.QuiesceAssistant(25));
         assert(audio.PrepareWatchWakeWord(&models) && audio.PrepareVoiceProcessing(&models, true));
         assert(owner.Complete(validation));
+        assert(!audio.StartModelValidation(validation.generation, 0));
+        assert(!audio.StartModelValidation(validation.generation, 60001));
         if (mode == 6) wake->start_ok = false;
         if (mode == 7) processor->start_ok = false;
         if (mode >= 6 && mode <= 7) {
-            assert(!audio.StartModelValidation(validation.generation) && !events->bits);
+            assert(!audio.StartModelValidation(validation.generation, 60000) && !events->bits);
             assert(audio.QuiesceAssistant(25));
             assert(owner.ReleaseModelValidation(validation.generation, true));
             preparation_fixture = false;
             continue;
         }
-        assert(audio.StartModelValidation(validation.generation));
-        assert(!audio.StartModelValidation(validation.generation));
+        assert(audio.StartModelValidation(validation.generation, 60000));
+        assert(!audio.StartModelValidation(validation.generation, 60000));
         assert(audio.IsModelValidationCurrent(validation.generation) && !audio.IsAssistantUserEnabled());
         assert(events->bits == AS_EVENT_MODEL_VALIDATION_RUNNING && !audio.IsWakeWordGenerationCurrent(1));
         if (wake->detected) wake->detected("unexpected");
@@ -183,6 +186,49 @@ int main() {
     }
     calls.clear();
     std::cout << "PASS: local model validation input, no debug output, explicit owner, preemption and failed drain\n";
+    for (int boundary = 0; boundary < 4; ++boundary) {
+        preparation_fixture = true;
+        AudioSessionCoordinator owner;
+        AudioService audio; Codec codec; srmodel_list_t models;
+        assert(audio.SetWakeWordGuard([] { return false; }));
+        audio.Initialize(&codec); audio.SetSessionCoordinator(&owner); audio.SetAssistantUserEnabled(false);
+        const auto validation = owner.Begin(AudioSessionMode::kModelValidation);
+        assert(audio.QuiesceAssistant(25));
+        assert(audio.PrepareWatchWakeWord(&models) && audio.PrepareVoiceProcessing(&models, true));
+        assert(owner.Complete(validation));
+        assert(audio.StartModelValidation(validation.generation, boundary == 0 ? 1 : 60000));
+        assert(!audio.RevokeModelValidation(0) && !audio.RevokeModelValidation(validation.generation + 1));
+        input_reads = wake_feeds = processor_feeds = 0;
+        auto revoke = [&] { assert(audio.RevokeModelValidation(validation.generation)); };
+        if (boundary == 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (boundary == 1) input_hook = revoke;
+        if (boundary == 2) wake_feed_hook = revoke;
+        if (boundary == 3) processor_feed_hook = revoke;
+        std::vector<int16_t> unused;
+        assert(!audio.ReadAudioData(unused, 0, 0));
+        assert(input_reads == static_cast<unsigned>(boundary != 0));
+        assert(wake_feeds == static_cast<unsigned>(boundary >= 2));
+        assert(processor_feeds == static_cast<unsigned>(boundary == 3));
+        assert(!audio.ModelValidationFeedCount() && !audio.IsModelValidationCurrent(validation.generation));
+        input_hook = wake_feed_hook = processor_feed_hook = {};
+        // Expiry/revocation is not proof of resource release or permission to restart.
+        assert(owner.BlocksSleep() && events->bits == AS_EVENT_MODEL_VALIDATION_RUNNING);
+        assert(!audio.StartModelValidation(validation.generation, 60000));
+        assert(audio.QuiesceAssistant(25) && owner.ReleaseModelValidation(validation.generation, true));
+        const auto next = owner.Begin(AudioSessionMode::kModelValidation);
+        assert(owner.Complete(next) && audio.StartModelValidation(next.generation, 60000));
+        assert(!audio.RevokeModelValidation(validation.generation));
+        assert(audio.ReadAudioData(unused, 0, 0) && audio.ModelValidationFeedCount() == 1);
+        assert(audio.QuiesceAssistant(25) && owner.ReleaseModelValidation(next.generation, true));
+        const auto restarted = owner.Begin(AudioSessionMode::kModelValidation);
+        assert(owner.Complete(restarted) && audio.StartModelValidation(restarted.generation, 60000));
+        assert(!audio.ModelValidationFeedCount());
+        assert(audio.QuiesceAssistant(25) && owner.ReleaseModelValidation(restarted.generation, true));
+        assert(!audio.IsAssistantUserEnabled());
+        preparation_fixture = false;
+    }
+    std::cout << "PASS: bounded model validation, per-feed revocation, stale cancellation and fresh progress\n";
+    calls.clear();
     AudioSessionCoordinator coordinator;
     {
         AudioService audio;
