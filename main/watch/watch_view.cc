@@ -382,7 +382,7 @@ lv_obj_t* WatchView::NumberPicker(lv_obj_t* parent, unsigned maximum, unsigned s
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
     auto* down = Button(picker, FONT_AWESOME_ANGLE_DOWN, []() {}, true, true);
     const auto refresh = [number, label]() {
-        char value[12]; std::snprintf(value, sizeof(value), "%02u", *number);
+        char value[12]; std::snprintf(value, sizeof(value), "%02u", static_cast<unsigned>(*number));
         lv_label_set_text(label, value);
     };
     for (auto* button : {up, down}) {

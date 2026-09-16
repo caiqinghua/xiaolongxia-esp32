@@ -84,7 +84,7 @@ void Reset(bool enabled = true) {
     binding_generation = 1;
     ++connection;
     assert(Client().HostStarted());
-    esp_ble_gattc_cb_param_t reg{}; reg.reg.app_id = 0xada1; reg.reg.status = ESP_GATT_OK; Event(ESP_GATTC_REG_EVT, reg);
+    esp_ble_gattc_cb_param_t reg{}; reg.reg.app_id = 0x2da1; reg.reg.status = ESP_GATT_OK; Event(ESP_GATTC_REG_EVT, reg);
     assert(Client().SetEnabled(enabled)); Connected();
 }
 void Open() {
@@ -595,7 +595,7 @@ void ServerMtu(uint16_t mtu) {
 }
 void StartServer() {
     assert(Server().HostStarted()); Server().SetEnabled(true);
-    esp_ble_gatts_cb_param_t value{}; value.reg.app_id = 0xada2; value.reg.status = ESP_GATT_OK;
+    esp_ble_gatts_cb_param_t value{}; value.reg.app_id = 0x2da2; value.reg.status = ESP_GATT_OK;
     ServerEvent(ESP_GATTS_REG_EVT, value);
     uint16_t handles[]{100,101,102,103,104,105,106,107,108,109};
     value = {}; value.add_attr_tab.status = ESP_GATT_OK; value.add_attr_tab.num_handle = 10;
@@ -613,7 +613,7 @@ void PairingEvent(esp_gatts_cb_event_t event, esp_ble_gatts_cb_param_t& value) {
 void ServerRead(uint16_t handle);
 void StartPairingServer() {
     assert(PairingServer().HostStarted());
-    esp_ble_gatts_cb_param_t value{}; value.reg.app_id = 0xada3; value.reg.status = ESP_GATT_OK;
+    esp_ble_gatts_cb_param_t value{}; value.reg.app_id = 0x2da3; value.reg.status = ESP_GATT_OK;
     PairingEvent(ESP_GATTS_REG_EVT, value);
     uint16_t handles[]{200,201,202,203,204,205,206};
     value = {}; value.add_attr_tab.status = ESP_GATT_OK; value.add_attr_tab.num_handle = 7;
@@ -854,8 +854,8 @@ void TestPairingGattSharesDispatcher() {
     esp_ble_gatts_cb_param_t event{}; event.write.conn_id = connection; event.write.need_rsp = true;
     server_callback(ESP_GATTS_WRITE_EVT, ESP_GATT_IF_NONE, &event);
     assert(pairing_responses.size() == before && server_responses.size() == count);
-    assert(!RegisterWatchGattCallback(0xada2, nullptr));
-    assert(!RegisterWatchGattCallback(0xada2, [](esp_gatts_cb_event_t, esp_gatt_if_t, esp_ble_gatts_cb_param_t*) {}));
+    assert(!RegisterWatchGattCallback(0x2da2, nullptr));
+    assert(!RegisterWatchGattCallback(0x2da2, [](esp_gatts_cb_event_t, esp_gatt_if_t, esp_ble_gatts_cb_param_t*) {}));
 }
 void ServerWrite(uint16_t handle, Bytes bytes, bool prepare = false, bool response = true) {
     esp_ble_gatts_cb_param_t value{};
@@ -1131,7 +1131,7 @@ std::optional<std::array<uint8_t, 32>> BuildPeerProof(std::string_view,
 #endif
 extern "C" void esp_fill_random(void* buffer, size_t length) { assert(length == 32); std::memset(buffer, ++random_calls, length); }
 esp_err_t esp_ble_gatts_register_callback(esp_gatts_cb_t value) { server_callback = value; return Call("server_callback"); }
-esp_err_t esp_ble_gatts_app_register(uint16_t app) { assert(app == 0xada2 || app == 0xada3); return Call("server_register"); }
+esp_err_t esp_ble_gatts_app_register(uint16_t app) { assert(app == 0x2da2 || app == 0x2da3); return Call("server_register"); }
 esp_err_t esp_ble_gatts_create_attr_tab(const esp_gatts_attr_db_t* db, esp_gatt_if_t interface, uint16_t count, uint8_t instance) {
     assert(instance == 0);
     if (interface == kPairingInterface) {
@@ -1165,7 +1165,7 @@ esp_err_t esp_ble_gatts_send_indicate(esp_gatt_if_t interface, uint16_t conn, ui
 esp_err_t esp_ble_gatt_set_local_mtu(uint16_t mtu) { assert(mtu == 512); return Call("local_mtu"); }
 esp_err_t esp_ble_gattc_send_mtu_req(esp_gatt_if_t, uint16_t) { return Call("mtu_request"); }
 esp_err_t esp_ble_gattc_register_callback(esp_gattc_cb_t value) { callback = value; return Call("register_callback"); }
-esp_err_t esp_ble_gattc_app_register(uint16_t app) { assert(app == 0xada1); return Call("register_app"); }
+esp_err_t esp_ble_gattc_app_register(uint16_t app) { assert(app == 0x2da1); return Call("register_app"); }
 esp_err_t esp_ble_gap_set_security_param(esp_ble_sm_param_t kind, void* value, uint8_t size) {
     assert(size == 1);
     if (kind == ESP_BLE_SM_AUTHEN_REQ_MODE) assert(*static_cast<uint8_t*>(value) == ESP_LE_AUTH_REQ_SC_MITM_BOND);
@@ -1648,10 +1648,10 @@ void TestNativeHostRegistrationAdmission() {
     assert(!Client().CanOpenPairingWindow(true) && !Client().OpenControlPairingWindow());
     assert(calls.empty());
     esp_ble_gattc_cb_param_t reg{};
-    reg.reg.app_id = 0xada2; reg.reg.status = ESP_GATT_OK;
+    reg.reg.app_id = 0x2da2; reg.reg.status = ESP_GATT_OK;
     Event(ESP_GATTC_REG_EVT, reg);
     assert(!Client().CanOpenPairingWindow(true));
-    reg.reg.app_id = 0xada1; Event(ESP_GATTC_REG_EVT, reg);
+    reg.reg.app_id = 0x2da1; Event(ESP_GATTC_REG_EVT, reg);
     assert(Client().CanOpenPairingWindow(true) && Client().CanOpenPairingWindow(false));
     reg.reg.status = ESP_GATT_ERROR; Event(ESP_GATTC_REG_EVT, reg);
     assert(Client().CanOpenPairingWindow(true));

@@ -1142,8 +1142,10 @@ function(build_default_assets_bin)
         "--output" "${GENERATED_ASSETS_BIN}"
     )
     
-    # Add builtin text font if defined
-    if(BUILTIN_TEXT_FONT)
+    # The watch UI links its full text font directly because it must render
+    # before assets are initialized. Avoid packing a duplicate multi-megabyte
+    # font into the mmap bundle, which can exhaust ESP32-S3 data MMU pages.
+    if(BUILTIN_TEXT_FONT AND NOT CONFIG_AUDREAM_WATCH_UI)
         list(APPEND BUILD_ARGS "--builtin_text_font" "${BUILTIN_TEXT_FONT}")
     endif()
     

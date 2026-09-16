@@ -91,6 +91,17 @@ static const char* BLUFI_TAG = "BLUFI_CLASS";
 
 namespace {
 
+void LogBluetoothHeap(const char* stage) {
+    ESP_LOGI(
+        BLUFI_TAG,
+        "Bluetooth heap at %s: internal_free=%u internal_largest=%u spiram_free=%u",
+        stage,
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM))
+    );
+}
+
 constexpr uint16_t kAudreamCompanyIdentifier = 0xFFFF;
 constexpr char kAudreamManufacturerMarker[] = "ADRM";
 constexpr size_t kMaxManufacturerDataLength = 29;
@@ -701,6 +712,7 @@ esp_err_t Blufi::SendRecordingStatusEvent(
 
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
 esp_err_t Blufi::_host_init() {
+    LogBluetoothHeap("host init start");
     esp_err_t ret = esp_bluedroid_init();
     if (ret) {
         ESP_LOGE(BLUFI_TAG, "%s init bluedroid failed: %s", __func__, esp_err_to_name(ret));
@@ -711,6 +723,7 @@ esp_err_t Blufi::_host_init() {
         ESP_LOGE(BLUFI_TAG, "%s enable bluedroid failed: %s", __func__, esp_err_to_name(ret));
         return ESP_FAIL;
     }
+    LogBluetoothHeap("host init complete");
     ESP_LOGI(BLUFI_TAG, "BD ADDR: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(esp_bt_dev_get_address()));
     return ESP_OK;
 }
@@ -939,6 +952,7 @@ esp_err_t Blufi::_host_and_cb_init() {
 
 #if CONFIG_BT_CONTROLLER_ENABLED || !CONFIG_BT_NIMBLE_ENABLED
 esp_err_t Blufi::_controller_init() {
+    LogBluetoothHeap("controller init start");
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t ret = esp_bt_controller_init(&bt_cfg);
     if (ret) {
@@ -950,6 +964,7 @@ esp_err_t Blufi::_controller_init() {
         ESP_LOGE(BLUFI_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(ret));
         return ret;
     }
+    LogBluetoothHeap("controller init complete");
 
 #ifdef CONFIG_BT_NIMBLE_ENABLED
     ret = esp_nimble_init();

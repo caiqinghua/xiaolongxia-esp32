@@ -4,6 +4,10 @@
 #include <cstdlib>
 #include <limits.h>
 
+#ifdef ESP_PLATFORM
+#include "esp_pthread.h"
+#endif
+
 namespace watch_voice {
 
 RequestTask::~RequestTask() {

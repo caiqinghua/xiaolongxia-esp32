@@ -8,6 +8,16 @@
 
 #define TAG "BoxAudioCodec"
 
+namespace {
+#if CONFIG_AUDREAM_WATCH_UI
+constexpr uint32_t kDmaDescriptorCount = 4;
+constexpr uint32_t kDmaFrameCount = 160;
+#else
+constexpr uint32_t kDmaDescriptorCount = AUDIO_CODEC_DMA_DESC_NUM;
+constexpr uint32_t kDmaFrameCount = AUDIO_CODEC_DMA_FRAME_NUM;
+#endif
+}
+
 BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
     gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7210_addr, bool input_reference, uint8_t input_mic_mask,
@@ -127,8 +137,8 @@ void BoxAudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_
     i2s_chan_config_t chan_cfg = {
         .id = I2S_NUM_0,
         .role = I2S_ROLE_MASTER,
-        .dma_desc_num = AUDIO_CODEC_DMA_DESC_NUM,
-        .dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM,
+        .dma_desc_num = kDmaDescriptorCount,
+        .dma_frame_num = kDmaFrameCount,
         .auto_clear_after_cb = true,
         .auto_clear_before_cb = false,
         .intr_priority = 0,
@@ -212,7 +222,10 @@ void BoxAudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_
         ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
     }
     ESP_ERROR_CHECK(i2s_channel_init_tdm_mode(rx_handle_, &tdm_cfg));
-    ESP_LOGI(TAG, "%s channels created", enable_output_path ? "Duplex" : "RX-only");
+    ESP_LOGI(TAG, "%s channels created: dma_desc=%u dma_frames=%u",
+        enable_output_path ? "Duplex" : "RX-only",
+        static_cast<unsigned>(kDmaDescriptorCount),
+        static_cast<unsigned>(kDmaFrameCount));
 }
 
 void BoxAudioCodec::EnsureChannelEnabled(i2s_chan_handle_t handle) {

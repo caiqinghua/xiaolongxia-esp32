@@ -1,4 +1,5 @@
 #include "watch_ancs_client.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_gatt_common_api.h"
 #include <algorithm>
@@ -24,7 +25,8 @@ bool WatchAncsClient::NeedsResponsiveLink() const {
     }
 }
 namespace {
-constexpr uint16_t kAppId = 0xada1;
+constexpr char kTag[] = "WatchAncsClient";
+constexpr uint16_t kAppId = 0x2da1;
 constexpr uint64_t kPhaseTimeoutMs = 60000;
 constexpr uint64_t kDevicePairingWindowMs = 120000;
 constexpr uint8_t kAncs[]{0xd0,0x00,0x2d,0x12,0x1e,0x4b,0x0f,0xa4,0x99,0x4e,0xce,0xb5,0x31,0xf4,0x05,0x79};
@@ -134,12 +136,20 @@ bool WatchAncsClient::ConfigureSecurity() {
     uint8_t key_size = 16;
     uint8_t keys = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
     uint8_t only = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_ENABLE;
-    return esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth, sizeof(auth)) == ESP_OK &&
-        esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &capability, sizeof(capability)) == ESP_OK &&
-        esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size)) == ESP_OK &&
-        esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &keys, sizeof(keys)) == ESP_OK &&
-        esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &keys, sizeof(keys)) == ESP_OK &&
-        esp_ble_gap_set_security_param(ESP_BLE_SM_ONLY_ACCEPT_SPECIFIED_SEC_AUTH, &only, sizeof(only)) == ESP_OK;
+    const auto set = [](esp_ble_sm_param_t parameter, void* value, uint8_t size, const char* name) {
+        const esp_err_t result = esp_ble_gap_set_security_param(parameter, value, size);
+        if (result != ESP_OK) {
+            ESP_LOGE(kTag, "Security parameter %s failed: %s", name, esp_err_to_name(result));
+            return false;
+        }
+        return true;
+    };
+    return set(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth, sizeof(auth), "authentication") &&
+        set(ESP_BLE_SM_IOCAP_MODE, &capability, sizeof(capability), "capability") &&
+        set(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size), "key size") &&
+        set(ESP_BLE_SM_SET_INIT_KEY, &keys, sizeof(keys), "initiator key") &&
+        set(ESP_BLE_SM_SET_RSP_KEY, &keys, sizeof(keys), "responder key") &&
+        set(ESP_BLE_SM_ONLY_ACCEPT_SPECIFIED_SEC_AUTH, &only, sizeof(only), "specified authentication");
 }
 bool WatchAncsClient::HostStarted() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -149,8 +159,23 @@ bool WatchAncsClient::HostStarted() {
     host_registration_pending_ = true;
     host_registration_started_ms_ = Now();
     Transition(enabled_ ? WatchAncsLinkState::kOffline : WatchAncsLinkState::kDisabled);
-    if (!ConfigureSecurity() || esp_ble_gatt_set_local_mtu(512) != ESP_OK || esp_ble_gattc_register_callback(GattCallback) != ESP_OK ||
-        esp_ble_gattc_app_register(kAppId) != ESP_OK) {
+    bool started = ConfigureSecurity();
+    const esp_err_t mtu_result = started ? esp_ble_gatt_set_local_mtu(512) : ESP_FAIL;
+    if (started && mtu_result != ESP_OK) {
+        ESP_LOGE(kTag, "Local GATT MTU configuration failed: %s", esp_err_to_name(mtu_result));
+        started = false;
+    }
+    const esp_err_t callback_result = started ? esp_ble_gattc_register_callback(GattCallback) : ESP_FAIL;
+    if (started && callback_result != ESP_OK) {
+        ESP_LOGE(kTag, "GATT client callback registration failed: %s", esp_err_to_name(callback_result));
+        started = false;
+    }
+    const esp_err_t app_result = started ? esp_ble_gattc_app_register(kAppId) : ESP_FAIL;
+    if (started && app_result != ESP_OK) {
+        ESP_LOGE(kTag, "GATT client application registration failed: %s", esp_err_to_name(app_result));
+        started = false;
+    }
+    if (!started) {
         host_registration_pending_ = false;
         Retire(WatchAncsLinkState::kFailed); return false;
     }

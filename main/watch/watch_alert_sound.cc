@@ -6,6 +6,10 @@
 #include <limits.h>
 #include <utility>
 
+#ifdef ESP_PLATFORM
+#include "esp_pthread.h"
+#endif
+
 WatchAlertSound::WatchAlertSound(AudioSessionCoordinator& coordinator, Hooks hooks, uint32_t sample_rate)
     : coordinator_(coordinator), hooks_(std::move(hooks)), sample_rate_(sample_rate) {}
 

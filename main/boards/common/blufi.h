@@ -15,6 +15,7 @@
 #if CONFIG_AUDREAM_WATCH_UI && defined(CONFIG_BT_BLUEDROID_ENABLED)
 #include "watch/watch_ble_advertising_policy.h"
 #include "watch/watch_ble_link_policy.h"
+#include "esp_gap_ble_api.h"
 #endif
 #include "esp_blufi_api.h"
 #include "esp_err.h"

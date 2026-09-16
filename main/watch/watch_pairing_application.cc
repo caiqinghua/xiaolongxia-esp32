@@ -1,7 +1,7 @@
 #include "application.h"
 #include "board.h"
 #include "blufi.h"
-#include "wifi_station.h"
+#include "wifi_manager.h"
 #include "watch/watch_ancs_client.h"
 #include "watch/watch_view_state.h"
 #include "watch/watch_wifi_gate.h"
@@ -36,7 +36,7 @@ bool Application::CanOpenWatchPairing(bool control_only, bool removing_binding, 
     return watch_pairing_ && !watch_pairing_->Active() && !gate.TransferActive() &&
         (!(removing_binding || control_peer || saved_control) || !audio_service_.IsAssistantUserEnabled()) &&
         (control_only || removing_binding || control_peer || saved_control || (WatchVoiceEndpoints().Valid() && gate.Enabled() && gate.StationAllowed() &&
-            WifiStation::GetInstance().IsConnected())) &&
+            WifiManager::GetInstance().IsConnected())) &&
         (removing_binding || (Blufi::GetInstance().IsControlReady() &&
             (saved_control ? WatchAncsClient::Get().CanInspectSavedControlPeers() : control_peer ? WatchAncsClient::Get().CanForgetControlPeer(control_peer) :
              WatchAncsClient::Get().CanOpenPairingWindow(control_only)))) &&
@@ -232,6 +232,6 @@ WatchPairingSnapshot Application::PollWatchPairing() {
     state.forget_peer_generation = CanOpenWatchPairing(false, false, peer.link_generation) &&
         WatchAncsClient::Get().CanForgetControlPeer(peer.link_generation) ? peer.link_generation : 0;
     state.network_required = watch_pairing_->Active() && !raw.control_only && !raw.removing_binding && !raw.removing_control &&
-        (!GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() || !WifiStation::GetInstance().IsConnected());
+        (!GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() || !WifiManager::GetInstance().IsConnected());
     return state;
 }

@@ -36,8 +36,10 @@ Assets::Assets() {
 #else
     strategy_ = std::make_unique<Assets::EmoteStrategy>();
 #endif
+#if !CONFIG_AUDREAM_WATCH_UI
     // Initialize the partition
     InitializePartition();
+#endif
 }
 
 Assets::~Assets() {

@@ -1,5 +1,5 @@
 #include "application.h"
-#include "wifi_station.h"
+#include "wifi_manager.h"
 #include "watch/watch_wifi_gate.h"
 #include "esp_timer.h"
 #include <algorithm>
@@ -13,7 +13,7 @@ bool Application::RequestWatchListening(ListeningMode mode, const std::string& w
     if (watch_network_preparing_) return false;
     if (press_token && (!watch_capture_guard_ready_ || !watch_press_.Held(press_token, esp_timer_get_time() / 1000))) return false;
     if (reset_protocol_pending_ || !AllowsAssistantSession() || wake_word.size() > 128) return false;
-    if (!WifiStation::GetInstance().IsConnected()) {
+    if (!WifiManager::GetInstance().IsConnected()) {
         watch_assistant_.Fail(WatchAssistantError::kNetwork);
         return false;
     }

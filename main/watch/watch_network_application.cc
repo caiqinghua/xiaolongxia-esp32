@@ -1,7 +1,7 @@
 #include "application.h"
 #include "board.h"
 #include "watch/watch_wifi_gate.h"
-#include "wifi_station.h"
+#include "wifi_manager.h"
 #include "system/audream_power_manager.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -20,7 +20,7 @@ bool Application::CanPrepareWatchNetwork() {
         !pending_assistant_listening_ && !assistant_session_.IsClosing() && !reset_protocol_pending_ &&
         !watch_cloud_task_.Active() && !watch_cloud_application_ && !watch_cloud_ack_ &&
         !watch_cloud_retirement_ && !watch_wake_retirement_ && !watch_power_change_ && !watch_deferred_wifi_request_ &&
-        (!GetWatchWifiGate().StationAllowed() || !WifiStation::GetInstance().IsConnected() || !authorized);
+        (!GetWatchWifiGate().StationAllowed() || !WifiManager::GetInstance().IsConnected() || !authorized);
 }
 
 bool Application::RequestWatchNetwork() {
@@ -74,7 +74,7 @@ void Application::PollWatchNetwork() {
             CancelWatchNetwork();
         }
     }
-    const bool connected = gate.StationAllowed() && WifiStation::GetInstance().IsConnected();
+    const bool connected = gate.StationAllowed() && WifiManager::GetInstance().IsConnected();
     if (watch_network_preparing_ && connected && !watch_cloud_task_.Active() &&
         !watch_cloud_ack_ && !watch_cloud_application_ && !watch_cloud_retirement_ &&
         (watch_cloud_required_ ? watch_power_mode_.revision != 0 : protocol_ != nullptr))

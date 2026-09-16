@@ -651,8 +651,8 @@ public:
 
 class CustomBacklight : public Backlight {
 public:
-    CustomBacklight(esp_lcd_panel_io_handle_t panel_io, bool panel_awake = false)
-        : Backlight(), panel_io_(panel_io), panel_awake_(panel_awake) {}
+    CustomBacklight(esp_lcd_panel_io_handle_t panel_io, bool panel_awake = false, Display* display = nullptr)
+        : Backlight(), panel_io_(panel_io), display_(display), panel_awake_(panel_awake) {}
 
     void SetImmediateBrightness(uint8_t brightness) {
         if (brightness > 100) {
@@ -690,6 +690,7 @@ public:
 
 protected:
     esp_lcd_panel_io_handle_t panel_io_;
+    Display* display_ = nullptr;
     bool panel_awake_ = false;
 
     esp_err_t SendCommand(uint8_t command, const void* data, size_t size) {
@@ -711,9 +712,12 @@ protected:
     }
 
     virtual void SetBrightnessImpl(uint8_t brightness) override {
-        auto display = Board::GetInstance().GetDisplay();
-        DisplayLockGuard lock(display);
         uint8_t data[1] = {((uint8_t)((255*  brightness) / 100))};
+        if (display_ != nullptr) {
+            DisplayLockGuard lock(display_);
+            SendCommand(0x51, &data, sizeof(data));
+            return;
+        }
         SendCommand(0x51, &data, sizeof(data));
     }
 };
@@ -1208,10 +1212,17 @@ private:
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
         if (!CreateDisplayPanel(panel_io, panel)) { return false; }
+        ESP_LOGI(TAG, "Creating the LVGL display for the SH8601 panel");
         display_ = new CustomLcdDisplay(panel_io, panel,
                                         DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
-        backlight_ = new CustomBacklight(panel_io, true);
-        backlight_->RestoreBrightness();
+        ESP_LOGI(TAG, "LVGL display creation completed: ready=%d", display_->LvglHandle() != nullptr ? 1 : 0);
+        backlight_ = new CustomBacklight(panel_io, true, display_);
+        const int saved_brightness = ReadWatchLevel(WatchLevel::kBrightness);
+        if (saved_brightness < 0) {
+            ESP_LOGE(TAG, "Watch brightness could not be restored; using a visible fallback");
+        }
+        backlight_->SetImmediateBrightness(saved_brightness < 0 ? 75 : saved_brightness);
+        ESP_LOGI(TAG, "Initial watch brightness applied: level=%d", saved_brightness < 0 ? 75 : saved_brightness);
         return display_->LvglHandle() != nullptr;
     }
 

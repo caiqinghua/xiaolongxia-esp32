@@ -6,6 +6,10 @@
 #include <limits.h>
 #include <thread>
 
+#ifdef ESP_PLATFORM
+#include "esp_pthread.h"
+#endif
+
 namespace {
 void YieldPlaybackScan() { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
 }

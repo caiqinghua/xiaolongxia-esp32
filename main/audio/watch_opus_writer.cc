@@ -71,7 +71,7 @@ bool WatchOpusWriter::Submit(const uint8_t* data, size_t size, uint64_t granule,
     ogg_page page{};
     // Force bounded per-packet writes. Header packets must each end their page.
     while (ogg_stream_flush(&state_->stream, &page)) {
-        for (const auto part : {std::make_pair(page.header, page.header_len), std::make_pair(page.body, page.body_len)}) {
+        for (const auto& part : {std::make_pair(page.header, page.header_len), std::make_pair(page.body, page.body_len)}) {
             const auto count = io_->Write(state_->file, part.first, static_cast<size_t>(part.second));
             bytes_ += count;
             if (count != static_cast<size_t>(part.second)) { failed_ = true; return false; }

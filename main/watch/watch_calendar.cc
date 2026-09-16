@@ -46,7 +46,7 @@ std::string WatchCivilDateLabel(int32_t day) {
     int month = 0;
     while (month < 12 && remaining >= months[month]) remaining -= months[month++];
     if (month == 12) return {};
-    char label[16];
+    char label[20];
     std::snprintf(label, sizeof(label), "%04d-%02d-%02d", year, month + 1, remaining + 1);
     return label;
 }

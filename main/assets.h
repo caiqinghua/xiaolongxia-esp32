@@ -13,6 +13,10 @@
 #include <map>
 #include <string>
 
+#ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
+#define HAVE_LVGL 1
+#endif
+
 #if HAVE_LVGL
 #include <spi_flash_mmap.h>
 #endif
@@ -31,6 +35,7 @@ public:
     ~Assets();
 
     bool Download(std::string url, std::function<void(int progress, size_t speed)> progress_callback);
+    bool InitializePartition();
     bool Apply();
     bool LoadAssistantModels(srmodel_list_t*& models);
     bool BeginTrialHealth(bool models_ready, int64_t now_ms, uint32_t wake_feeds);
@@ -52,7 +57,6 @@ private:
     Assets(const Assets&) = delete;
     Assets& operator=(const Assets&) = delete;
 
-    bool InitializePartition();
     void UnApplyPartition();
     static bool FindPartition(Assets* assets);
     static bool LoadSrmodelsFromIndex(Assets* assets, cJSON* root = nullptr, bool publish = true);

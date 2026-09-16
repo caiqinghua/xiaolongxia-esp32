@@ -1,10 +1,17 @@
 #include "asset_mapping.h"
 #include "audio/assistant_model_bundle.h"
 #include "signed_release_json.h"
+#include <esp_log.h>
+#include <spi_flash_mmap.h>
+#include <cstring>
 #include <new>
 #include <cstdlib>
 
 namespace asset_storage {
+namespace {
+constexpr char kTag[] = "AssetMapping";
+}
+
 bool IsValidConfig(const BootConfig& config) {
     using namespace signed_release_json;
     std::array<unsigned char, crypto_sign_PUBLICKEYBYTES> key{};
@@ -73,11 +80,25 @@ bool Mapping::EndTrialHealth(bool failed) {
 bool Mapping::Open(const esp_partition_t* partition, const BootConfig* config) {
     if (attempted_) return valid_;
     attempted_ = true;
-    if (!partition || partition->size < 12) { failed_ = true; return false; }
+    if (!partition || partition->size < 12) {
+        ESP_LOGE(kTag, "Assets partition is missing or too small");
+        failed_ = true;
+        return false;
+    }
     std::array<unsigned char, 12> header{};
-    if (esp_partition_read(partition, 0, header.data(), header.size()) != ESP_OK) { failed_ = true; return false; }
+    const esp_err_t read_result = esp_partition_read(partition, 0, header.data(), header.size());
+    if (read_result != ESP_OK) {
+        ESP_LOGE(kTag, "Failed to read assets header: %s", esp_err_to_name(read_result));
+        failed_ = true;
+        return false;
+    }
     const auto factory_length = audream::ReadBundleU32(header.data() + 8);
-    if (factory_length > partition->size - header.size()) { failed_ = true; return false; }
+    if (factory_length > partition->size - header.size()) {
+        ESP_LOGE(kTag, "Assets factory length is invalid: length=%u partition=%u",
+                 static_cast<unsigned>(factory_length), static_cast<unsigned>(partition->size));
+        failed_ = true;
+        return false;
+    }
     selected_.size = factory_length + header.size();
     if (config && IsValidConfig(*config)) {
         factory_firmware_min_ = config->factory_firmware_min;
@@ -94,20 +115,79 @@ bool Mapping::Open(const esp_partition_t* partition, const BootConfig* config) {
         failed_ = true;
     }
     size_ = selected_.size;
-    mapped_ = esp_partition_mmap(partition, selected_.offset, size_, ESP_PARTITION_MMAP_DATA, &data_, &handle_) == ESP_OK;
-    if (!mapped_ || !audream::ValidateMappedAssetBundle(data_, size_)) {
-        failed_ = true; Close(); return false;
+    const int free_pages = spi_flash_mmap_get_free_pages(SPI_FLASH_MMAP_DATA);
+    const esp_err_t map_result = esp_partition_mmap(
+        partition, selected_.offset, size_, ESP_PARTITION_MMAP_DATA, &data_, &handle_);
+    mapped_ = map_result == ESP_OK;
+    if (!mapped_) {
+        ESP_LOGE(kTag, "Failed to map assets: %s offset=%u bytes=%u free_pages=%d",
+                 esp_err_to_name(map_result), static_cast<unsigned>(selected_.offset),
+                 static_cast<unsigned>(size_), free_pages);
+        failed_ = true;
+        Close();
+        return false;
+    }
+    if (!audream::ValidateMappedAssetBundle(data_, size_)) {
+        const auto* bytes = static_cast<const unsigned char*>(data_);
+        const size_t files = size_ >= 4 ? audream::ReadBundleU32(bytes) : 0;
+        const size_t length = size_ >= 12 ? audream::ReadBundleU32(bytes + 8) : 0;
+        ESP_LOGE(kTag,
+                 "Mapped assets bundle structure is invalid: offset=%u bytes=%u files=%u length=%u",
+                 static_cast<unsigned>(selected_.offset), static_cast<unsigned>(size_),
+                 static_cast<unsigned>(files), static_cast<unsigned>(length));
+        if (size_ >= 12 && files && files <= length / 44 && length <= size_ - 12) {
+            const size_t payload_size = length - files * 44;
+            for (size_t i = 0; i < files; ++i) {
+                const auto* entry = bytes + 12 + i * 44;
+                const size_t asset_size = audream::ReadBundleU32(entry + 32);
+                const size_t asset_offset = audream::ReadBundleU32(entry + 36);
+                const bool name_valid = entry[0] && std::memchr(entry, 0, 32);
+                const bool range_valid = asset_offset <= payload_size && payload_size - asset_offset >= 2 &&
+                    asset_size <= payload_size - asset_offset - 2;
+                const auto* payload = range_valid ? bytes + 12 + files * 44 + asset_offset : nullptr;
+                const bool magic_valid = payload && payload[0] == 'Z' && payload[1] == 'Z';
+                if (!name_valid || !range_valid || !magic_valid) {
+                    ESP_LOGE(kTag,
+                             "Invalid asset entry: index=%u name_valid=%d size=%u asset_offset=%u "
+                             "payload_size=%u magic=%02x%02x",
+                             static_cast<unsigned>(i), name_valid, static_cast<unsigned>(asset_size),
+                             static_cast<unsigned>(asset_offset), static_cast<unsigned>(payload_size),
+                             payload ? payload[0] : 0, payload ? payload[1] : 0);
+                    break;
+                }
+            }
+        }
+        failed_ = true;
+        Close();
+        return false;
     }
     if (selected_.slot && (!store_ || !store_->SelectedRelease() ||
         !asset_release::ValidateBundle(*store_->SelectedRelease(), data_, size_))) {
-        failed_ = true; Close(); return false;
+        ESP_LOGE(kTag, "Selected asset release validation failed: slot=%u",
+                 static_cast<unsigned>(selected_.slot));
+        failed_ = true;
+        Close();
+        return false;
     }
     const auto* bytes = static_cast<const unsigned char*>(data_);
     const auto length = audream::ReadBundleU32(bytes + 8);
-    if (length != size_ - 12) { failed_ = true; Close(); return false; }
+    if (length != size_ - 12) {
+        ESP_LOGE(kTag, "Mapped assets length mismatch: header=%u mapped=%u",
+                 static_cast<unsigned>(length), static_cast<unsigned>(size_));
+        failed_ = true;
+        Close();
+        return false;
+    }
     uint32_t checksum = 0;
     for (size_t i = 12; i < size_; ++i) checksum = (checksum + bytes[i]) & 0xffff;
-    if (checksum != audream::ReadBundleU32(bytes + 4)) { failed_ = true; Close(); return false; }
+    const auto stored_checksum = audream::ReadBundleU32(bytes + 4);
+    if (checksum != stored_checksum) {
+        ESP_LOGE(kTag, "Mapped assets checksum mismatch: calculated=0x%04x stored=0x%04x",
+                 static_cast<unsigned>(checksum), static_cast<unsigned>(stored_checksum));
+        failed_ = true;
+        Close();
+        return false;
+    }
     valid_ = true;
     if (selected_.slot) version_ = store_->SelectedRelease()->Version();
     return true;

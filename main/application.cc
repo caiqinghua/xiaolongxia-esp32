@@ -37,7 +37,7 @@
 #include "watch/watch_pairing_gatt_server.h"
 #endif
 #include "blufi.h"
-#include "wifi_station.h"
+#include "wifi_manager.h"
 
 #include <cstring>
 #include <chrono>
@@ -450,7 +450,7 @@ void Application::Initialize() {
         audio_service_.SetSessionCoordinator(&audio_session_coordinator_);
         watch_wake_guard_ready_ = audio_service_.SetWakeWordGuard([this]() {
             return GetWatchWifiGate().Enabled() && !GetWatchWifiGate().TransferActive() &&
-                WifiStation::GetInstance().IsConnected() &&
+                WifiManager::GetInstance().IsConnected() &&
                 audio_session_coordinator_.Mode() == AudioSessionMode::kIdle &&
                 watch_wake_lease_.Allows(watch_voice::ActiveBindingGeneration(),
                     audio_session_coordinator_.Generation(), esp_timer_get_time() / 1000);
@@ -539,6 +539,15 @@ void Application::Initialize() {
 #endif
 #if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
         InitializeWatchPairing();
+#endif
+#if CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING && defined(CONFIG_BT_BLUEDROID_ENABLED)
+        // Start the BLE host before the watch UI and audio service consume the
+        // remaining internal RAM. Board::StartNetwork() reuses this session.
+        const esp_err_t ble_start_result = Blufi::GetInstance().init(false);
+        if (ble_start_result != ESP_OK) {
+            ESP_LOGE(TAG, "Early watch BLE initialization failed: %s", esp_err_to_name(ble_start_result));
+            watch_boot_ready = false;
+        }
 #endif
         if (!display->SetupWatchUI([this](const WatchViewRequest& request) {
             // Intent fencing is immediate even when the owner is in a handshake.
@@ -747,6 +756,14 @@ void Application::Initialize() {
 
     // Start network asynchronously
     board.StartNetwork();
+
+#if CONFIG_AUDREAM_WATCH_UI
+    if (board.GetRuntimeProfile() == BoardRuntimeProfile::kWatchAssistantRecorder &&
+        !Assets::GetInstance().InitializePartition()) {
+        ESP_LOGE(TAG, "Watch assets initialization failed after network startup");
+        watch_boot_ready = false;
+    }
+#endif
 
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
@@ -1000,7 +1017,7 @@ void Application::RefreshWatchDisplay() {
     state.time = GetWatchTimeService().Snapshot(state.clock);
     bool discharging = false;
     if (!board.GetBatteryLevel(state.battery_percent, state.charging, discharging)) { state.battery_percent = -1; }
-    state.wifi_connected = WifiStation::GetInstance().IsConnected();
+    state.wifi_connected = WifiManager::GetInstance().IsConnected();
     state.ble_connected = Blufi::GetInstance().IsConnected();
     state.recorder = BuildWatchRecordingSnapshot();
     state.recording = state.recorder.active;
@@ -1062,7 +1079,7 @@ WatchAssistantSnapshot Application::BuildWatchAssistantSnapshot() {
     if (mode == AudioSessionMode::kAssistantListening && !audio_service_.IsAudioProcessorRunning()) mode = AudioSessionMode::kAssistantConnecting;
     auto snapshot = watch_assistant_.Snapshot(mode,
         assistant_session_.IsClosing() || reset_protocol_pending_, pending_assistant_listening_.has_value(),
-        configured, GetWatchWifiGate().Enabled() && GetWatchWifiGate().StationAllowed() && WifiStation::GetInstance().IsConnected(), assistant_response_finished_ && !audio_service_.IsIdle(),
+        configured, GetWatchWifiGate().Enabled() && GetWatchWifiGate().StationAllowed() && WifiManager::GetInstance().IsConnected(), assistant_response_finished_ && !audio_service_.IsIdle(),
         audio_service_.IsAssistantUserEnabled(), assistant_conversation_idle_deadline_us_ != 0);
     if (!watch_capture_guard_ready_) snapshot.can_talk = snapshot.can_interrupt = false;
     snapshot.can_connect = CanPrepareWatchNetwork();

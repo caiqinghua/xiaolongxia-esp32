@@ -1,4 +1,5 @@
 #include "audio_service.h"
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <algorithm>
 #include <cstring>
@@ -288,7 +289,11 @@ bool AudioService::StartTasks(bool recording_only) {
             service->audio_input_task_handle_ = nullptr;
             service->audio_queue_cv_.notify_all();
         }
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_SPIRAM
+        vTaskDeleteWithCaps(nullptr);
+#else
         vTaskDelete(nullptr);
+#endif
     };
     auto output_entry = [](void* arg) {
         auto* service = static_cast<AudioService*>(arg);
@@ -298,7 +303,11 @@ bool AudioService::StartTasks(bool recording_only) {
             service->audio_output_task_handle_ = nullptr;
             service->audio_queue_cv_.notify_all();
         }
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_SPIRAM
+        vTaskDeleteWithCaps(nullptr);
+#else
         vTaskDelete(nullptr);
+#endif
     };
     auto opus_entry = [](void* arg) {
         auto* service = static_cast<AudioService*>(arg);
@@ -308,23 +317,59 @@ bool AudioService::StartTasks(bool recording_only) {
             service->opus_codec_task_handle_ = nullptr;
             service->audio_queue_cv_.notify_all();
         }
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_SPIRAM
+        vTaskDeleteWithCaps(nullptr);
+#else
         vTaskDelete(nullptr);
+#endif
     };
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_SPIRAM
+    bool created = xTaskCreateWithCaps(
+        opus_entry,
+        "opus_codec",
+        2048 * 12,
+        this,
+        2,
+        &opus_codec_task_handle_,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    ) == pdPASS;
+#else
     bool created = xTaskCreate(opus_entry, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_) == pdPASS;
+#endif
 #if CONFIG_USE_AUDIO_PROCESSOR
     if (created && !recording_only) {
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_SPIRAM
+        created = xTaskCreatePinnedToCoreWithCaps(input_entry, "audio_input", 2048 * 3, this, 8,
+            &audio_input_task_handle_, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+#else
         created = xTaskCreatePinnedToCore(input_entry, "audio_input", 2048 * 3, this, 8,
             &audio_input_task_handle_, 0) == pdPASS;
+#endif
     } else if (created) {
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_SPIRAM
+        created = xTaskCreateWithCaps(input_entry, "record_input", 2048 * 2, this, 8,
+            &audio_input_task_handle_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+#else
         created = xTaskCreate(input_entry, "record_input", 2048 * 2, this, 8, &audio_input_task_handle_) == pdPASS;
+#endif
     }
 #else
     if (created) {
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_SPIRAM
+        created = xTaskCreateWithCaps(input_entry, "audio_input", 2048 * 2, this, 8,
+            &audio_input_task_handle_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+#else
         created = xTaskCreate(input_entry, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_) == pdPASS;
+#endif
     }
 #endif
     if (created && !recording_only) {
+#if CONFIG_AUDREAM_WATCH_UI && CONFIG_SPIRAM
+        created = xTaskCreateWithCaps(output_entry, "audio_output", 2048 * 2, this, 4,
+            &audio_output_task_handle_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+#else
         created = xTaskCreate(output_entry, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_) == pdPASS;
+#endif
     }
     if (created) {
         created = esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000) == ESP_OK;

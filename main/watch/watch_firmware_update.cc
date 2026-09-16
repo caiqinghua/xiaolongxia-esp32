@@ -5,6 +5,10 @@
 #include <limits.h>
 #include <limits>
 
+#ifdef ESP_PLATFORM
+#include "esp_pthread.h"
+#endif
+
 namespace watch_update {
 
 Controller::Controller(Hooks hooks) : hooks_(std::move(hooks)) { state_.target = hooks_.target; }

@@ -12,7 +12,7 @@
 #include <limits>
 
 namespace {
-constexpr uint16_t kAppId = 0xada2;
+constexpr uint16_t kAppId = 0x2da2;
 constexpr uint64_t kOwnerTimeoutMs = 60000;
 constexpr uint16_t kMinimumMtu = 185;
 enum Handle { kService, kHelloDeclaration, kHello, kDataDeclaration, kData, kAckDeclaration, kAck, kCcc,

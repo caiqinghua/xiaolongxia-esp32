@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <limits.h>
 
+#ifdef ESP_PLATFORM
+#include "esp_pthread.h"
+#endif
+
 WatchMotionTask::~WatchMotionTask() {
     {
         std::lock_guard<std::mutex> lock(mutex_);

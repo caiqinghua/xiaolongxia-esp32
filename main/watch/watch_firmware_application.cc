@@ -4,7 +4,7 @@
 #include "assets.h"
 #include "watch/watch_view_state.h"
 #include "watch/watch_wifi_gate.h"
-#include "wifi_station.h"
+#include "wifi_manager.h"
 #include "system/audream_power_manager.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -112,7 +112,7 @@ WatchUpdateBlock Application::WatchFirmwareBlock(bool installing) {
 bool Application::AcquireWatchFirmware(watch_update::Operation operation) {
     if (watch_firmware_revoked_.load() || !watch_firmware_network_ ||
         WatchFirmwareBlock(operation == watch_update::Operation::kInstall) != WatchUpdateBlock::kNone ||
-        !GetWatchWifiGate().StationAllowed() || !WifiStation::GetInstance().IsConnected() ||
+        !GetWatchWifiGate().StationAllowed() || !WifiManager::GetInstance().IsConnected() ||
         !audio_service_.IsIdle() || !audio_service_.IsAssistantCaptureDrained() || audio_service_.IsWakeWordRunning()) return false;
     const auto lease = audio_session_coordinator_.Begin(AudioSessionMode::kFirmwareUpdate);
     if (!lease) return false;
@@ -284,7 +284,7 @@ void Application::PollWatchFirmware() {
     if (watch_firmware_revoked_.load() ||
         (raw.active && !raw.commit_started && !FirmwareBatteryReady(raw.phase == watch_update::Phase::kInstalling)) ||
         (raw.active && (!GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() ||
-            !WifiStation::GetInstance().IsConnected() || GetWatchWifiGate().TransferActive() ||
+            !WifiManager::GetInstance().IsConnected() || GetWatchWifiGate().TransferActive() ||
             !audio_session_coordinator_.OwnsFirmwareUpdateResources(watch_firmware_generation_.load())))) {
         StopWatchFirmware(0);
         return;
@@ -307,7 +307,7 @@ void Application::PollWatchFirmware() {
         watch_firmware_preparation_phase_ = installing ? watch_update::Phase::kInstallFailed : watch_update::Phase::kCheckFailed;
         return;
     }
-    if (!GetWatchWifiGate().StationAllowed() || !WifiStation::GetInstance().IsConnected() || watch_wake_retirement_ ||
+    if (!GetWatchWifiGate().StationAllowed() || !WifiManager::GetInstance().IsConnected() || watch_wake_retirement_ ||
         audio_service_.IsWakeWordRunning() || !audio_service_.IsIdle() || !audio_service_.IsAssistantCaptureDrained()) return;
     if (protocol_ && !protocol_->CloseAudioChannelWithin(0)) return;
     const auto request = *watch_firmware_preparation_;

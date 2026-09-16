@@ -3,7 +3,7 @@
 #include "display.h"
 #include "watch/watch_view_state.h"
 #include "watch/watch_wifi_gate.h"
-#include "wifi_station.h"
+#include "wifi_manager.h"
 #include "system/audream_power_manager.h"
 #include "system/device_time_service.h"
 #include "esp_timer.h"
@@ -73,7 +73,7 @@ WatchPowerModeSnapshot Application::BuildWatchPowerModeSnapshot() {
         watch_cloud_ack_.has_value();
     state.can_change = !WatchFirmwareBusy() && watch_cloud_required_ && state.revision && !state.pending &&
         !watch_cloud_task_.Active() && !watch_cloud_retirement_ && !watch_wake_retirement_ &&
-        GetWatchWifiGate().Enabled() && GetWatchWifiGate().StationAllowed() && WifiStation::GetInstance().IsConnected() &&
+        GetWatchWifiGate().Enabled() && GetWatchWifiGate().StationAllowed() && WifiManager::GetInstance().IsConnected() &&
         !GetWatchWifiGate().TransferActive() && WatchCloudPowerReady() &&
         audio_session_coordinator_.Mode() == AudioSessionMode::kIdle &&
         (audio_service_.IsWakeWordRunning() || audio_service_.IsIdle()) &&
@@ -117,7 +117,7 @@ void Application::StartWatchBootstrap(const watch_voice::Binding& binding) {
         now < watch_cloud_retry_after_us_ || protocol_ ||
         !GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() ||
         !WatchCloudPowerReady() ||
-        !WifiStation::GetInstance().IsConnected() || GetWatchWifiGate().TransferActive() ||
+        !WifiManager::GetInstance().IsConnected() || GetWatchWifiGate().TransferActive() ||
         audio_session_coordinator_.Mode() != AudioSessionMode::kIdle ||
         audio_service_.IsWakeWordRunning() || !audio_service_.IsIdle() || Board::GetInstance().GetWatchRecordingControlStatus().starting ||
         assistant_session_.IsClosing() || reset_protocol_pending_) return;
@@ -236,7 +236,7 @@ void Application::PollWatchBootstrap() {
              watch_power_change_->voice_intent != watch_voice_request_ ||
              !audio_session_coordinator_.IsCurrent(watch_power_change_->audio_generation) ||
              esp_timer_get_time() >= watch_power_change_->deadline_us ||
-             !GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() || !WifiStation::GetInstance().IsConnected() ||
+             !GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() || !WifiManager::GetInstance().IsConnected() ||
              GetWatchWifiGate().TransferActive() || Board::GetInstance().GetWatchRecordingControlStatus().starting ||
              (watch_power_change_->sent && !watch_cloud_task_.Active()))) {
             CancelWatchPowerMode(watch_voice::Result::kCancelled);
@@ -262,7 +262,7 @@ void Application::PollWatchBootstrap() {
         watch_cloud_retirement_.reset();
     }
     if (!GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() ||
-        !WifiStation::GetInstance().IsConnected() ||
+        !WifiManager::GetInstance().IsConnected() ||
         audio_session_coordinator_.Mode() != AudioSessionMode::kIdle || GetWatchWifiGate().TransferActive()) {
         if (watch_cloud_task_.Active()) watch_cloud_task_.Cancel();
     }
@@ -297,7 +297,7 @@ void Application::PollWatchBootstrap() {
                     watch_voice_request_ == watch_cloud_request_voice_revision_ &&
                     audio_session_coordinator_.IsCurrent(watch_cloud_request_audio_generation_) &&
                     bootstrap && GetWatchWifiGate().Enabled() && GetWatchWifiGate().StationAllowed() &&
-                    WifiStation::GetInstance().IsConnected() && !GetWatchWifiGate().TransferActive() &&
+                    WifiManager::GetInstance().IsConnected() && !GetWatchWifiGate().TransferActive() &&
                     !watch_deferred_wifi_request_;
                 if (accepted) {
                     const auto reservation = audio_session_coordinator_.Begin(AudioSessionMode::kMaintenance);
@@ -343,7 +343,7 @@ void Application::PollWatchBootstrap() {
     if (WatchFirmwareBusy() || !watch_cloud_required_ || watch_cloud_task_.Active() || watch_wake_retirement_ ||
         !GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() ||
         !WatchCloudPowerReady() ||
-        !WifiStation::GetInstance().IsConnected() || GetWatchWifiGate().TransferActive() ||
+        !WifiManager::GetInstance().IsConnected() || GetWatchWifiGate().TransferActive() ||
         esp_timer_get_time() < watch_cloud_retry_after_us_ ||
         audio_session_coordinator_.Mode() != AudioSessionMode::kIdle ||
         assistant_session_.IsClosing() || reset_protocol_pending_) return;
@@ -389,7 +389,7 @@ void Application::PollWatchSettingsApplication() {
     watch_cloud_application_.reset();
     const bool current = bound && watch_voice_request_ == watch_cloud_request_voice_revision_ &&
         audio_session_coordinator_.IsCurrent(watch_cloud_application_transition_->generation) &&
-        GetWatchWifiGate().Enabled() && GetWatchWifiGate().StationAllowed() && WifiStation::GetInstance().IsConnected() &&
+        GetWatchWifiGate().Enabled() && GetWatchWifiGate().StationAllowed() && WifiManager::GetInstance().IsConnected() &&
         !GetWatchWifiGate().TransferActive() && !watch_deferred_wifi_request_ && !reset_protocol_pending_;
     watch_cloud_authorization_.reset();
     if (current) {
@@ -491,7 +491,7 @@ void Application::StartWatchSettingsAcknowledgement() {
     if (!watch_cloud_ack_ || watch_cloud_task_.Active()) return;
     if (esp_timer_get_time() < watch_cloud_ack_retry_after_us_ ||
         !WatchCloudPowerReady() ||
-        !GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() || !WifiStation::GetInstance().IsConnected() ||
+        !GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() || !WifiManager::GetInstance().IsConnected() ||
         GetWatchWifiGate().TransferActive()) return;
     watch_voice::Binding binding;
     const auto pending = *watch_cloud_ack_;
@@ -521,7 +521,7 @@ void Application::StartWatchSettingsAcknowledgement() {
                 return cancelled() || pending.local_permission != audio_service_.IsAssistantUserEnabled() ||
                     !audio_session_coordinator_.IsCurrent(pending.audio_generation) ||
                     audio_session_coordinator_.Mode() != AudioSessionMode::kIdle ||
-                    !GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() || !WifiStation::GetInstance().IsConnected() ||
+                    !GetWatchWifiGate().Enabled() || !GetWatchWifiGate().StationAllowed() || !WifiManager::GetInstance().IsConnected() ||
                     GetWatchWifiGate().TransferActive();
             };
             return watch_voice::Client(endpoints).Acknowledge(binding.device_id, binding.credential,
@@ -587,7 +587,7 @@ void Application::PollWatchWakeListening() {
         watch_wake_confirmed_intent_ == watch_voice_request_ &&
         watch_cloud_binding_generation_ == watch_voice::ActiveBindingGeneration() &&
         audio_service_.IsAssistantUserEnabled() && GetWatchWifiGate().Enabled() && GetWatchWifiGate().StationAllowed() &&
-        WifiStation::GetInstance().IsConnected() && !GetWatchWifiGate().TransferActive() &&
+        WifiManager::GetInstance().IsConnected() && !GetWatchWifiGate().TransferActive() &&
         !watch_cloud_task_.Active() && !watch_cloud_application_ && !watch_cloud_ack_ &&
         !watch_cloud_retirement_ && !watch_power_change_ && !watch_deferred_wifi_request_ && !reset_protocol_pending_ &&
         protocol_ && !HasAssistantSession() && !assistant_session_.IsClosing() && !pending_assistant_listening_ &&
