@@ -10,6 +10,7 @@ It does not replace or alter the Note Watch board target.
 - Uses the recording power profile with an 80 MHz CPU ceiling and tickless idle enabled.
 - Prints metadata for up to seven recent completed sessions after the internal Flash FAT filesystem is mounted.
 - Starts recording when the Boot button is pressed.
+- Keeps the internal green status LED on while recording and turns it off when recording stops.
 - Rotates Ogg/Opus files at approximately 512 KiB and removes the oldest completed segment when space is needed.
 - Stops after three consecutive battery samples at or below 5%, finalizes metadata, unmounts Flash, disables peripheral rails, and enters deep sleep.
 

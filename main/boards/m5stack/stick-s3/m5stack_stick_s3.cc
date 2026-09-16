@@ -53,6 +53,20 @@ private:
     uint8_t low_battery_sample_count_ = 0;
     std::atomic<bool> low_battery_stop_pending_{false};
 
+    void SetRecordingIndicator(bool enabled) {
+        const m5pm1_err_t result = pmic_.setLedEnLevel(enabled);
+        if (result != M5PM1_OK) {
+            ESP_LOGW(
+                kTag,
+                "Failed to set the recording indicator: enabled=%d error=%d",
+                enabled ? 1 : 0,
+                static_cast<int>(result)
+            );
+            return;
+        }
+        ESP_LOGI(kTag, "Recording indicator: %s", enabled ? "on" : "off");
+    }
+
     void InitializeI2c() {
         const i2c_master_bus_config_t config = {
             .i2c_port = I2C_NUM_0,
@@ -84,6 +98,7 @@ private:
         pmic_.gpioSetDrive(M5PM1_GPIO_NUM_3, M5PM1_GPIO_DRIVE_PUSHPULL);
         pmic_.digitalWrite(3, LOW);
         pmic_.setDoubleOffDisable(false);
+        SetRecordingIndicator(false);
 
         gpio_config_t backlight_config = {};
         backlight_config.pin_bit_mask = 1ULL << DISPLAY_BACKLIGHT_PIN;
@@ -110,7 +125,9 @@ private:
                         ReadBatteryPercentForMetadata("start")
                     )) {
                     ESP_LOGE(kTag, "Boot button could not start endurance recording");
+                    return;
                 }
+                SetRecordingIndicator(true);
             });
         });
         boot_button_.OnLongPress([this]() {
@@ -122,6 +139,7 @@ private:
                         "user_button",
                         ReadBatteryPercentForMetadata("stop")
                     );
+                    SetRecordingIndicator(false);
                 }
             });
         });
@@ -213,6 +231,7 @@ private:
         }
         GetAudioCodec()->PrepareForDeepSleep();
         SdCardStorage::GetInstance().PrepareForDeepSleep();
+        SetRecordingIndicator(false);
         pmic_.digitalWrite(3, LOW);
         pmic_.digitalWrite(2, LOW);
         gpio_set_level(DISPLAY_BACKLIGHT_PIN, 0);
