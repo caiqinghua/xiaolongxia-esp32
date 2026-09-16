@@ -14,6 +14,8 @@ constexpr uint32_t kText = 0xF4F7F6;
 constexpr uint32_t kMuted = 0xA5AFB4;
 constexpr uint32_t kAccent = 0x70DDC0;
 constexpr uint32_t kWarning = 0xF6B35C;
+constexpr int kHeaderHeight = 80;
+constexpr int kHeaderHorizontalInset = 28;
 bool IsFirmwareAction(WatchViewAction action) {
     return action == WatchViewAction::kCheckFirmware || action == WatchViewAction::kCancelFirmware ||
         action == WatchViewAction::kInstallFirmware || action == WatchViewAction::kRebootFirmware ||
@@ -725,8 +727,8 @@ void WatchView::Render() {
     pairing_saved_choices_.clear();
     notification_items_.clear();
     weekdays_.fill(nullptr);
-    auto* header = Row(root_, 64);
-    lv_obj_set_style_pad_hor(header, 16, 0);
+    auto* header = Row(root_, kHeaderHeight);
+    lv_obj_set_style_pad_hor(header, kHeaderHorizontalInset, 0);
     Button(header, page_ == WatchPage::kFace ? FONT_AWESOME_WATCH : FONT_AWESOME_ANGLE_LEFT, [this]() {
         if (page_ == WatchPage::kRecordingDeleteConfirm) {
             if (!pending_request_) Navigate(WatchPage::kRecordings);

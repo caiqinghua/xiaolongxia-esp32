@@ -2500,7 +2500,17 @@ int main(int argc, char** argv) {
         const size_t unavailable_count = requests.size();
         Click(view, record_start);
         Check(requests.size() == unavailable_count, "disabled storage action cannot enqueue a start");
+        auto* recorder_back = FindButton(view.Root(), FONT_AWESOME_ANGLE_LEFT);
+        Check(recorder_back != nullptr, "unavailable recorder keeps its back action");
+        lv_area_t recorder_back_bounds{};
+        lv_obj_get_coords(recorder_back, &recorder_back_bounds);
+        Check(recorder_back_bounds.x1 >= 28 && recorder_back_bounds.y1 >= 16,
+            "recorder back action stays inside the rounded display safe area");
         Screenshot(view.Root(), std::filesystem::path(argv[1]) / "recorder-no-storage.ppm");
+        Click(view, FONT_AWESOME_ANGLE_LEFT);
+        Check(view.Page() == WatchPage::kFace && requests.size() == unavailable_count,
+            "unavailable recorder can return to the watch face without a command");
+        view.Navigate(WatchPage::kRecorder); Tick();
         state.recorder.storage_mounted = true;
         state.recorder.control.error = WatchRecordingError::kStartFailed;
         view.Update(state); Tick();
