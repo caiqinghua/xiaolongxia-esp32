@@ -40,6 +40,7 @@ public:
     WatchAndroidNotificationSnapshot Snapshot();
     bool Clear(uint64_t session);
     bool MarkRead(uint64_t session, uint32_t uid, uint64_t revision);
+    bool Dismiss(uint64_t session, uint32_t uid, uint64_t revision);
     void GattEvent(esp_gatts_cb_event_t event, esp_gatt_if_t interface, esp_ble_gatts_cb_param_t* param);
 
 private:

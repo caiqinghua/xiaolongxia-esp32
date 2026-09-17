@@ -587,6 +587,9 @@ void WatchAncsClient::Poll() {
 bool WatchAncsClient::MarkRead(uint64_t session, uint32_t uid, uint64_t revision) {
     std::lock_guard<std::mutex> lock(mutex_); return engine_.MarkRead(session, uid, revision);
 }
+bool WatchAncsClient::Dismiss(uint64_t session, uint32_t uid, uint64_t revision) {
+    std::lock_guard<std::mutex> lock(mutex_); return engine_.Dismiss(session, uid, revision);
+}
 bool WatchAncsClient::RequestAppName(uint64_t session, uint32_t uid, uint64_t revision) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto snapshot = engine_.Snapshot();

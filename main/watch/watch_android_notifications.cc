@@ -175,6 +175,16 @@ bool WatchAndroidNotifications::MarkRead(uint64_t session, uint32_t uid, uint64_
     if (item == entries_.end()) return false;
     item->read = true; return true;
 }
+bool WatchAndroidNotifications::Dismiss(uint64_t session, uint32_t uid, uint64_t revision, uint64_t now_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (Expire(now_ms) || !session || session != session_ || state_ != WatchAndroidNotificationState::kReady) return false;
+    const auto item = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
+        return entry.uid == uid && entry.revision == revision;
+    });
+    if (item == entries_.end()) return false;
+    entries_.erase(item);
+    return true;
+}
 WatchAndroidNotificationState WatchAndroidNotifications::Poll(uint64_t now_ms) {
     std::lock_guard<std::mutex> lock(mutex_); Expire(now_ms); return state_;
 }

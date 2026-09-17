@@ -36,6 +36,7 @@ public:
     bool Confirm(uint64_t confirmation, bool accept);
     void Poll();
     bool MarkRead(uint64_t session, uint32_t uid, uint64_t revision);
+    bool Dismiss(uint64_t session, uint32_t uid, uint64_t revision);
     bool RequestAppName(uint64_t session, uint32_t uid, uint64_t revision);
     bool Clear(uint64_t session);
     WatchAncsClientSnapshot Snapshot() const;

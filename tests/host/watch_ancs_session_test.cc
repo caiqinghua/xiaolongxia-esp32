@@ -188,6 +188,19 @@ void TestBoundedRetentionAndPendingEviction() {
     assert(engine.Snapshot().notifications.size() == 20);
 }
 
+void TestGuardedLocalDismissal() {
+    WatchAncsSession engine;
+    const auto session = Ready(engine);
+    const auto request = Start(engine, session);
+    Ack(engine, request);
+    assert(Receive(engine, session, Reply()));
+    const auto item = engine.Snapshot().notifications.front();
+    assert(!engine.Dismiss(session, item.uid, item.revision + 1));
+    assert(engine.Dismiss(session, item.uid, item.revision));
+    assert(engine.Snapshot().notifications.empty());
+    assert(!engine.Dismiss(session, item.uid, item.revision));
+}
+
 void TestFailuresAndTimeoutsRetirePrivateData() {
     for (unsigned failure = 0; failure < 5; ++failure) {
         WatchAncsSession engine;
@@ -389,11 +402,12 @@ int main() {
     TestWireRequestAndEverySplit();
     TestInflightModificationRemovalAndClear();
     TestBoundedRetentionAndPendingEviction();
+    TestGuardedLocalDismissal();
     TestFailuresAndTimeoutsRetirePrivateData();
     TestMalformedResponses();
     TestTextLimitsAndInvalidUtf8();
     TestAppNameWireFragmentsAndSessionCache();
     TestAppNameMalformedRepliesAndClearing();
     TestRejectedRequestsDoNotClearUnrelatedNotifications();
-    std::puts("Ten ANCS session test groups passed");
+    std::puts("Eleven ANCS session test groups passed");
 }

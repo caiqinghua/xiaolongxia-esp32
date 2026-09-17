@@ -1,6 +1,7 @@
 #include "application.h"
 #include "watch/watch_voice_settings.h"
 #include "watch/watch_notification_settings.h"
+#include "watch/watch_face_settings.h"
 #include "watch/watch_voice_binding.h"
 #include "watch/watch_wifi_settings.h"
 #include "watch/watch_wifi_gate.h"
@@ -426,6 +427,7 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     bool watch_boot_ready = true;
     if (board.GetRuntimeProfile() == BoardRuntimeProfile::kWatchAssistantRecorder) {
+        watch_face_style_ = ReadWatchFaceStyle();
         const int enabled = ReadWatchVoiceEnabled();
 #if CONFIG_AUDREAM_WATCH_ANCS
         const int notifications_enabled = ReadWatchNotificationsEnabled();
@@ -999,6 +1001,7 @@ void Application::RefreshWatchDisplay() {
     auto& board = Board::GetInstance();
     if (board.GetRuntimeProfile() != BoardRuntimeProfile::kWatchAssistantRecorder) { return; }
     WatchViewState state;
+    state.face_style = watch_face_style_;
 #if CONFIG_AUDREAM_WATCH_UI
     state.firmware = BuildWatchFirmwareSnapshot();
 #endif
@@ -1203,6 +1206,10 @@ void Application::HandleWatchViewRequest(const WatchViewRequest& request) {
 #endif
             break;
         }
+        case WatchViewAction::kSetFaceStyle:
+            succeeded = SaveWatchFaceStyle(request.face_style);
+            if (succeeded) watch_face_style_ = request.face_style;
+            break;
         case WatchViewAction::kConfirmNotificationPeer:
 #if CONFIG_AUDREAM_WATCH_ANCS
             succeeded = WatchAncsClient::Get().Confirm(request.notification_confirmation, request.enabled);
@@ -1219,6 +1226,20 @@ void Application::HandleWatchViewRequest(const WatchViewRequest& request) {
 #if CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS
             else if (request.notification_source == WatchNotificationSource::kAndroid) {
                 succeeded = WatchAndroidGattServer::Get().MarkRead(request.notification_session,
+                    request.notification_uid, request.notification_revision);
+            }
+#endif
+#endif
+            break;
+        case WatchViewAction::kDismissNotification:
+#if CONFIG_AUDREAM_WATCH_ANCS
+            if (request.notification_source == WatchNotificationSource::kAncs) {
+                succeeded = WatchAncsClient::Get().Dismiss(request.notification_session,
+                    request.notification_uid, request.notification_revision);
+            }
+#if CONFIG_AUDREAM_WATCH_ANDROID_NOTIFICATIONS
+            else if (request.notification_source == WatchNotificationSource::kAndroid) {
+                succeeded = WatchAndroidGattServer::Get().Dismiss(request.notification_session,
                     request.notification_uid, request.notification_revision);
             }
 #endif

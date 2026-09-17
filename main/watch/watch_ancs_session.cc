@@ -284,6 +284,17 @@ bool WatchAncsSession::MarkRead(uint64_t session, uint32_t uid, uint64_t revisio
     if (found == notifications_.end()) return false;
     found->read = true; return true;
 }
+bool WatchAncsSession::Dismiss(uint64_t session, uint32_t uid, uint64_t revision) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!ReadyLocked(session)) return false;
+    const auto found = std::find_if(notifications_.begin(), notifications_.end(), [=](const auto& item) {
+        return item.uid == uid && item.revision == revision;
+    });
+    if (found == notifications_.end()) return false;
+    notifications_.erase(found);
+    queued_.erase(std::remove(queued_.begin(), queued_.end(), uid), queued_.end());
+    return true;
+}
 bool WatchAncsSession::Clear(uint64_t session) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!ReadyLocked(session)) return false;

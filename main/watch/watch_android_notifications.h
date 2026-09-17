@@ -38,6 +38,7 @@ public:
     ReceiveResult Receive(uint64_t session, const uint8_t* bytes, size_t size, uint64_t now_ms);
     bool Clear(uint64_t session, uint64_t now_ms);
     bool MarkRead(uint64_t session, uint32_t uid, uint64_t revision, uint64_t now_ms);
+    bool Dismiss(uint64_t session, uint32_t uid, uint64_t revision, uint64_t now_ms);
     WatchAndroidNotificationState Poll(uint64_t now_ms);
     WatchAndroidNotificationSnapshot Snapshot(uint64_t now_ms);
 

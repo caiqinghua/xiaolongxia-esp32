@@ -348,3 +348,6 @@ bool WatchAndroidGattServer::Clear(uint64_t session) {
 bool WatchAndroidGattServer::MarkRead(uint64_t session, uint32_t uid, uint64_t revision) {
     std::lock_guard<std::mutex> lock(mutex_); return !Expire() && engine_.MarkRead(session, uid, revision, Now());
 }
+bool WatchAndroidGattServer::Dismiss(uint64_t session, uint32_t uid, uint64_t revision) {
+    std::lock_guard<std::mutex> lock(mutex_); return !Expire() && engine_.Dismiss(session, uid, revision, Now());
+}

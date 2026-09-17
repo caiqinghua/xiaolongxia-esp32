@@ -1663,6 +1663,20 @@ void TestHiddenWatchTouchWake(const WatchViewState& state) {
 }
 
 void TestWatchNavigationGestures(WatchViewState state) {
+    state.notifications.available = true;
+    state.notifications.client.enabled = true;
+    state.notifications.client.state = WatchAncsLinkState::kReady;
+    state.notifications.content.ready = true;
+    state.notifications.content.source = WatchNotificationSource::kAncs;
+    state.notifications.content.session = 73;
+    WatchPhoneNotification notification;
+    notification.uid = 41;
+    notification.revision = 9;
+    notification.details_ready = true;
+    notification.title = "Unread message";
+    notification.message = "Swipe to dismiss";
+    notification.read = false;
+    state.notifications.content.items = {notification};
     std::vector<WatchViewRequest> requests;
     WatchView view(lv_screen_active(), &font_puhui_30_4, &lv_font_montserrat_48,
         &font_awesome_30_4, [&](const WatchViewRequest& request) { requests.push_back(request); });
@@ -1676,28 +1690,68 @@ void TestWatchNavigationGestures(WatchViewState state) {
         data->point = sample.point;
         data->state = sample.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
     });
-    const auto swipe = [&](lv_point_t start, lv_point_t end) {
+    const auto swipe = [&](lv_point_t start, lv_point_t end, uint32_t hold_ms = 0) {
         touch.point = start;
         touch.pressed = true;
         Tick();
+        if (hold_ms) {
+            lv_tick_inc(hold_ms);
+            Tick();
+        }
         for (int step = 1; step <= 5; ++step) {
             touch.point.x = start.x + (end.x - start.x) * step / 5;
             touch.point.y = start.y + (end.y - start.y) * step / 5;
             Tick();
         }
         touch.pressed = false;
-        Tick();
-        Tick();
-        Tick();
+        for (int step = 0; step < 6; ++step) Tick();
     };
 
+    auto* face_header = lv_obj_get_child(view.Root(), 0);
+    Check(face_header && lv_obj_get_child_count(face_header) == 4,
+        "an unread phone notification adds a face indicator without exposing content");
+
+    auto* face_body = lv_obj_get_parent(FindButton(view.Root(), WATCH_RECORDER));
+    Check(face_body != nullptr, "classic face exposes a long-press target");
+    lv_obj_send_event(face_body, LV_EVENT_LONG_PRESSED, nullptr); Tick();
+    Check(view.Page() == WatchPage::kFaceGallery && FindButton(view.Root(), WATCH_FACE_MINIMAL),
+        "long-pressing the watch face opens face selection");
+    Click(view, WATCH_FACE_MINIMAL);
+    Check(requests.back().action == WatchViewAction::kSetFaceStyle &&
+        requests.back().face_style == WatchFaceStyle::kMinimal,
+        "face selection submits the selected persistent style");
+    const auto face_request = requests.back().id;
+    state.face_style = WatchFaceStyle::kMinimal;
+    view.Update(state);
+    view.Complete(face_request, true); Tick();
+    Check(view.Page() == WatchPage::kFace && !FindButton(view.Root(), WATCH_RECORDER),
+        "a saved minimal face returns to the watch face without classic launch buttons");
+
     swipe({205, 52}, {205, 220});
-    Check(view.Page() == WatchPage::kNotifications && requests.empty(),
+    Check(view.Page() == WatchPage::kNotifications,
         "watch-face downward swipe opens Notification Center without a command");
+    auto* notification_row = FindButton(view.Root(), notification.title);
+    Check(notification_row != nullptr, "Notification Center renders the unread item");
+    lv_obj_update_layout(view.Root());
+    lv_area_t row_bounds{};
+    lv_obj_get_coords(notification_row, &row_bounds);
+    const auto requests_before_dismiss = requests.size();
+    swipe({row_bounds.x2 - 20, (row_bounds.y1 + row_bounds.y2) / 2},
+        {row_bounds.x1 + 12, (row_bounds.y1 + row_bounds.y2) / 2});
+    Check(requests.size() == requests_before_dismiss && FindButton(view.Root(), FONT_AWESOME_TRASH),
+        "left-swiping a notification reveals an explicit delete action");
+    Click(view, FONT_AWESOME_TRASH);
+    Check(requests.size() == requests_before_dismiss + 1 &&
+        requests.back().action == WatchViewAction::kDismissNotification &&
+        requests.back().notification_source == WatchNotificationSource::kAncs &&
+        requests.back().notification_session == 73 && requests.back().notification_uid == 41 &&
+        requests.back().notification_revision == 9,
+        "the revealed delete action submits a guarded local dismissal");
+    view.Complete(requests.back().id, true);
     view.Navigate(WatchPage::kFace); Tick();
     Tick();
     swipe({205, 450}, {205, 260});
-    Check(view.Page() == WatchPage::kApps && requests.empty(),
+    Check(view.Page() == WatchPage::kApps,
         "watch-face upward swipe opens the app launcher without a command");
 
     view.Navigate(WatchPage::kRecorder); Tick();
@@ -1705,9 +1759,16 @@ void TestWatchNavigationGestures(WatchViewState state) {
     Check(view.Page() == WatchPage::kRecorder,
         "horizontal content gestures away from the edge do not navigate back");
     swipe({24, 250}, {190, 250});
-    Check(view.Page() == WatchPage::kFace && requests.empty(),
+    Check(view.Page() == WatchPage::kFace,
         "left-edge right swipe returns from a detail page without a command");
 
+    view.Navigate(WatchPage::kSettings); Tick();
+    swipe({205, 52}, {205, 220});
+    Check(view.Page() == WatchPage::kSettings,
+        "a secondary page ignores an immediate top-edge downward scroll");
+    swipe({205, 52}, {205, 220}, 300);
+    Check(view.Page() == WatchPage::kNotifications,
+        "holding the top edge before dragging opens Notification Center from a secondary page");
     view.Navigate(WatchPage::kSettings); Tick();
     swipe({205, 420}, {205, 230});
     Check(view.Page() == WatchPage::kSettings,

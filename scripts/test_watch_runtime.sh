@@ -46,7 +46,7 @@ bash "$root/scripts/test_ap_transfer.sh"
     -I "$root/tests/host/watch_level_stubs" -I "$root/tests/host/audio_processor_stubs" \
     -I "$root/tests/host/transport_stubs" -I "$root/main" \
     "$root/main/watch/watch_level_settings.cc" "$root/main/watch/watch_voice_settings.cc" \
-    "$root/main/watch/watch_notification_settings.cc" \
+    "$root/main/watch/watch_notification_settings.cc" "$root/main/watch/watch_face_settings.cc" \
     "$root/main/watch/watch_wifi_settings.cc" "$root/main/audio/audio_codec.cc" \
     "$root/tests/host/watch_level_settings_test.cc" \
     -o "$build_dir/watch_level_settings_test"

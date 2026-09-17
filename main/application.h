@@ -35,6 +35,7 @@
 #include "watch/watch_station_policy.h"
 #include "watch/watch_voice_binding.h"
 #include "watch/watch_voice_task.h"
+#include "watch/watch_face_settings.h"
 #if CONFIG_AUDREAM_WATCH_DEVICE_PAIRING
 #include "watch/watch_pairing_controller.h"
 #include "watch/watch_pairing_view_state.h"
@@ -210,6 +211,7 @@ private:
     void PollWatchAssetHealth(bool healthy);
     bool watch_voice_save_failed_ = false;
     bool watch_notifications_save_failed_ = false;
+    WatchFaceStyle watch_face_style_ = WatchFaceStyle::kClassic;
     std::mutex watch_notifications_mutex_;
     uint64_t watch_notifications_request_ = 0;
     bool watch_wifi_change_failed_ = false;

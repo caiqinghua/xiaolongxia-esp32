@@ -18,6 +18,8 @@ constexpr int kHeaderHeight = 80;
 constexpr int kHeaderHorizontalInset = 28;
 constexpr int kBackGestureEdge = 40;
 constexpr int kNavigationGestureDistance = 64;
+constexpr int kNotificationPullEdge = 72;
+constexpr uint32_t kNotificationPullHoldMs = 300;
 bool IsFirmwareAction(WatchViewAction action) {
     return action == WatchViewAction::kCheckFirmware || action == WatchViewAction::kCancelFirmware ||
         action == WatchViewAction::kInstallFirmware || action == WatchViewAction::kRebootFirmware ||
@@ -52,7 +54,8 @@ bool SamePairing(const WatchPairingSnapshot& a, const WatchPairingSnapshot& b) {
 }
 bool IsNotificationAction(WatchViewAction action) {
     return action == WatchViewAction::kSetNotificationsEnabled || action == WatchViewAction::kConfirmNotificationPeer ||
-        action == WatchViewAction::kOpenNotification || action == WatchViewAction::kClearNotifications;
+        action == WatchViewAction::kOpenNotification || action == WatchViewAction::kDismissNotification ||
+        action == WatchViewAction::kClearNotifications;
 }
 bool SameNotifications(const WatchNotificationSnapshot& a, const WatchNotificationSnapshot& b) {
     if (a.available != b.available || a.save_failed != b.save_failed || a.client.enabled != b.client.enabled ||
@@ -148,6 +151,7 @@ const char* PageTitle(WatchPage page) {
     using namespace Lang::Strings;
     switch (page) {
         case WatchPage::kFace: return WATCH_TITLE;
+        case WatchPage::kFaceGallery: return WATCH_FACES;
         case WatchPage::kApps: return WATCH_APPS;
         case WatchPage::kTimer: return WATCH_TIMER;
         case WatchPage::kStopwatch: return WATCH_STOPWATCH;
@@ -234,7 +238,22 @@ void WatchView::CaptureGestureStart(lv_event_t* event) {
     gesture_start_valid_ = input != nullptr;
     gesture_navigation_pending_ = false;
     gesture_back_pending_ = false;
-    if (input) lv_indev_get_point(input, &gesture_start_);
+    gesture_target_ = static_cast<lv_obj_t*>(lv_event_get_current_target(event));
+    gesture_started_at_ = lv_tick_get();
+    if (input) {
+        lv_indev_get_point(input, &gesture_start_);
+        if (page_ == WatchPage::kNotifications) {
+            for (auto* item : notification_items_) {
+                lv_area_t bounds{};
+                lv_obj_get_coords(item, &bounds);
+                if (gesture_start_.x >= bounds.x1 && gesture_start_.x <= bounds.x2 &&
+                    gesture_start_.y >= bounds.y1 && gesture_start_.y <= bounds.y2) {
+                    gesture_target_ = item;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 void WatchView::InstallGestureHandlers(lv_obj_t* object) {
@@ -279,6 +298,31 @@ void WatchView::TrackGesture(lv_event_t* event) {
     if (page_ == WatchPage::kFace) {
         if (vertical < kNavigationGestureDistance || vertical * 2 <= horizontal * 3) return;
         gesture_destination_ = dy > 0 ? WatchPage::kNotifications : WatchPage::kApps;
+        gesture_navigation_pending_ = true;
+    } else if (page_ == WatchPage::kNotifications && dx <= -kNavigationGestureDistance &&
+        horizontal * 2 > vertical * 3) {
+        auto* notification_target = gesture_target_;
+        auto target = std::find(notification_items_.begin(), notification_items_.end(), notification_target);
+        while (target == notification_items_.end() && notification_target && notification_target != root_) {
+            notification_target = lv_obj_get_parent(notification_target);
+            target = std::find(notification_items_.begin(), notification_items_.end(), notification_target);
+        }
+        if (target == notification_items_.end()) return;
+        const auto index = static_cast<size_t>(std::distance(notification_items_.begin(), target));
+        if (index >= state_.notifications.content.items.size()) return;
+        const auto& entry = state_.notifications.content.items[index];
+        notification_delete_revealed_ = true;
+        revealed_notification_source_ = state_.notifications.content.source;
+        revealed_notification_session_ = state_.notifications.content.session;
+        revealed_notification_uid_ = entry.uid;
+        revealed_notification_revision_ = entry.revision;
+        gesture_start_valid_ = false;
+        dirty_ = true;
+        lv_indev_wait_release(input);
+    } else if (page_ != WatchPage::kNotifications && gesture_start_.y <= kNotificationPullEdge &&
+        dy >= kNavigationGestureDistance && vertical * 2 > horizontal * 3 &&
+        lv_tick_elaps(gesture_started_at_) >= kNotificationPullHoldMs) {
+        gesture_destination_ = WatchPage::kNotifications;
         gesture_navigation_pending_ = true;
     } else if (gesture_start_.x <= kBackGestureEdge && dx >= kNavigationGestureDistance &&
         horizontal * 2 > vertical * 3) {
@@ -486,6 +530,7 @@ lv_obj_t* WatchView::NumberPicker(lv_obj_t* parent, unsigned maximum, unsigned s
 
 void WatchView::Navigate(WatchPage page) {
     const auto previous = page_;
+    if (page != WatchPage::kNotifications) notification_delete_revealed_ = false;
     if (IsFirmwarePage(page_) && !IsFirmwarePage(page)) CancelFirmware();
     if (page == WatchPage::kFirmwareConfirm && page_ != page) firmware_confirmation_ = state_.firmware.update;
     if (page_ == WatchPage::kDevicePairing && page != page_) CancelPairing();
@@ -537,6 +582,8 @@ void WatchView::Navigate(WatchPage page) {
 }
 
 void WatchView::Update(const WatchViewState& state) {
+    if (state_.face_style != state.face_style &&
+        (page_ == WatchPage::kFace || page_ == WatchPage::kFaceGallery)) dirty_ = true;
     if (state_.firmware.available != state.firmware.available && page_ == WatchPage::kSettings) dirty_ = true;
     if (state.time.sleep_prepared) unlock_pressed_ = false;
     const bool pairing_changed = !SamePairing(state_.pairing, state.pairing);
@@ -547,6 +594,7 @@ void WatchView::Update(const WatchViewState& state) {
     if (page_ == WatchPage::kNotificationDetail && state_.time.state.timezone != state.time.state.timezone)
         dirty_ = true;
     if (notifications_changed && (IsNotificationPage(page_) || IsNotificationPage(rendered_page_) ||
+        page_ == WatchPage::kFace || rendered_page_ == WatchPage::kFace ||
         state_.notifications.client.confirmation != state.notifications.client.confirmation)) dirty_ = true;
     const bool sound_stopping = !state.time.state.alarm_alerts && !state.time.state.checkpoint.timer_alert && state.alert_sound.active;
     const bool was_sound_stopping = !state_.time.state.alarm_alerts && !state_.time.state.checkpoint.timer_alert && state_.alert_sound.active;
@@ -596,7 +644,8 @@ void WatchView::Update(const WatchViewState& state) {
         state_.wrist.request == pending_request_ && !state_.wrist.pending) Complete(pending_request_, state_.wrist.succeeded);
     // Purge retained LVGL text even while the display is hidden. A disconnected,
     // removed or revised notification must never reappear for one render tick.
-    if ((notifications_changed && (IsNotificationPage(page_) || IsNotificationPage(rendered_page_))) ||
+    if ((notifications_changed && (IsNotificationPage(page_) || IsNotificationPage(rendered_page_) ||
+            page_ == WatchPage::kFace || rendered_page_ == WatchPage::kFace)) ||
         (pairing_changed && pairing_page)) {
         const int scroll = !pairing_changed && rendered_page_ == page_ && body_ ? lv_obj_get_scroll_y(body_) : 0;
         Render();
@@ -611,6 +660,8 @@ void WatchView::Complete(uint64_t request_id, bool succeeded) {
     failed_ = !succeeded;
     if (succeeded && pending_action_ == WatchViewAction::kSetAlarm && page_ == WatchPage::kAlarmEditor) {
         Navigate(WatchPage::kAlarms);
+    } else if (succeeded && pending_action_ == WatchViewAction::kSetFaceStyle && page_ == WatchPage::kFaceGallery) {
+        Navigate(WatchPage::kFace);
     } else if (succeeded && pending_action_ == WatchViewAction::kResetCorruptActivityStorage && page_ == WatchPage::kActivityResetConfirm) {
         Navigate(WatchPage::kActivity);
     } else if (succeeded && pending_action_ == WatchViewAction::kDeleteRecording && page_ == WatchPage::kRecordingDeleteConfirm) {
@@ -654,6 +705,7 @@ void WatchView::Submit(WatchViewRequest request) {
     const bool wifi = request.action == WatchViewAction::kSetWifiEnabled;
     const bool power = request.action == WatchViewAction::kSetPowerMode;
     const bool notifications = IsNotificationAction(request.action);
+    const bool face = request.action == WatchViewAction::kSetFaceStyle;
     const bool pairing = IsPairingAction(request.action);
     const bool firmware = IsFirmwareAction(request.action);
     const bool activity = request.action == WatchViewAction::kRetryActivityStorage ||
@@ -673,7 +725,7 @@ void WatchView::Submit(WatchViewRequest request) {
         (recording && request.recording_command == WatchRecordingCommand::kStop) ||
         (request.action == WatchViewAction::kWristCommand && (request.wrist_action == WatchWristAction::kCancel ||
             (request.wrist_action == WatchWristAction::kSetEnabled && !request.enabled)));
-    if ((pending_request_ && !cancel) || !handler_ || (!firmware && !pairing && !notifications && !dismiss_alert && !assistant && !recording && !library && !playback && !level && !voice && !wifi && !power && !activity && !state_.time.initialized) ||
+    if ((pending_request_ && !cancel) || !handler_ || (!firmware && !pairing && !notifications && !dismiss_alert && !assistant && !recording && !library && !playback && !level && !voice && !wifi && !power && !activity && !face && !state_.time.initialized) ||
         (state_.time.sleep_prepared && !cancel)) { return; }
     request.id = ++next_request_;
     if (!request.id) { request.id = ++next_request_; }
@@ -822,6 +874,15 @@ void WatchView::Render() {
     lv_obj_set_flex_grow(title, 1);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(title, 1);
+    if (page_ == WatchPage::kFace && std::any_of(state_.notifications.content.items.begin(),
+        state_.notifications.content.items.end(), [](const auto& item) { return !item.read; })) {
+        auto* unread = lv_obj_create(header);
+        Plain(unread);
+        lv_obj_set_size(unread, 10, 10);
+        lv_obj_set_style_radius(unread, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(unread, lv_color_hex(0xE24B5A), 0);
+        lv_obj_set_style_bg_opa(unread, LV_OPA_COVER, 0);
+    }
     auto* spacer = lv_obj_create(header);
     Plain(spacer); lv_obj_set_size(spacer, 48, 1);
     if (state_.notifications.available && !state_.notifications.client.device_pairing_peer &&
@@ -852,6 +913,7 @@ void WatchView::Render() {
     Bind(body_, LV_EVENT_SCROLL_BEGIN, [](lv_event_t*) {});
     switch (page_) {
         case WatchPage::kFace: BuildFace(); break;
+        case WatchPage::kFaceGallery: BuildFaceGallery(); break;
         case WatchPage::kApps: BuildApps(); break;
         case WatchPage::kTimer: BuildTimer(); break;
         case WatchPage::kStopwatch: BuildStopwatch(); break;
@@ -974,11 +1036,38 @@ void WatchView::BuildFace() {
     connections_ = Label(body_, "", icon_font_);
     record_ = Label(body_, "");
     lv_obj_set_style_text_color(record_, lv_color_hex(kWarning), 0);
+    Bind(body_, LV_EVENT_LONG_PRESSED, [this](lv_event_t*) { Navigate(WatchPage::kFaceGallery); });
+    if (state_.face_style == WatchFaceStyle::kMinimal) return;
+    if (state_.face_style == WatchFaceStyle::kActivity) {
+        auto* steps = Label(body_, "");
+        const auto value = state_.motion.initialized ? std::to_string(state_.motion.activity.steps) : "--";
+        lv_label_set_text(steps, (std::string(FONT_AWESOME_HEART) + "  " + value).c_str());
+        lv_obj_set_style_text_align(steps, LV_TEXT_ALIGN_CENTER, 0);
+    }
     auto* assistant = Button(body_, FONT_AWESOME_MICROPHONE, [this]() { Navigate(WatchPage::kAssistant); }, false, true);
     lv_obj_set_size(assistant, LV_PCT(100), 48);
     Button(body_, Lang::Strings::WATCH_RECORDER, [this]() { Navigate(WatchPage::kRecorder); });
     Button(body_, Lang::Strings::WATCH_TIMER, [this]() { Navigate(WatchPage::kTimer); });
     Button(body_, Lang::Strings::WATCH_ALARMS, [this]() { Navigate(WatchPage::kAlarms); });
+}
+
+void WatchView::BuildFaceGallery() {
+    using namespace Lang::Strings;
+    const struct Option { WatchFaceStyle style; const char* label; } options[] = {
+        {WatchFaceStyle::kClassic, WATCH_FACE_CLASSIC},
+        {WatchFaceStyle::kMinimal, WATCH_FACE_MINIMAL},
+        {WatchFaceStyle::kActivity, WATCH_FACE_ACTIVITY},
+    };
+    for (const auto& option : options) {
+        std::string label = option.style == state_.face_style ? std::string(FONT_AWESOME_CHECK) + "  " + option.label : option.label;
+        auto* button = Button(body_, label.c_str(), [this, option]() {
+            WatchViewRequest request;
+            request.action = WatchViewAction::kSetFaceStyle;
+            request.face_style = option.style;
+            Submit(request);
+        });
+        lv_obj_set_height(button, 104);
+    }
 }
 
 void WatchView::BuildApps() {
@@ -1660,7 +1749,7 @@ void WatchView::BuildNotifications() {
         const auto uid = entry.uid;
         const auto revision = entry.revision;
         const std::string title = entry.details_ready ? (entry.title.empty() ? WATCH_NOTIFY_UNTITLED : entry.title) : WATCH_NOTIFY_LOADING;
-        auto* button = Button(body_, title.c_str(), [this, source, session, uid, revision]() {
+        const auto open = [this, source, session, uid, revision]() {
             if (pending_request_) return;
             selected_notification_source_ = source;
             selected_notification_session_ = session;
@@ -1675,8 +1764,34 @@ void WatchView::BuildNotifications() {
             request.notification_uid = uid;
             request.notification_revision = revision;
             Submit(request);
-        });
+        };
+        const bool revealed = notification_delete_revealed_ && revealed_notification_source_ == source &&
+            revealed_notification_session_ == session && revealed_notification_uid_ == uid &&
+            revealed_notification_revision_ == revision;
+        auto* parent = body_;
+        if (revealed) {
+            parent = Row(body_, 96);
+            lv_obj_set_style_pad_column(parent, 8, 0);
+        }
+        auto* button = Button(parent, title.c_str(), open);
         lv_obj_set_height(button, 96);
+        if (revealed) {
+            lv_obj_set_width(button, 1);
+            lv_obj_set_flex_grow(button, 1);
+            auto* dismiss = Button(parent, FONT_AWESOME_TRASH, [this, source, session, uid, revision]() {
+                if (state_.notifications.content.source != source ||
+                    state_.notifications.content.session != session || !state_.notifications.content.ready) return;
+                WatchViewRequest request;
+                request.action = WatchViewAction::kDismissNotification;
+                request.notification_source = source;
+                request.notification_session = session;
+                request.notification_uid = uid;
+                request.notification_revision = revision;
+                Submit(request);
+            }, false, true);
+            lv_obj_set_size(dismiss, 72, 96);
+            lv_obj_set_style_bg_color(dismiss, lv_color_hex(kWarning), 0);
+        }
         auto* title_label = lv_obj_get_child(button, 0);
         lv_label_set_long_mode(title_label, LV_LABEL_LONG_DOT);
         lv_obj_set_height(title_label, 84);

@@ -57,6 +57,7 @@ public:
     bool DataSource(uint64_t session, const uint8_t* bytes, size_t size, uint64_t now_ms);
     bool RequestAppName(uint64_t session, uint32_t uid, uint64_t revision);
     bool MarkRead(uint64_t session, uint32_t uid, uint64_t revision);
+    bool Dismiss(uint64_t session, uint32_t uid, uint64_t revision);
     bool Clear(uint64_t session);
     WatchAncsSnapshot Snapshot() const;
     WatchAncsState State() const;

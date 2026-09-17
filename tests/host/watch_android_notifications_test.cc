@@ -148,6 +148,9 @@ void ClearsAndReadsDoNotResurrect() {
     auto changed = engine.Snapshot(100);
     CHECK(changed.entries[1].read); CHECK(changed.entries[1].revision == initial.entries[1].revision);
     CHECK(!engine.MarkRead(token, 2, initial.entries[0].revision, 100));
+    CHECK(!engine.Dismiss(token, 1, changed.entries[1].revision + 1, 100));
+    CHECK(engine.Dismiss(token, 1, changed.entries[1].revision, 100));
+    CHECK(engine.Snapshot(100).entries.size() == 1 && engine.Snapshot(100).entries[0].uid == 2);
     CHECK(engine.Clear(token, 100));
     CHECK(Feed(engine, token, Packet(5, 4, {Item(3), Item(1)})).result == Result::kApplied);
     CHECK(engine.Snapshot(100).entries.size() == 1 && engine.Snapshot(100).entries[0].uid == 3);

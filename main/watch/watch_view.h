@@ -170,10 +170,17 @@ private:
     bool hour24_draft_ = true;
     std::array<uint32_t, 3> duration_draft_{0, 5, 0};
     lv_point_t gesture_start_{};
+    uint32_t gesture_started_at_ = 0;
+    lv_obj_t* gesture_target_ = nullptr;
     bool gesture_start_valid_ = false;
     bool gesture_navigation_pending_ = false;
     bool gesture_back_pending_ = false;
     WatchPage gesture_destination_ = WatchPage::kFace;
+    bool notification_delete_revealed_ = false;
+    WatchNotificationSource revealed_notification_source_ = WatchNotificationSource::kNone;
+    uint64_t revealed_notification_session_ = 0;
+    uint64_t revealed_notification_revision_ = 0;
+    uint32_t revealed_notification_uid_ = 0;
 
     void Render();
     void CaptureGestureStart(lv_event_t* event);
@@ -198,6 +205,7 @@ private:
     void Submit(WatchViewRequest request);
     void Command(WatchTimeCommand command, uint64_t duration_ms = 0);
     void BuildFace();
+    void BuildFaceGallery();
     void BuildApps();
     void BuildTimer();
     void BuildStopwatch();

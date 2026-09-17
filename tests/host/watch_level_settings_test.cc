@@ -1,6 +1,7 @@
 #include "watch/watch_level_settings.h"
 #include "watch/watch_voice_settings.h"
 #include "watch/watch_notification_settings.h"
+#include "watch/watch_face_settings.h"
 #include "watch/watch_wifi_settings.h"
 #include "audio/audio_codec.h"
 #include "settings.h"
@@ -225,4 +226,17 @@ int main() {
     assert(SaveWatchWifiEnabled(false));
     assert(ReadWatchWifiEnabled() == 0 && opens == closes);
     std::puts("PASS: WiFi storage failures and corrupt values remain explicit and retryable");
+
+    disk.erase("audream_watch/face_style");
+    assert(ReadWatchFaceStyle() == WatchFaceStyle::kClassic);
+    assert(SaveWatchFaceStyle(WatchFaceStyle::kMinimal));
+    assert(ReadWatchFaceStyle() == WatchFaceStyle::kMinimal);
+    assert(SaveWatchFaceStyle(WatchFaceStyle::kActivity));
+    assert(ReadWatchFaceStyle() == WatchFaceStyle::kActivity);
+    disk["audream_watch/face_style"] = 99;
+    assert(ReadWatchFaceStyle() == WatchFaceStyle::kClassic);
+    const auto face_writes = commits;
+    assert(!SaveWatchFaceStyle(static_cast<WatchFaceStyle>(99)));
+    assert(commits == face_writes && opens == closes);
+    std::puts("PASS: watch face selection persists valid styles and rejects corrupt values");
 }

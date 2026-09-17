@@ -15,16 +15,18 @@
 #include "watch_firmware_view_state.h"
 #include "audio/recording_playback_task.h"
 
-enum class WatchPage { kFace, kApps, kTimer, kStopwatch, kAlarms, kAlarmEditor, kSettings, kAssistant, kRecorder,
+enum class WatchFaceStyle { kClassic, kMinimal, kActivity };
+enum class WatchPage { kFace, kFaceGallery, kApps, kTimer, kStopwatch, kAlarms, kAlarmEditor, kSettings, kAssistant, kRecorder,
     kRecordings, kRecordingDetail, kControls, kActivity, kActivityHistory, kActivityResetConfirm, kRecordingDeleteConfirm,
     kPlayback, kNotifications, kNotificationDetail, kWristSettings, kPowerSettings, kDevicePairing,
     kFirmwareUpdate, kFirmwareConfirm };
-enum class WatchViewAction { kTimeCommand, kSetAlarm, kSetPreferences,
+enum class WatchViewAction { kTimeCommand, kSetAlarm, kSetPreferences, kSetFaceStyle,
     kAssistantTalk, kAssistantSend, kAssistantEnd, kAssistantClear, kRecordingCommand,
     kLoadRecordings, kCancelRecordings, kAssistantPress, kAssistantRelease, kAssistantCancelPress, kSetLevel, kSetVoiceEnabled,
     kSetWifiEnabled, kRetryActivityStorage, kResetCorruptActivityStorage, kLoadOlderRecordings, kLoadNewerRecordings,
     kDeleteRecording, kPlayRecording, kPausePlayback, kResumePlayback, kStopPlayback, kSetPlaybackVolume, kSeekPlayback,
-    kSetNotificationsEnabled, kConfirmNotificationPeer, kOpenNotification, kClearNotifications, kWristCommand, kSetPowerMode,
+    kSetNotificationsEnabled, kConfirmNotificationPeer, kOpenNotification, kDismissNotification, kClearNotifications,
+    kWristCommand, kSetPowerMode,
     kPrepareAssistantNetwork, kOpenDevicePairing, kCancelDevicePairing, kConfirmDevicePairingPeer, kApproveDevicePairingAccount,
     kOpenBindingRemoval, kConfirmBindingRemoval, kOpenControlRemoval, kConfirmControlRemoval,
     kOpenSavedControlPeers, kSelectSavedControlPeer, kSelectAllSavedControlPeers, kConfirmAllControlRemoval,
@@ -40,6 +42,7 @@ struct WatchViewRequest {
     WatchAlarm alarm;
     std::string timezone;
     bool hour24 = true;
+    WatchFaceStyle face_style = WatchFaceStyle::kClassic;
     WatchRecordingCommand recording_command = WatchRecordingCommand::kStart;
     uint64_t press_token = 0;
     WatchLevel level = WatchLevel::kBrightness;
@@ -74,6 +77,7 @@ struct WatchViewRequest {
 };
 
 struct WatchViewState {
+    WatchFaceStyle face_style = WatchFaceStyle::kClassic;
     WatchClockReading clock;
     WatchTimeSnapshot time;
     WatchAlertSoundSnapshot alert_sound;
