@@ -98,6 +98,10 @@ constexpr uint8_t kAxp2101Aldo1Aldo2Aldo3Aldo4EnableMask = 0x0F;
 constexpr uint8_t kAxp2101Aldo1Voltage3300mv = (3300 - 500) / 100;
 constexpr uint8_t kAxp2101AdcChannelEnableReg = 0x30;
 constexpr uint8_t kAxp2101BatteryDetectionReg = 0x68;
+constexpr uint8_t kAxp2101InterruptEnable2Reg = 0x41;
+constexpr uint8_t kAxp2101InterruptStatus2Reg = 0x49;
+constexpr uint8_t kAxp2101PowerKeyLongPressMask = 1 << 2;
+constexpr uint8_t kAxp2101PowerKeyShortPressMask = 1 << 3;
 constexpr uint8_t kAxp2101BatteryVoltageHighReg = 0x34;
 constexpr uint8_t kAxp2101BatteryVoltageLowReg = 0x35;
 constexpr uint16_t kRecordingLowBatteryStopVoltageMv = 3450;
@@ -321,6 +325,26 @@ public:
         return true;
     }
 
+    bool ConsumePowerKeyShortPress() {
+        uint8_t status = 0;
+        const esp_err_t read_result = TryReadReg(kAxp2101InterruptStatus2Reg, &status);
+        if (read_result != ESP_OK) {
+            ESP_LOGW(TAG, "PMIC power key status read failed: %s", esp_err_to_name(read_result));
+            return false;
+        }
+        const uint8_t power_key_status = status &
+            (kAxp2101PowerKeyLongPressMask | kAxp2101PowerKeyShortPressMask);
+        if (power_key_status == 0) {
+            return false;
+        }
+        const esp_err_t clear_result = TryWriteReg(kAxp2101InterruptStatus2Reg, power_key_status);
+        if (clear_result != ESP_OK) {
+            ESP_LOGW(TAG, "PMIC power key status clear failed: %s", esp_err_to_name(clear_result));
+            return false;
+        }
+        return (power_key_status & kAxp2101PowerKeyShortPressMask) != 0;
+    }
+
 private:
     static constexpr int kWriteAttempts = 3;
     bool initialized_ = false;
@@ -386,7 +410,16 @@ private:
             }
         }
         if (!UpdateRegWithRetry(kAxp2101AdcChannelEnableReg, 0x00, 0x01) ||
-            !UpdateRegWithRetry(kAxp2101BatteryDetectionReg, 0x00, 0x01)) {
+            !UpdateRegWithRetry(kAxp2101BatteryDetectionReg, 0x00, 0x01) ||
+            !UpdateRegWithRetry(
+                kAxp2101InterruptEnable2Reg,
+                0x00,
+                kAxp2101PowerKeyShortPressMask
+            ) ||
+            TryWriteReg(
+                kAxp2101InterruptStatus2Reg,
+                kAxp2101PowerKeyLongPressMask | kAxp2101PowerKeyShortPressMask
+            ) != ESP_OK) {
             return false;
         }
         return true;
@@ -600,6 +633,15 @@ public:
         Unlock();
         return true;
     }
+
+    bool NavigateWatch(WatchPage page) {
+        if (!watch_view_ || !Lock(1000)) { return false; }
+        watch_view_->SetVisible(true);
+        watch_view_->Navigate(page);
+        watch_display_idle_ = false;
+        Unlock();
+        return true;
+    }
 #endif
 
     static void rounder_event_cb(lv_event_t* e) {
@@ -790,6 +832,7 @@ private:
     bool pending_recording_stop_event_valid_ = false;
     bool power_source_initialized_ = false;
     bool usb_powered_ = false;
+    uint8_t power_status_tick_count_ = 0;
     bool recording_button_pressed_ = false;
     bool recording_hold_start_pending_ = false;
     WatchRecordingError watch_recording_error_ = WatchRecordingError::kNone;
@@ -1136,8 +1179,7 @@ private:
                 if (board == nullptr) {
                     return;
                 }
-                board->UpdateUsbPowerState();
-                board->CheckRecordingLowBattery();
+                board->HandlePowerStatusTick();
             },
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,
@@ -1154,8 +1196,44 @@ private:
             return;
         }
         ESP_ERROR_CHECK_WITHOUT_ABORT(
-            esp_timer_start_periodic(power_status_timer_, 5000000ULL)
+            esp_timer_start_periodic(power_status_timer_, 1000000ULL)
         );
+    }
+
+    void HandlePowerStatusTick() {
+#if CONFIG_AUDREAM_WATCH_UI
+        bool power_key_short_press = false;
+        if (pmic_mutex_ != nullptr) {
+            xSemaphoreTake(pmic_mutex_, portMAX_DELAY);
+        }
+        if (pmic_ != nullptr) {
+            power_key_short_press = pmic_->ConsumePowerKeyShortPress();
+        }
+        if (pmic_mutex_ != nullptr) {
+            xSemaphoreGive(pmic_mutex_);
+        }
+        if (power_key_short_press) {
+            Application::GetInstance().Schedule([this]() {
+                auto& power = AudreamPowerManager::GetInstance();
+                const bool display_was_idle = power.IsDisplayIdle();
+                power.NotifyUserActivity("power_button");
+                if (!display_was_idle && display_ != nullptr) {
+                    display_->NavigateWatch(WatchPage::kFace);
+                }
+                ESP_LOGI(
+                    TAG,
+                    "Power button short press handled: action=%s",
+                    display_was_idle ? "wake_display" : "return_to_face"
+                );
+            });
+        }
+#endif
+        if (++power_status_tick_count_ < 5) {
+            return;
+        }
+        power_status_tick_count_ = 0;
+        UpdateUsbPowerState();
+        CheckRecordingLowBattery();
     }
 
     bool InitializeSpi() {
@@ -1729,6 +1807,9 @@ private:
                     AudreamPowerManager::GetInstance().NotifyUserActivity("recording_highlight");
                 } else {
                     AudreamPowerManager::GetInstance().NotifyUserActivity("button_click");
+                    if (display_ != nullptr) {
+                        display_->NavigateWatch(WatchPage::kControls);
+                    }
                 }
             });
         });
