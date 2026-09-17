@@ -169,8 +169,18 @@ private:
     std::string timezone_draft_ = "UTC";
     bool hour24_draft_ = true;
     std::array<uint32_t, 3> duration_draft_{0, 5, 0};
+    lv_point_t gesture_start_{};
+    bool gesture_start_valid_ = false;
+    bool gesture_navigation_pending_ = false;
+    bool gesture_back_pending_ = false;
+    WatchPage gesture_destination_ = WatchPage::kFace;
 
     void Render();
+    void CaptureGestureStart(lv_event_t* event);
+    void TrackGesture(lv_event_t* event);
+    void CompleteGestureNavigation(lv_event_t* event);
+    void InstallGestureHandlers(lv_obj_t* object);
+    void NavigateBack();
     void BuildTouchLock(lv_obj_t* parent);
     void SetTouchLocked(bool locked);
     void RefreshTouchLock();

@@ -1662,6 +1662,60 @@ void TestHiddenWatchTouchWake(const WatchViewState& state) {
     lv_indev_delete(input);
 }
 
+void TestWatchNavigationGestures(WatchViewState state) {
+    std::vector<WatchViewRequest> requests;
+    WatchView view(lv_screen_active(), &font_puhui_30_4, &lv_font_montserrat_48,
+        &font_awesome_30_4, [&](const WatchViewRequest& request) { requests.push_back(request); });
+    view.Update(state); Tick();
+    struct Touch { lv_point_t point; bool pressed = false; } touch{};
+    auto* input = lv_indev_create();
+    lv_indev_set_type(input, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_user_data(input, &touch);
+    lv_indev_set_read_cb(input, [](lv_indev_t* device, lv_indev_data_t* data) {
+        const auto& sample = *static_cast<Touch*>(lv_indev_get_user_data(device));
+        data->point = sample.point;
+        data->state = sample.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    });
+    const auto swipe = [&](lv_point_t start, lv_point_t end) {
+        touch.point = start;
+        touch.pressed = true;
+        Tick();
+        for (int step = 1; step <= 5; ++step) {
+            touch.point.x = start.x + (end.x - start.x) * step / 5;
+            touch.point.y = start.y + (end.y - start.y) * step / 5;
+            Tick();
+        }
+        touch.pressed = false;
+        Tick();
+        Tick();
+        Tick();
+    };
+
+    swipe({205, 52}, {205, 220});
+    Check(view.Page() == WatchPage::kNotifications && requests.empty(),
+        "watch-face downward swipe opens Notification Center without a command");
+    view.Navigate(WatchPage::kFace); Tick();
+    Tick();
+    swipe({205, 450}, {205, 260});
+    Check(view.Page() == WatchPage::kApps && requests.empty(),
+        "watch-face upward swipe opens the app launcher without a command");
+
+    view.Navigate(WatchPage::kRecorder); Tick();
+    swipe({120, 250}, {300, 250});
+    Check(view.Page() == WatchPage::kRecorder,
+        "horizontal content gestures away from the edge do not navigate back");
+    swipe({24, 250}, {190, 250});
+    Check(view.Page() == WatchPage::kFace && requests.empty(),
+        "left-edge right swipe returns from a detail page without a command");
+
+    view.Navigate(WatchPage::kSettings); Tick();
+    swipe({205, 420}, {205, 230});
+    Check(view.Page() == WatchPage::kSettings,
+        "vertical gestures inside a secondary page remain available for scrolling");
+    lv_indev_delete(input);
+    std::cout << "PASS: Apple-style watch-face and edge navigation gestures\n";
+}
+
 void TestFirmwareUi(WatchViewState state, const std::filesystem::path& screenshots) {
     using watch_update::Phase;
     state.time.initialized = false;
@@ -1941,6 +1995,7 @@ int main(int argc, char** argv) {
     Check(service.Initialize(state.clock), "UI time service initializes");
     state.time = service.Snapshot(state.clock);
     TestHiddenWatchTouchWake(state);
+    TestWatchNavigationGestures(state);
     TestPixelShift(state, argv[1]);
     TestTouchLock(state, argv[1]);
     TestTouchLockPointer(state);

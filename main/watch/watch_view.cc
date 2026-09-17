@@ -16,6 +16,8 @@ constexpr uint32_t kAccent = 0x70DDC0;
 constexpr uint32_t kWarning = 0xF6B35C;
 constexpr int kHeaderHeight = 80;
 constexpr int kHeaderHorizontalInset = 28;
+constexpr int kBackGestureEdge = 40;
+constexpr int kNavigationGestureDistance = 64;
 bool IsFirmwareAction(WatchViewAction action) {
     return action == WatchViewAction::kCheckFirmware || action == WatchViewAction::kCancelFirmware ||
         action == WatchViewAction::kInstallFirmware || action == WatchViewAction::kRebootFirmware ||
@@ -190,6 +192,16 @@ WatchView::WatchView(lv_obj_t* parent, const lv_font_t* text_font, const lv_font
     lv_obj_set_style_text_font(root_, text_font_, 0);
     lv_obj_set_flex_flow(root_, LV_FLEX_FLOW_COLUMN);
     lv_obj_remove_flag(root_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(root_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(root_, [](lv_event_t* event) {
+        static_cast<WatchView*>(lv_event_get_user_data(event))->CaptureGestureStart(event);
+    }, LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(root_, [](lv_event_t* event) {
+        static_cast<WatchView*>(lv_event_get_user_data(event))->TrackGesture(event);
+    }, LV_EVENT_PRESSING, this);
+    lv_obj_add_event_cb(root_, [](lv_event_t* event) {
+        static_cast<WatchView*>(lv_event_get_user_data(event))->CompleteGestureNavigation(event);
+    }, LV_EVENT_RELEASED, this);
     render_timer_ = lv_timer_create([](lv_timer_t* timer) {
         auto* self = static_cast<WatchView*>(lv_timer_get_user_data(timer));
         if (self->visible_ && self->dirty_) { self->Render(); }
@@ -215,6 +227,75 @@ void WatchView::Bind(lv_obj_t* object, lv_event_code_t event, std::function<void
         if (binding->owner->activity_) { binding->owner->activity_(); }
         binding->callback(value);
     }, event, &bindings_.back());
+}
+
+void WatchView::CaptureGestureStart(lv_event_t* event) {
+    auto* input = lv_event_get_indev(event);
+    gesture_start_valid_ = input != nullptr;
+    gesture_navigation_pending_ = false;
+    gesture_back_pending_ = false;
+    if (input) lv_indev_get_point(input, &gesture_start_);
+}
+
+void WatchView::InstallGestureHandlers(lv_obj_t* object) {
+    for (uint32_t index = 0; index < lv_obj_get_child_count(object); ++index) {
+        auto* child = lv_obj_get_child(object, index);
+        lv_obj_add_event_cb(child, [](lv_event_t* event) {
+            static_cast<WatchView*>(lv_event_get_user_data(event))->CaptureGestureStart(event);
+        }, LV_EVENT_PRESSED, this);
+        lv_obj_add_event_cb(child, [](lv_event_t* event) {
+            static_cast<WatchView*>(lv_event_get_user_data(event))->TrackGesture(event);
+        }, LV_EVENT_PRESSING, this);
+        lv_obj_add_event_cb(child, [](lv_event_t* event) {
+            static_cast<WatchView*>(lv_event_get_user_data(event))->CompleteGestureNavigation(event);
+        }, LV_EVENT_RELEASED, this);
+        InstallGestureHandlers(child);
+    }
+}
+
+void WatchView::NavigateBack() {
+    if (page_ == WatchPage::kFace) return;
+    if (page_ == WatchPage::kRecordingDeleteConfirm && pending_request_) return;
+    Navigate(page_ == WatchPage::kRecordingDetail ? WatchPage::kRecordings :
+        page_ == WatchPage::kNotificationDetail ? WatchPage::kNotifications :
+        page_ == WatchPage::kPowerSettings ? WatchPage::kControls :
+        page_ == WatchPage::kDevicePairing ? WatchPage::kControls :
+        page_ == WatchPage::kFirmwareUpdate ? WatchPage::kSettings :
+        page_ == WatchPage::kFirmwareConfirm ? WatchPage::kFirmwareUpdate :
+        (page_ == WatchPage::kActivityHistory || page_ == WatchPage::kActivityResetConfirm) ? WatchPage::kActivity :
+        page_ == WatchPage::kAlarmEditor ? WatchPage::kAlarms :
+        page_ == WatchPage::kRecordingDeleteConfirm ? WatchPage::kRecordings : WatchPage::kFace);
+}
+
+void WatchView::TrackGesture(lv_event_t* event) {
+    auto* input = lv_event_get_indev(event);
+    if (!input || !gesture_start_valid_ || gesture_navigation_pending_ || state_.time.sleep_prepared) return;
+    lv_point_t point{};
+    lv_indev_get_point(input, &point);
+    const int dx = point.x - gesture_start_.x;
+    const int dy = point.y - gesture_start_.y;
+    const int horizontal = std::abs(dx);
+    const int vertical = std::abs(dy);
+    if (page_ == WatchPage::kFace) {
+        if (vertical < kNavigationGestureDistance || vertical * 2 <= horizontal * 3) return;
+        gesture_destination_ = dy > 0 ? WatchPage::kNotifications : WatchPage::kApps;
+        gesture_navigation_pending_ = true;
+    } else if (gesture_start_.x <= kBackGestureEdge && dx >= kNavigationGestureDistance &&
+        horizontal * 2 > vertical * 3) {
+        gesture_navigation_pending_ = true;
+        gesture_back_pending_ = true;
+    }
+}
+
+void WatchView::CompleteGestureNavigation(lv_event_t*) {
+    gesture_start_valid_ = false;
+    if (!gesture_navigation_pending_) return;
+    gesture_navigation_pending_ = false;
+    const bool back = gesture_back_pending_;
+    gesture_back_pending_ = false;
+    if (activity_) activity_();
+    if (back) NavigateBack();
+    else Navigate(gesture_destination_);
 }
 
 void WatchView::BuildTouchLock(lv_obj_t* parent) {
@@ -689,6 +770,9 @@ void WatchView::Render() {
     // Replacing a pressed widget may suppress the input device's release event.
     AssistantRelease(true);
     CaptureDraft();
+    gesture_start_valid_ = false;
+    gesture_navigation_pending_ = false;
+    gesture_back_pending_ = false;
     rendered_page_ = page_;
     pixel_shift_minute_ = UINT32_MAX;
     dirty_ = false;
@@ -730,19 +814,8 @@ void WatchView::Render() {
     auto* header = Row(root_, kHeaderHeight);
     lv_obj_set_style_pad_hor(header, kHeaderHorizontalInset, 0);
     Button(header, page_ == WatchPage::kFace ? FONT_AWESOME_WATCH : FONT_AWESOME_ANGLE_LEFT, [this]() {
-        if (page_ == WatchPage::kRecordingDeleteConfirm) {
-            if (!pending_request_) Navigate(WatchPage::kRecordings);
-            return;
-        }
-        Navigate(page_ == WatchPage::kFace ? WatchPage::kApps :
-            page_ == WatchPage::kRecordingDetail ? WatchPage::kRecordings :
-            page_ == WatchPage::kNotificationDetail ? WatchPage::kNotifications :
-            page_ == WatchPage::kPowerSettings ? WatchPage::kControls :
-            page_ == WatchPage::kDevicePairing ? WatchPage::kControls :
-            page_ == WatchPage::kFirmwareUpdate ? WatchPage::kSettings :
-            page_ == WatchPage::kFirmwareConfirm ? WatchPage::kFirmwareUpdate :
-            (page_ == WatchPage::kActivityHistory || page_ == WatchPage::kActivityResetConfirm) ? WatchPage::kActivity :
-            page_ == WatchPage::kAlarmEditor ? WatchPage::kAlarms : WatchPage::kFace);
+        if (page_ == WatchPage::kFace) Navigate(WatchPage::kApps);
+        else NavigateBack();
     }, false, true);
     auto* title = Label(header, page_ == WatchPage::kRecordingDeleteConfirm && !deletion_entry_.audio_available
         ? Lang::Strings::WATCH_RECORDING_METADATA_CLEANUP : PageTitle(page_));
@@ -806,6 +879,7 @@ void WatchView::Render() {
     error_ = Label(root_, "");
     lv_obj_set_style_pad_hor(error_, 18, 0);
     lv_obj_set_style_text_color(error_, lv_color_hex(kWarning), 0);
+    InstallGestureHandlers(root_);
     RefreshLabels(); RefreshCommandState();
     RefreshPixelShift();
     if (page_ == WatchPage::kRecordings) {
