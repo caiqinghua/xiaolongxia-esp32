@@ -1803,13 +1803,15 @@ private:
             if (recording_button_intent_.LastPressWasHold()) return;
             Application::GetInstance().Schedule([this]() {
                 auto& recording = LocalRecordingService::GetInstance();
-                if (recording.IsRecording() && AddRecordingHighlight("device_button")) {
-                    AudreamPowerManager::GetInstance().NotifyUserActivity("recording_highlight");
-                } else {
-                    AudreamPowerManager::GetInstance().NotifyUserActivity("button_click");
-                    if (display_ != nullptr) {
-                        display_->NavigateWatch(WatchPage::kControls);
+                if (recording.IsRecording()) {
+                    if (AddRecordingHighlight("device_button")) {
+                        AudreamPowerManager::GetInstance().NotifyUserActivity("recording_highlight");
                     }
+                    return;
+                }
+                AudreamPowerManager::GetInstance().NotifyUserActivity("button_click");
+                if (display_ != nullptr) {
+                    display_->NavigateWatch(WatchPage::kControls);
                 }
             });
         });
