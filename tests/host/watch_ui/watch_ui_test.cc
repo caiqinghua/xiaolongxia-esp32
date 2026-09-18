@@ -967,8 +967,11 @@ void TestAlertSoundUi(WatchViewState state, const std::filesystem::path& screens
         "failed hardware cleanup stays visible and retryable after timer dismissal");
     Screenshot(view.Root(), screenshots / "alert-sound-cleanup-failed.ppm");
     auto* label = FindLabel(view.Root(), WATCH_ALERT_CLEANUP_FAILED);
-    lv_area_t bounds; lv_obj_get_coords(label, &bounds);
-    Check(bounds.y1 >= 64 && bounds.y2 < 140, "cleanup status fits inside the alert banner");
+    lv_area_t bounds, banner_bounds;
+    lv_obj_get_coords(label, &bounds);
+    lv_obj_get_content_coords(lv_obj_get_parent(label), &banner_bounds);
+    Check(bounds.y1 >= banner_bounds.y1 && bounds.y2 <= banner_bounds.y2,
+        "cleanup status fits inside the alert banner");
     state.time.initialized = false;
     view.Update(state); Tick();
     Click(view, FONT_AWESOME_CHECK); const auto retry = requests.back().id;
@@ -1762,6 +1765,15 @@ void TestWatchNavigationGestures(WatchViewState state) {
     Check(view.Page() == WatchPage::kFace,
         "left-edge right swipe returns from a detail page without a command");
 
+    view.Navigate(WatchPage::kSettings); Tick();
+    auto* back = FindButton(view.Root(), FONT_AWESOME_ANGLE_LEFT);
+    lv_area_t back_bounds{};
+    lv_obj_get_coords(back, &back_bounds);
+    touch.point = {back_bounds.x1 - 8, (back_bounds.y1 + back_bounds.y2) / 2};
+    touch.pressed = true; Tick();
+    touch.pressed = false; Tick();
+    Check(view.Page() == WatchPage::kFace,
+        "the expanded area around the back icon accepts an imprecise tap");
     view.Navigate(WatchPage::kSettings); Tick();
     swipe({205, 52}, {205, 220});
     Check(view.Page() == WatchPage::kSettings,
@@ -2622,6 +2634,8 @@ int main(int argc, char** argv) {
         lv_obj_get_coords(recorder_back, &recorder_back_bounds);
         Check(recorder_back_bounds.x1 >= 28 && recorder_back_bounds.y1 >= 16,
             "recorder back action stays inside the rounded display safe area");
+        Check(lv_obj_get_width(recorder_back) >= 64 && lv_obj_get_height(recorder_back) >= 64,
+            "recorder back action exposes a stable touch target");
         Screenshot(view.Root(), std::filesystem::path(argv[1]) / "recorder-no-storage.ppm");
         Click(view, FONT_AWESOME_ANGLE_LEFT);
         Check(view.Page() == WatchPage::kFace && requests.size() == unavailable_count,

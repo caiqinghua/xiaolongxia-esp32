@@ -14,8 +14,10 @@ constexpr uint32_t kText = 0xF4F7F6;
 constexpr uint32_t kMuted = 0xA5AFB4;
 constexpr uint32_t kAccent = 0x70DDC0;
 constexpr uint32_t kWarning = 0xF6B35C;
-constexpr int kHeaderHeight = 80;
+constexpr int kHeaderHeight = 96;
 constexpr int kHeaderHorizontalInset = 28;
+constexpr int kHeaderNavigationSize = 64;
+constexpr int kHeaderNavigationClickPadding = 12;
 constexpr int kBackGestureEdge = 40;
 constexpr int kNavigationGestureDistance = 64;
 constexpr int kNotificationPullEdge = 72;
@@ -865,10 +867,16 @@ void WatchView::Render() {
     weekdays_.fill(nullptr);
     auto* header = Row(root_, kHeaderHeight);
     lv_obj_set_style_pad_hor(header, kHeaderHorizontalInset, 0);
-    Button(header, page_ == WatchPage::kFace ? FONT_AWESOME_WATCH : FONT_AWESOME_ANGLE_LEFT, [this]() {
+    auto* navigation = Button(header,
+        page_ == WatchPage::kFace ? FONT_AWESOME_WATCH : FONT_AWESOME_ANGLE_LEFT, [this]() {
         if (page_ == WatchPage::kFace) Navigate(WatchPage::kApps);
         else NavigateBack();
     }, false, true);
+    lv_obj_set_size(navigation, kHeaderNavigationSize, kHeaderNavigationSize);
+    lv_obj_set_ext_click_area(navigation, kHeaderNavigationClickPadding);
+    lv_obj_set_style_radius(navigation, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(navigation, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_opa(navigation, LV_OPA_COVER, LV_STATE_PRESSED);
     auto* title = Label(header, page_ == WatchPage::kRecordingDeleteConfirm && !deletion_entry_.audio_available
         ? Lang::Strings::WATCH_RECORDING_METADATA_CLEANUP : PageTitle(page_));
     lv_obj_set_flex_grow(title, 1);
@@ -884,7 +892,7 @@ void WatchView::Render() {
         lv_obj_set_style_bg_opa(unread, LV_OPA_COVER, 0);
     }
     auto* spacer = lv_obj_create(header);
-    Plain(spacer); lv_obj_set_size(spacer, 48, 1);
+    Plain(spacer); lv_obj_set_size(spacer, kHeaderNavigationSize, 1);
     if (state_.notifications.available && !state_.notifications.client.device_pairing_peer &&
         !state_.notifications.client.control_pairing_peer &&
         state_.notifications.client.confirmation && !IsNotificationPage(page_)) {
