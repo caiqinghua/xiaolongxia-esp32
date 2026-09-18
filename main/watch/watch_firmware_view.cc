@@ -42,6 +42,8 @@ void WatchView::BuildFirmwareUpdate() {
         Label(body_, WATCH_UPDATE_TARGET);
         firmware_target_ = lv_dropdown_create(body_);
         lv_obj_set_width(firmware_target_, LV_PCT(100));
+        lv_obj_set_height(firmware_target_, 52);
+        lv_obj_set_ext_click_area(firmware_target_, 6);
         lv_dropdown_set_symbol(firmware_target_, FONT_AWESOME_ANGLE_DOWN);
         lv_obj_set_style_text_font(firmware_target_, icon_font_, LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(firmware_target_, lv_color_hex(0x202427), 0);

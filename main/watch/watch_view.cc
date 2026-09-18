@@ -18,6 +18,12 @@ constexpr int kHeaderHeight = 96;
 constexpr int kHeaderHorizontalInset = 28;
 constexpr int kHeaderNavigationSize = 64;
 constexpr int kHeaderNavigationClickPadding = 12;
+constexpr int kControlVisualSize = 52;
+constexpr int kControlClickPadding = 6;
+constexpr int kSwitchVisualWidth = 72;
+constexpr int kSwitchVisualHeight = 40;
+constexpr int kSwitchClickPadding = 12;
+constexpr int kSliderClickPadding = 26;
 constexpr int kBackGestureEdge = 40;
 constexpr int kNavigationGestureDistance = 64;
 constexpr int kNotificationPullEdge = 72;
@@ -148,6 +154,17 @@ void Plain(lv_obj_t* object) {
     lv_obj_set_style_border_width(object, 0, 0);
     lv_obj_set_style_radius(object, 0, 0);
     lv_obj_set_style_pad_all(object, 0, 0);
+}
+void ConfigureSwitch(lv_obj_t* object) {
+    lv_obj_set_size(object, kSwitchVisualWidth, kSwitchVisualHeight);
+    lv_obj_set_ext_click_area(object, kSwitchClickPadding);
+}
+void ConfigureSlider(lv_obj_t* object) {
+    lv_obj_set_ext_click_area(object, kSliderClickPadding);
+}
+void ConfigureDropdown(lv_obj_t* object) {
+    lv_obj_set_height(object, kControlVisualSize);
+    lv_obj_set_ext_click_area(object, kControlClickPadding);
 }
 const char* PageTitle(WatchPage page) {
     using namespace Lang::Strings;
@@ -476,7 +493,8 @@ lv_obj_t* WatchView::Row(lv_obj_t* parent, int height) {
 
 lv_obj_t* WatchView::Button(lv_obj_t* parent, const char* text, std::function<void()> callback, bool command, bool icon) {
     auto* button = lv_button_create(parent);
-    lv_obj_set_size(button, icon ? 48 : LV_PCT(100), 48);
+    lv_obj_set_size(button, icon ? kControlVisualSize : LV_PCT(100), kControlVisualSize);
+    lv_obj_set_ext_click_area(button, kControlClickPadding);
     lv_obj_set_style_radius(button, 8, 0);
     lv_obj_set_style_bg_color(button, lv_color_hex(kSurface), 0);
     lv_obj_set_style_shadow_width(button, 0, 0);
@@ -498,7 +516,7 @@ uint32_t WatchView::NumberValue(lv_obj_t* picker) {
 lv_obj_t* WatchView::NumberPicker(lv_obj_t* parent, unsigned maximum, unsigned selected) {
     auto* picker = lv_obj_create(parent);
     Plain(picker);
-    lv_obj_set_size(picker, 64, 116);
+    lv_obj_set_size(picker, 64, 132);
     lv_obj_set_flex_grow(picker, 1);
     lv_obj_set_flex_flow(picker, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(picker, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -515,7 +533,8 @@ lv_obj_t* WatchView::NumberPicker(lv_obj_t* parent, unsigned maximum, unsigned s
         lv_label_set_text(label, value);
     };
     for (auto* button : {up, down}) {
-        lv_obj_set_size(button, LV_PCT(100), 40);
+        lv_obj_set_size(button, LV_PCT(100), 48);
+        lv_obj_set_ext_click_area(button, 8);
         lv_obj_set_style_pad_ver(button, 2, 0);
         const bool increase = button == up;
         const auto change = [number, maximum, increase, refresh](lv_event_t*) {
@@ -1212,6 +1231,7 @@ void WatchView::BuildControls() {
         level_sliders_[index] = slider;
         lv_obj_set_width(slider, LV_PCT(100));
         lv_obj_set_height(slider, 12);
+        ConfigureSlider(slider);
         lv_slider_set_range(slider, index == 0 ? 10 : 0, 100);
         lv_obj_set_style_bg_color(slider, lv_color_hex(kAccent), LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(slider, lv_color_hex(kAccent), LV_PART_KNOB);
@@ -1246,7 +1266,7 @@ void WatchView::BuildControls() {
     lv_obj_set_width(wifi_retry_, 52);
     lv_obj_set_flex_grow(wifi_retry_, 0);
     wifi_switch_ = lv_switch_create(wifi_row);
-    lv_obj_set_size(wifi_switch_, 60, 32);
+    ConfigureSwitch(wifi_switch_);
     lv_obj_set_style_bg_color(wifi_switch_, lv_color_hex(kAccent), LV_PART_INDICATOR | LV_STATE_CHECKED);
     Bind(wifi_switch_, LV_EVENT_VALUE_CHANGED, [this](lv_event_t*) {
         const bool enabled = lv_obj_has_state(wifi_switch_, LV_STATE_CHECKED);
@@ -1266,7 +1286,7 @@ void WatchView::BuildControls() {
     lv_obj_set_width(voice_label, 1);
     lv_obj_set_flex_grow(voice_label, 1);
     voice_switch_ = lv_switch_create(voice_row);
-    lv_obj_set_size(voice_switch_, 60, 32);
+    ConfigureSwitch(voice_switch_);
     lv_obj_set_style_bg_color(voice_switch_, lv_color_hex(kAccent), LV_PART_INDICATOR | LV_STATE_CHECKED);
     Bind(voice_switch_, LV_EVENT_VALUE_CHANGED, [this](lv_event_t*) {
         const bool enabled = lv_obj_has_state(voice_switch_, LV_STATE_CHECKED);
@@ -1302,6 +1322,7 @@ void WatchView::BuildPowerSettings() {
     power_saved_ = Label(body_, "");
     power_options_ = lv_dropdown_create(body_);
     lv_obj_set_width(power_options_, LV_PCT(100));
+    ConfigureDropdown(power_options_);
     lv_dropdown_set_symbol(power_options_, FONT_AWESOME_ANGLE_DOWN);
     lv_obj_set_style_text_font(power_options_, icon_font_, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(power_options_, lv_color_hex(kSurface), 0);
@@ -1384,7 +1405,7 @@ void WatchView::BuildWristSettings() {
     lv_obj_set_width(label, 1);
     lv_obj_set_flex_grow(label, 1);
     wrist_switch_ = lv_switch_create(row);
-    lv_obj_set_size(wrist_switch_, 60, 32);
+    ConfigureSwitch(wrist_switch_);
     lv_obj_set_style_bg_color(wrist_switch_, lv_color_hex(kAccent), LV_PART_INDICATOR | LV_STATE_CHECKED);
     Bind(wrist_switch_, LV_EVENT_VALUE_CHANGED, [this](lv_event_t*) {
         const bool enabled = lv_obj_has_state(wrist_switch_, LV_STATE_CHECKED);
@@ -1702,7 +1723,7 @@ void WatchView::BuildNotifications() {
     lv_obj_set_width(label, 1);
     lv_obj_set_flex_grow(label, 1);
     notification_switch_ = lv_switch_create(row);
-    lv_obj_set_size(notification_switch_, 60, 32);
+    ConfigureSwitch(notification_switch_);
     lv_obj_set_style_bg_color(notification_switch_, lv_color_hex(kAccent), LV_PART_INDICATOR | LV_STATE_CHECKED);
     Bind(notification_switch_, LV_EVENT_VALUE_CHANGED, [this](lv_event_t*) {
         WatchViewRequest request;
@@ -1786,6 +1807,7 @@ void WatchView::BuildNotifications() {
         if (revealed) {
             lv_obj_set_width(button, 1);
             lv_obj_set_flex_grow(button, 1);
+            lv_obj_set_ext_click_area(button, 0);
             auto* dismiss = Button(parent, FONT_AWESOME_TRASH, [this, source, session, uid, revision]() {
                 if (state_.notifications.content.source != source ||
                     state_.notifications.content.session != session || !state_.notifications.content.ready) return;
@@ -1798,6 +1820,7 @@ void WatchView::BuildNotifications() {
                 Submit(request);
             }, false, true);
             lv_obj_set_size(dismiss, 72, 96);
+            lv_obj_set_ext_click_area(dismiss, 0);
             lv_obj_set_style_bg_color(dismiss, lv_color_hex(kWarning), 0);
         }
         auto* title_label = lv_obj_get_child(button, 0);
@@ -2051,6 +2074,7 @@ void WatchView::BuildPlayback() {
     lv_obj_set_style_pad_hor(seek_track, 18, 0);
     playback_seek_ = lv_slider_create(seek_track);
     lv_obj_set_size(playback_seek_, LV_PCT(100), 12);
+    ConfigureSlider(playback_seek_);
     lv_slider_set_range(playback_seek_, 0, 1000);
     lv_obj_set_style_bg_color(playback_seek_, lv_color_hex(kAccent), LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(playback_seek_, lv_color_hex(kAccent), LV_PART_KNOB);
@@ -2083,6 +2107,7 @@ void WatchView::BuildPlayback() {
     lv_obj_set_style_pad_hor(track, 18, 0);
     playback_volume_ = lv_slider_create(track);
     lv_obj_set_size(playback_volume_, LV_PCT(100), 12);
+    ConfigureSlider(playback_volume_);
     lv_slider_set_range(playback_volume_, 0, 100);
     lv_obj_set_style_bg_color(playback_volume_, lv_color_hex(kAccent), LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(playback_volume_, lv_color_hex(kAccent), LV_PART_KNOB);
@@ -2535,6 +2560,7 @@ void WatchView::BuildAlarmEditor() {
     auto* enabled_row = Row(body_);
     auto* label = Label(enabled_row, WATCH_ENABLED); lv_obj_set_flex_grow(label, 1); lv_obj_set_width(label, 1);
     enabled_ = lv_switch_create(enabled_row); commands_.push_back(enabled_);
+    ConfigureSwitch(enabled_);
     Bind(enabled_, LV_EVENT_VALUE_CHANGED, [](lv_event_t*) {});
     if (alarm_draft_.enabled) { lv_obj_add_state(enabled_, LV_STATE_CHECKED); }
     Label(body_, WATCH_REPEAT);
@@ -2571,6 +2597,7 @@ void WatchView::BuildSettings() {
         if (timezone_draft_ == zones[index].id) { selected = index; }
     }
     zone_ = lv_dropdown_create(body_);
+    ConfigureDropdown(zone_);
     lv_dropdown_set_symbol(zone_, FONT_AWESOME_ANGLE_DOWN);
     lv_obj_set_style_text_font(zone_, icon_font_, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(zone_, lv_color_hex(kSurface), 0);
@@ -2588,6 +2615,7 @@ void WatchView::BuildSettings() {
     auto* row = Row(body_);
     auto* label = Label(row, WATCH_24_HOUR); lv_obj_set_flex_grow(label, 1); lv_obj_set_width(label, 1);
     format_ = lv_switch_create(row); commands_.push_back(format_);
+    ConfigureSwitch(format_);
     Bind(format_, LV_EVENT_VALUE_CHANGED, [](lv_event_t*) {});
     if (hour24_draft_) { lv_obj_add_state(format_, LV_STATE_CHECKED); }
     Button(body_, WATCH_SAVE, [this]() {

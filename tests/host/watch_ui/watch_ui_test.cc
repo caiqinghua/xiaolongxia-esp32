@@ -81,6 +81,22 @@ void CollectSliders(lv_obj_t* parent, std::vector<lv_obj_t*>& sliders) {
     for (uint32_t index = 0; index < lv_obj_get_child_count(parent); ++index)
         CollectSliders(lv_obj_get_child(parent, index), sliders);
 }
+void PointerTap(lv_point_t point) {
+    struct Touch { lv_point_t point; bool pressed = false; } touch{point};
+    auto* input = lv_indev_create();
+    lv_indev_set_type(input, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_user_data(input, &touch);
+    lv_indev_set_read_cb(input, [](lv_indev_t* device, lv_indev_data_t* data) {
+        const auto& sample = *static_cast<Touch*>(lv_indev_get_user_data(device));
+        data->point = sample.point;
+        data->state = sample.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    });
+    touch.pressed = true;
+    Tick();
+    touch.pressed = false;
+    Tick();
+    lv_indev_delete(input);
+}
 struct Storage : WatchTimeStorage {
     bool fail = false;
     WatchStateLoad Load(std::string&) override { return WatchStateLoad::kAbsent; }
@@ -718,6 +734,16 @@ void TestNotificationUi(WatchViewState state, const std::filesystem::path& scree
         else lv_obj_remove_state(control, LV_STATE_CHECKED);
         lv_obj_send_event(control, LV_EVENT_VALUE_CHANGED, nullptr);
     };
+    auto* notification_switch = find_switch();
+    Check(lv_obj_get_width(notification_switch) == 72 && lv_obj_get_height(notification_switch) == 40,
+        "notification switch has a proportionate watch-sized visual control");
+    lv_obj_update_layout(view.Root());
+    lv_area_t switch_bounds{};
+    lv_obj_get_coords(notification_switch, &switch_bounds);
+    PointerTap({switch_bounds.x1 - 10, (switch_bounds.y1 + switch_bounds.y2) / 2});
+    Check(requests.back().action == WatchViewAction::kSetNotificationsEnabled && requests.back().enabled,
+        "notification switch accepts a near-edge tap inside its expanded touch target");
+    view.Complete(requests.back().id, true);
     toggle(true);
     Check(requests.back().action == WatchViewAction::kSetNotificationsEnabled && requests.back().enabled,
         "notification opt in works without initialized clock");
